@@ -29,7 +29,7 @@ pub const MAX_RANGE_END: u64 = PAGE_SIZE * PageId::MAX as u64;
 #[derive(Debug)]
 pub struct ServiceConfig {
     pub cache: CacheConfig,
-    pub hedge_latency_quantile: f64,
+    pub hedge_quantile: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -68,11 +68,7 @@ impl CacheyService {
         let cache = build_cache(config.cache).await?;
         let ingress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
         let egress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
-        let downloader = Downloader::new(
-            s3,
-            config.hedge_latency_quantile,
-            ingress_throughput.clone(),
-        );
+        let downloader = Downloader::new(s3, config.hedge_quantile, ingress_throughput.clone());
         Ok(Self {
             cache,
             downloader,

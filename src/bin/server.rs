@@ -45,6 +45,18 @@ struct TlsConfig {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Maximum memory to use for cache (e.g., "512MiB", "2GB", "1.5GiB")
+    #[arg(long, value_parser = parse_bytes, default_value = "4GiB")]
+    memory: ByteSize,
+
+    /// Disk cache configuration
+    #[command(flatten)]
+    disk_cache: DiskCacheGroup,
+
+    /// Latency quantile for making hedged requests (0.0-1.0, use 0 to disable hedging)
+    #[arg(long, default_value = "0.99", value_parser = parse_hedge_quantile)]
+    hedge_quantile: f64,
+
     /// TLS configuration (defaults to plain HTTP if not specified).
     #[command(flatten)]
     tls: TlsConfig,
@@ -52,18 +64,6 @@ struct Args {
     /// Port to listen on [default: 443 if HTTPS configured, otherwise 80 for HTTP]
     #[arg(long)]
     port: Option<u16>,
-
-    /// Maximum memory to use for cache (e.g., "512MiB", "2GB", "1.5GiB")
-    #[arg(long, value_parser = parse_bytes, default_value = "4GiB")]
-    cache_memory: ByteSize,
-
-    /// Disk cache configuration
-    #[command(flatten)]
-    disk_cache: DiskCacheGroup,
-
-    /// S3 hedge request latency quantile (0.0-1.0, use 0 to disable hedging)
-    #[arg(long, default_value = "0.99", value_parser = parse_hedge_quantile)]
-    hedge_latency_quantile: f64,
 }
 
 fn parse_bytes(s: &str) -> Result<ByteSize, String> {
@@ -94,7 +94,7 @@ async fn main() -> eyre::Result<()> {
 
     let service_config = ServiceConfig {
         cache: CacheConfig {
-            memory_size: args.cache_memory,
+            memory_size: args.memory,
             disk_cache: if let Some(path) = args.disk_cache.disk_path {
                 Some(DiskCacheConfig {
                     path,
@@ -106,7 +106,7 @@ async fn main() -> eyre::Result<()> {
                 None
             },
         },
-        hedge_latency_quantile: args.hedge_latency_quantile,
+        hedge_quantile: args.hedge_quantile,
     };
 
     info!(?service_config);

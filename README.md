@@ -6,8 +6,7 @@ A high-performance read-through cache for S3-compatible object storage.
 - Hybrid memory + disk cache powered by [foyer](https://foyer.rs/).
 - Fixed 16 MiB page size – maps requested range to page-aligned lookups.
 - Coalesces concurrent requests for the same page.
-- Limits intra-request concurrency to 2 page fetches.
-- Makes hedged requests to manage high tail latency of object storage.
+- Makes hedged requests to manage tail latency of object storage.
 - Can attempt redundant buckets for a given object.
 
 ## API
@@ -57,6 +56,16 @@ Standard HTTP response semantics can be expected, and status code and headers ar
 Usage: server [OPTIONS]
 
 Options:
+      --memory <MEMORY>
+          Maximum memory to use for cache (e.g., "512MiB", "2GB", "1.5GiB") [default: 4GiB]
+      --disk-path <DISK_PATH>
+          Path to disk cache storage, which may be a directory or block device
+      --disk-kind <DISK_KIND>
+          Kind of disk cache, which may be a file system or block device [default: fs] [possible values: block, fs]
+      --disk-capacity <DISK_CAPACITY>
+          Maximum disk cache capacity (e.g., "100GiB") If not specified, up to 80% of the available space will be used
+      --hedge-quantile <HEDGE_QUANTILE>
+          Latency quantile for making hedged requests (0.0-1.0, use 0 to disable hedging) [default: 0.99]
       --tls-self
           Use a self-signed certificate for TLS
       --tls-cert <TLS_CERT>
@@ -65,16 +74,6 @@ Options:
           Path to the private key file (e.g., key.pem) Must be used together with --tls-cert
       --port <PORT>
           Port to listen on [default: 443 if HTTPS configured, otherwise 80 for HTTP]
-      --cache-memory <CACHE_MEMORY>
-          Maximum memory to use for cache (e.g., "512MiB", "2GB", "1.5GiB") [default: 4GiB]
-      --disk-path <DISK_PATH>
-          Path to disk cache storage, which may be a directory or block device
-      --disk-kind <DISK_KIND>
-          Kind of disk cache, which may be a file system or block device [default: fs] [possible values: block, fs]
-      --disk-capacity <DISK_CAPACITY>
-          Maximum disk cache capacity (e.g., "100GiB") If not specified, up to 80% of the available space will be used
-      --hedge-latency-quantile <HEDGE_LATENCY_QUANTILE>
-          S3 hedge request latency quantile (0.0-1.0, use 0 to disable hedging) [default: 0.99]
   -h, --help
           Print help
   -V, --version
