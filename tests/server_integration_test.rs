@@ -57,7 +57,7 @@ async fn setup_test_server() -> TestContext {
             memory_size: ByteSize::mib(256),
             disk_cache: None,
         },
-        hedge_latency_quantile: 0.99,
+        hedge_quantile: 0.99,
     };
 
     let cachey = CacheyService::new(service_config, s3_client.clone())
