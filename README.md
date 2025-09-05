@@ -83,5 +83,5 @@ Options:
 
 ## Development
 
-- [justfile](./justfile)
-- [AGENTS](./AGENTS)
+- [justfile](./justfile) contains commands for [just](https://just.systems/man/en/) doing things
+- [AGENTS.md](./AGENTS.md) and symlinks for your favorite coding buddies
