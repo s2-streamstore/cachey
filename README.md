@@ -6,8 +6,7 @@ A high-performance read-through cache for S3-compatible object storage.
 - Hybrid memory + disk cache powered by [foyer](https://foyer.rs/).
 - Fixed 16 MiB page size – maps requested range to page-aligned lookups.
 - Coalesces concurrent requests for the same page.
-- Limits intra-request concurrency to 2 page fetches.
-- Makes hedged requests to manage high tail latency of object storage.
+- Makes hedged requests to manage tail latency of object storage.
 - Can attempt redundant buckets for a given object.
 
 ## API
