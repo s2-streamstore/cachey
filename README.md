@@ -62,17 +62,17 @@ Options:
       --tls-key <TLS_KEY>
           Path to the private key file (e.g., key.pem) Must be used together with --tls-cert
       --port <PORT>
-          Port to listen on (default: 443 for HTTPS, 80 for HTTP)
+          Port to listen on [default: 443 if HTTPS configured, otherwise 80 for HTTP]
       --cache-memory <CACHE_MEMORY>
-          Maximum memory to use for cache (e.g., "512MiB", "2GB", "1.5GiB") Defaults to 4GiB if not specified [default: 4GiB]
+          Maximum memory to use for cache (e.g., "512MiB", "2GB", "1.5GiB") [default: 4GiB]
       --disk-path <DISK_PATH>
-          Path for disk cache storage (directory or block device)
+          Path to disk cache storage, which may be a directory or block device
       --disk-kind <DISK_KIND>
-          Cache type: file system ("fs") or block device ("block") Defaults to file system if not specified [default: fs] [possible values: block, fs]
+          Kind of disk cache, which may be a file system or block device [default: fs] [possible values: block, fs]
       --disk-capacity <DISK_CAPACITY>
-          Maximum disk cache capacity (e.g., "100GiB") Defaults to 80% of available space if not specified
+          Maximum disk cache capacity (e.g., "100GiB") If not specified, up to 80% of the available space will be used
       --hedge-latency-quantile <HEDGE_LATENCY_QUANTILE>
-          S3 hedge request latency quantile (0.0-1.0, use 0 to disable hedging) Default: 0.99 (99th percentile) [default: 0.99]
+          S3 hedge request latency quantile (0.0-1.0, use 0 to disable hedging) [default: 0.99]
   -h, --help
           Print help
   -V, --version

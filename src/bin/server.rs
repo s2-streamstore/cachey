@@ -11,17 +11,16 @@ use tracing::info;
 
 #[derive(ArgGroup, Debug)]
 struct DiskCacheGroup {
-    /// Path for disk cache storage (directory or block device)
+    /// Path to disk cache storage, which may be a directory or block device
     #[arg(long)]
     disk_path: Option<PathBuf>,
 
-    /// Cache type: file system ("fs") or block device ("block")
-    /// Defaults to file system if not specified
+    /// Kind of disk cache, which may be a file system or block device
     #[arg(long, default_value = "fs", requires = "disk_path")]
     disk_kind: DiskCacheKind,
 
     /// Maximum disk cache capacity (e.g., "100GiB")
-    /// Defaults to 80% of available space if not specified
+    /// If not specified, up to 80% of the available space will be used
     #[arg(long, value_parser = parse_bytes, requires = "disk_path")]
     disk_capacity: Option<ByteSize>,
 }
@@ -46,16 +45,15 @@ struct TlsConfig {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// TLS configuration (defaults to plain HTTP if not specified)
+    /// TLS configuration (defaults to plain HTTP if not specified).
     #[command(flatten)]
     tls: TlsConfig,
 
-    /// Port to listen on (default: 443 for HTTPS, 80 for HTTP)
+    /// Port to listen on [default: 443 if HTTPS configured, otherwise 80 for HTTP]
     #[arg(long)]
     port: Option<u16>,
 
     /// Maximum memory to use for cache (e.g., "512MiB", "2GB", "1.5GiB")
-    /// Defaults to 4GiB if not specified
     #[arg(long, value_parser = parse_bytes, default_value = "4GiB")]
     cache_memory: ByteSize,
 
@@ -64,7 +62,6 @@ struct Args {
     disk_cache: DiskCacheGroup,
 
     /// S3 hedge request latency quantile (0.0-1.0, use 0 to disable hedging)
-    /// Default: 0.99 (99th percentile)
     #[arg(long, default_value = "0.99", value_parser = parse_hedge_quantile)]
     hedge_latency_quantile: f64,
 }
