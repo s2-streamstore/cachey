@@ -19,17 +19,19 @@ Non-standard HTTP headers are prefixed with `C0-`.
 Request:
 - `HEAD|GET /fetch/{kind}/{object}`
   - `kind` and `object` together form the cache key.
-  - `kind` can be a string upto 64 characters that uniquely identifies the set of buckets the object is stored on, and may be the bucket itself if the object is only stored on a single bucket.
+  - `kind` can be a string upto 64 characters that uniquely identifies the set of buckets the object is stored on.
   - `object` is the object key in the object store.
+
+Headers:
 - `Range` **required**
   - Only supported form is `bytes={first}-{last}`.
 - `C0-Bucket` **optional**
   - Multiple occurrences indicate the set of buckets the object is stored on, in client's preference order.
-  - If none provided, `kind` used as singleton set of buckets.
+  - If none provided, `kind` is interpreted as singular bucket for the object.
   - The client's preference may not be respected based on recent operational statistics i.e. latency and error rates.
   - At most 2 buckets will be attempted, including when an object was not found.
 
-The service maps each request to page-aligned ranges per object. The page size is currently hardcoded to 16 MiB.
+The service will map each request to page-aligned ranges per object.
 
 Standard HTTP response semantics can be expected, and status code and headers are sent eagerly based on the first page read.
 - Codes: 206, 404, ..
@@ -41,15 +43,15 @@ Standard HTTP response semantics can be expected, and status code and headers ar
   - `C0-Status: {first}-{last}; {bucket}; {cached_at}`
     - Byte range, source bucket, and whether it was a hit or miss
     - `cached_at` is Unix epoch timestamp in seconds that will be 0 in case of a miss
-    - As a header for first page accessed only, status for subsequent pages follows as trailers after the body
+    - Sent as a header for the first page accessed only; status for all pages follows as trailers after the body
 
-## Monitoring
+### Monitoring
 
 `GET /stats` returns throughput stats as JSON for load balancing and health checking.
 
 `GET /metrics` returns a more comprehensive set of metrics in Prometheus text format.
 
-### Command line options
+## Command line
 
 ```
 Usage: server [OPTIONS]
@@ -81,13 +83,5 @@ Options:
 
 ## Development
 
-See [CLAUDE.md](CLAUDE.md) for development guidelines.
-
-## License
-
-Licensed under either of
-
- * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
- * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+- [justfile](./justfile)
+- [AGENTS](./AGENTS)
