@@ -2,12 +2,12 @@
 
 A high-performance read-through cache for S3-compatible object storage.
 
-- Simple HTTP API.
-- Hybrid memory + disk cache powered by [foyer](https://foyer.rs/).
-- Fixed 16 MiB page size – maps requested range to page-aligned lookups.
-- Coalesces concurrent requests for the same page.
-- Makes hedged requests to manage tail latency of object storage.
-- Can attempt redundant buckets for a given object.
+- Simple HTTP API
+- Hybrid memory + disk cache powered by [foyer](https://foyer.rs/)
+- Fixed 16 MiB page size – maps requested range to page-aligned lookups
+- Coalesces concurrent requests for the same page
+- Makes hedged requests to manage tail latency of object storage
+- Can attempt redundant buckets for a given object
 
 ## API
 
@@ -66,8 +66,8 @@ The service maps requests to 16 MiB page-aligned ranges and the response has sta
 
 `C0-Status` format: `{first}-{last}; {bucket}; {cached_at}`
 - Byte range and which bucket was used
-- `cached_at` is Unix timestamp (0 = cache miss)
-- Only first page status is sent as a header; status for subsequent pages follows the body as trailers.
+- `cached_at` is Unix timestamp with 0 implying a cache miss
+- Only first page status is sent as a header; status for subsequent pages follows the body as trailers
 
 #### Example Response
 
