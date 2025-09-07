@@ -4,7 +4,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
 use bytes::{Bytes, BytesMut};
 use cachey::{
-    object_store::{DownloadError, Downloader},
+    object_store::{DownloadError, Downloader, S3RequestProfile},
     service::{PAGE_SIZE, SlidingThroughput},
     types::{BucketName, BucketNameSet, ObjectKey},
 };
@@ -93,7 +93,12 @@ async fn test_download_full_object() {
 
     // Download a small range from the beginning
     let out = downloader
-        .download(&buckets, key, &Range { start: 0, end: 100 })
+        .download(
+            &buckets,
+            key,
+            &Range { start: 0, end: 100 },
+            &S3RequestProfile::default(),
+        )
         .await
         .unwrap();
 
@@ -128,6 +133,7 @@ async fn test_download_partial_range() {
                 start: 1000,
                 end: 2000,
             },
+            &S3RequestProfile::default(),
         )
         .await
         .unwrap();
@@ -146,7 +152,12 @@ async fn test_download_no_such_key() {
     let key = ObjectKey::new("non-existent-key").unwrap();
 
     let result = downloader
-        .download(&buckets, key, &Range { start: 0, end: 100 })
+        .download(
+            &buckets,
+            key,
+            &Range { start: 0, end: 100 },
+            &S3RequestProfile::default(),
+        )
         .await;
 
     match result {
@@ -179,6 +190,7 @@ async fn test_download_range_not_satisfied() {
                 start: 0,
                 end: 1000,
             },
+            &S3RequestProfile::default(),
         )
         .await
         .unwrap();
@@ -210,6 +222,7 @@ async fn test_download_page_sized_range_from_small_object() {
                 start: 0,
                 end: PAGE_SIZE,
             },
+            &S3RequestProfile::default(),
         )
         .await
         .unwrap();
@@ -262,6 +275,7 @@ async fn test_download_with_fallback_bucket() {
                 start: 0,
                 end: test_data.len() as u64,
             },
+            &S3RequestProfile::default(),
         )
         .await
         .unwrap();
@@ -300,7 +314,7 @@ async fn test_download_multiple_ranges_same_object() {
 
     for range in ranges {
         let out = downloader
-            .download(&buckets, key.clone(), &range)
+            .download(&buckets, key.clone(), &range, &S3RequestProfile::default())
             .await
             .unwrap();
 
@@ -337,6 +351,7 @@ async fn test_download_with_hedged_requests() {
                     start: 0,
                     end: test_data.len() as u64,
                 },
+                &S3RequestProfile::default(),
             )
             .await
             .unwrap();
@@ -356,7 +371,12 @@ async fn test_download_empty_range() {
     let key = ObjectKey::new("any-key").unwrap();
 
     let _ = downloader
-        .download(&buckets, key, &Range { start: 10, end: 10 })
+        .download(
+            &buckets,
+            key,
+            &Range { start: 10, end: 10 },
+            &S3RequestProfile::default(),
+        )
         .await;
 }
 
@@ -384,6 +404,7 @@ async fn test_download_last_byte() {
                 start: 1023,
                 end: 1024,
             },
+            &S3RequestProfile::default(),
         )
         .await
         .unwrap();
@@ -419,6 +440,7 @@ async fn test_small_object_full_range() {
                 start: 0,
                 end: test_data.len() as u64,
             },
+            &S3RequestProfile::default(),
         )
         .await
         .unwrap();
@@ -447,7 +469,12 @@ async fn test_small_object_partial_range() {
     let key = ObjectKey::new(object_key).unwrap();
 
     let out = downloader
-        .download(&buckets, key, &Range { start: 10, end: 20 })
+        .download(
+            &buckets,
+            key,
+            &Range { start: 10, end: 20 },
+            &S3RequestProfile::default(),
+        )
         .await
         .unwrap();
 
@@ -478,6 +505,7 @@ async fn test_1kb_object() {
                 start: 0,
                 end: test_data.len() as u64,
             },
+            &S3RequestProfile::default(),
         )
         .await
         .unwrap();
@@ -510,6 +538,7 @@ async fn test_100kb_object_partial_range() {
                 start: 50000,
                 end: 60000,
             },
+            &S3RequestProfile::default(),
         )
         .await
         .unwrap();

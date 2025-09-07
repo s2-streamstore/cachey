@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use tokio::{select, time::Instant};
 
 use crate::{
-    object_store::{BucketMetrics, stats::BucketedStats},
+    object_store::{BucketMetrics, profile::S3RequestProfile, stats::BucketedStats},
     service::SlidingThroughput,
     types::{BucketName, BucketNameSet, ObjectKey},
 };
@@ -87,12 +87,13 @@ impl Downloader {
         buckets: &BucketNameSet,
         object: ObjectKey,
         byterange: &Range<u64>,
+        s3_profile: &S3RequestProfile,
     ) -> Result<DownloadOutput, DownloadError> {
         assert!(byterange.start < byterange.end);
         let mut attempt_order = self.bucketed_stats.attempt_order(buckets.iter());
         let primary_bucket_idx = attempt_order.next().expect("non-empty");
         match (
-            self.attempt(&buckets[primary_bucket_idx], &object, byterange)
+            self.attempt(&buckets[primary_bucket_idx], &object, byterange, s3_profile)
                 .await,
             attempt_order.next(),
         ) {
@@ -104,7 +105,12 @@ impl Downloader {
             }),
             (Err(e), Some(secondary_bucket_idx)) if e.should_attempt_fallback_bucket() => {
                 let piece = self
-                    .attempt(&buckets[secondary_bucket_idx], &object, byterange)
+                    .attempt(
+                        &buckets[secondary_bucket_idx],
+                        &object,
+                        byterange,
+                        s3_profile,
+                    )
                     .await?;
                 Ok(DownloadOutput {
                     piece,
@@ -122,9 +128,10 @@ impl Downloader {
         bucket: &BucketName,
         object: &ObjectKey,
         byterange: &Range<u64>,
+        s3_profile: &S3RequestProfile,
     ) -> Result<ObjectPiece, DownloadError> {
         let start_time = Instant::now();
-        let primary_future = self.attempt_inner(bucket, object, byterange);
+        let primary_future = self.attempt_inner(bucket, object, byterange, s3_profile);
         tokio::pin!(primary_future);
         select! {
             primary_result = &mut primary_future => {
@@ -138,7 +145,7 @@ impl Downloader {
             }
             hedge_threshold = self.hedge_trigger(bucket, start_time) => {
                 let hedge_start_time = Instant::now();
-                let hedge_future = self.attempt_inner(bucket, object, byterange);
+                let hedge_future = self.attempt_inner(bucket, object, byterange, s3_profile);
                 select! {
                     primary_result = primary_future => {
                         self.handle_result(
@@ -168,18 +175,34 @@ impl Downloader {
         bucket: &BucketName,
         key: &ObjectKey,
         byterange: &Range<u64>,
+        s3_profile: &S3RequestProfile,
     ) -> Result<
         GetObjectOutput,
         aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
     > {
-        self.s3
+        let request = self
+            .s3
             .get_object()
             .bucket(&**bucket)
             .key(&**key)
             .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
-            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
-            .send()
-            .await
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+
+        if s3_profile.is_noop() {
+            request.send().await
+        } else {
+            request
+                .customize()
+                .config_override(
+                    self.s3
+                        .config()
+                        .to_builder()
+                        .timeout_config(s3_profile.timeout_config())
+                        .retry_config(s3_profile.retry_config()),
+                )
+                .send()
+                .await
+        }
     }
 
     async fn handle_result(
@@ -481,7 +504,12 @@ mod tests {
 
         // This should panic due to assertion
         let _ = downloader
-            .download(&buckets, key, &Range { start: 10, end: 10 })
+            .download(
+                &buckets,
+                key,
+                &Range { start: 10, end: 10 },
+                &S3RequestProfile::default(),
+            )
             .await;
     }
 
