@@ -29,6 +29,13 @@ Headers:
   - If none provided, `kind` is interpreted as singular bucket for the object.
   - The client's preference may not be respected based on recent operational statistics i.e. latency and error rates.
   - At most 2 buckets will be attempted, including when an object was not found.
+- `C0-Upstream` **optional**
+  - Override the config of each S3 request made in case of a miss, as whitespace-separated `key=value` pairs:
+  - `ot=<milliseconds>` Operation timeout
+  - `oat=<milliseconds>` Operation attempt timeout
+  - `ma=<number>` Maximum attempts
+  - `ib=<milliseconds>` Initial backoff duration
+  - `mb=<milliseconds>` Maximum backoff duration
 
 The service will map each request to page-aligned ranges per object.
 
