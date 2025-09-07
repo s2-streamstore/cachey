@@ -2,54 +2,86 @@
 
 A high-performance read-through cache for S3-compatible object storage.
 
-- Simple HTTP API.
-- Hybrid memory + disk cache powered by [foyer](https://foyer.rs/).
-- Fixed 16 MiB page size – maps requested range to page-aligned lookups.
-- Coalesces concurrent requests for the same page.
-- Makes hedged requests to manage tail latency of object storage.
-- Can attempt redundant buckets for a given object.
+- Simple HTTP API
+- Hybrid memory + disk cache powered by [foyer](https://foyer.rs/)
+- Fixed 16 MiB page size – maps requested range to page-aligned lookups
+- Coalesces concurrent requests for the same page
+- Makes hedged requests to manage tail latency of object storage
+- Can attempt redundant buckets for a given object
 
 ## API
 
 ### Fetching data
 
-Non-standard HTTP headers are prefixed with `C0-`.
+#### Request
 
-Request:
-- `HEAD|GET /fetch/{kind}/{object}`
-  - `kind` and `object` together form the cache key.
-  - `kind` can be a string upto 64 characters that uniquely identifies the set of buckets the object is stored on.
-  - `object` is the object key in the object store.
+```
+HEAD|GET /fetch/{kind}/{object}
+```
+- `kind` + `object` form the cache key
+- `kind` identifies the bucket set (up to 64 chars)
+- `object` is the S3 object key
 
-Headers:
-- `Range` **required**
-  - Only supported form is `bytes={first}-{last}`.
-- `C0-Bucket` **optional**
-  - Multiple occurrences indicate the set of buckets the object is stored on, in client's preference order.
-  - If none provided, `kind` is interpreted as singular bucket for the object.
-  - The client's preference may not be respected based on recent operational statistics i.e. latency and error rates.
-  - At most 2 buckets will be attempted, including when an object was not found.
-- `C0-Upstream` **optional**
-  - Override the config of each S3 request made in case of a miss, as whitespace-separated `key=value` pairs:
-  - `ot=<milliseconds>` Operation timeout
-  - `oat=<milliseconds>` Operation attempt timeout
-  - `ma=<number>` Maximum attempts
-  - `ib=<milliseconds>` Initial backoff duration
-  - `mb=<milliseconds>` Maximum backoff duration
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Range` | ✅ | Byte range in format `bytes={first}-{last}` |
+| `C0-Bucket` | ❌ | Bucket(s) containing the object |
+| `C0-Upstream` | ❌ | Override S3 request config |
 
-The service will map each request to page-aligned ranges per object.
+`C0-Bucket` behavior:
+- Multiple headers indicate bucket preference order
+- If omitted, `kind` is used as the singular bucket name
+- Client preference may be overridden based on internal latency/error stats
+- At most 2 buckets attempted per page miss
 
-Standard HTTP response semantics can be expected, and status code and headers are sent eagerly based on the first page read.
-- Codes: 206, 404, ..
-- Headers:
-  - `Content-Range`
-  - `Content-Length`
-  - `Last-Modified` of first page
-  - `Content-Type` is always `application/octet-stream`
-  - `C0-Status: {first}-{last}; {bucket}; {cached_at}`
-    - Byte range, source bucket, and whether it was a hit or miss
-    - `cached_at` is Unix epoch timestamp in seconds that will be 0 in case of a miss
-    - Sent as a header for the first page accessed only; status for all pages follows as trailers after the body
+`C0-Upstream` overrides:
+Space-separated key-value pairs to override S3 request configuration, per page miss.
+- `ot=<ms>` Operation timeout
+- `oat=<ms>` Operation attempt timeout
+- `ma=<num>` Maximum attempts
+- `ib=<ms>` Initial backoff duration
+- `mb=<ms>` Maximum backoff duration
+
+#### Example Request
+
+```http
+GET /fetch/prod-videos/movie-2024.mp4 HTTP/1.1
+Range: bytes=1048576-18874367
+C0-Bucket: us-west-videos
+C0-Bucket: us-east-videos-backup
+C0-Upstream: ot=1500 ma=3
+```
+
+#### Response
+
+The service maps requests to 16 MiB page-aligned ranges and the response has standard HTTP semantics (`206 Partial Content`, `404 Not Found` etc.)
+
+| Header | Description |
+|--------|-------------|
+| `Content-Range` | Actual byte range served |
+| `Content-Length` | Number of bytes in response |
+| `Last-Modified` | Timestamp from first page |
+| `Content-Type` | Always `application/octet-stream` |
+| `C0-Status` | Status for first page |
+
+`C0-Status` format: `{first}-{last}; {bucket}; {cached_at}`
+- Byte range and which bucket was used
+- `cached_at` is Unix timestamp with 0 implying a cache miss
+- Only first page status is sent as a header; status for subsequent pages follows the body as trailers
+
+#### Example Response
+
+```http
+HTTP/1.1 206 Partial Content
+Content-Range: bytes 1048576-18874367/52428800
+Content-Length: 17825792
+Content-Type: application/octet-stream
+C0-Status: 1048576-16777215; us-west-videos; 1704067200
+
+[binary data]
+
+C0-Status: 16777216-18874367; us-west-videos; 0
+```
 
 ### Monitoring
 
