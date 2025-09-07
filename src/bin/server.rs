@@ -111,9 +111,6 @@ async fn main() -> eyre::Result<()> {
 
     info!(?service_config);
 
-    // TODO: override default timeouts & retries
-    // maybe it should be a header param for expected latency and derive from there
-    // very different for nvme vs hdd object storage & potentially cross-region
     let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let s3_client = aws_sdk_s3::Client::new(&aws_config);
 

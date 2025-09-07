@@ -17,13 +17,14 @@ use http_body_util::{BodyExt as _, StreamBody};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-    object_store::DownloadError,
+    object_store::{DownloadError, S3RequestProfile},
     service::{CacheyService, Chunk, ServiceError, metrics},
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
 };
 
 const CONTENT_TYPE: &str = "application/octet-stream";
 static C0_BUCKET_HEADER: HeaderName = HeaderName::from_static("c0-bucket");
+static C0_UPSTREAM_HEADER: HeaderName = HeaderName::from_static("c0-upstream");
 
 #[derive(Debug)]
 pub struct RangeHeader(pub Range<u64>);
@@ -64,6 +65,64 @@ where
     }
 }
 
+impl<S> FromRequestParts<S> for S3RequestProfile
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let Some(header_value) = parts.headers.get(&C0_UPSTREAM_HEADER) else {
+            return Ok(S3RequestProfile::default());
+        };
+
+        let header_str = header_value.to_str().map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Invalid C0-Upstream header encoding",
+            )
+        })?;
+
+        let mut profile = S3RequestProfile::default();
+
+        for pair in header_str.split_whitespace() {
+            let Some((key, value)) = pair.split_once('=') else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Malformed C0-Upstream header: missing '=' in key-value pair",
+                ));
+            };
+
+            let parse_duration = |v: &str| -> Result<Duration, Self::Rejection> {
+                v.parse::<u64>().map(Duration::from_millis).map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Invalid duration value in C0-Upstream header",
+                    )
+                })
+            };
+
+            match key {
+                "ot" => profile.operation_timeout = Some(parse_duration(value)?),
+                "oat" => profile.operation_attempt_timeout = Some(parse_duration(value)?),
+                "ma" => {
+                    profile.max_attempts = Some(value.parse().map_err(|_| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            "Invalid max_attempts value in C0-Upstream header",
+                        )
+                    })?)
+                }
+                "ib" => profile.initial_backoff = Some(parse_duration(value)?),
+                "mb" => profile.max_backoff = Some(parse_duration(value)?),
+                _ => return Err((StatusCode::BAD_REQUEST, "Unknown key in C0-Upstream header")),
+            }
+        }
+
+        Ok(profile)
+    }
+}
+
 #[derive(Debug)]
 pub struct BucketHeaders(pub Vec<BucketName>);
 
@@ -93,6 +152,7 @@ pub async fn fetch(
     method: axum::http::Method,
     RangeHeader(byterange): RangeHeader,
     BucketHeaders(buckets): BucketHeaders,
+    s3_profile: S3RequestProfile,
 ) -> Response {
     let buckets = if buckets.is_empty() {
         BucketNameSet::new(std::iter::once(kind.clone().into()))
@@ -119,6 +179,7 @@ pub async fn fetch(
                 buckets,
                 byterange.clone(),
                 concurrency,
+                s3_profile,
             )
             .await
             .peekable(),
@@ -284,4 +345,106 @@ fn on_chunk_error(
         ),
     );
     status_code
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::Request;
+
+    use super::*;
+
+    fn create_parts_with_headers(headers: Vec<(&HeaderName, &str)>) -> Parts {
+        let mut req = Request::builder();
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        let (parts, _) = req.body(()).unwrap().into_parts();
+        parts
+    }
+
+    #[tokio::test]
+    async fn test_s3_request_profile_default() {
+        let mut parts = create_parts_with_headers(vec![]);
+        let profile = S3RequestProfile::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert!(profile.operation_timeout.is_none());
+        assert!(profile.operation_attempt_timeout.is_none());
+        assert!(profile.max_attempts.is_none());
+        assert!(profile.initial_backoff.is_none());
+        assert!(profile.max_backoff.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_s3_request_profile_parse() {
+        let mut parts = create_parts_with_headers(vec![(
+            &C0_UPSTREAM_HEADER,
+            "ot=5000 oat=1000 ma=3 ib=100 mb=5000",
+        )]);
+
+        let profile = S3RequestProfile::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert_eq!(profile.operation_timeout, Some(Duration::from_millis(5000)));
+        assert_eq!(
+            profile.operation_attempt_timeout,
+            Some(Duration::from_millis(1000))
+        );
+        assert_eq!(profile.max_attempts, Some(3));
+        assert_eq!(profile.initial_backoff, Some(Duration::from_millis(100)));
+        assert_eq!(profile.max_backoff, Some(Duration::from_millis(5000)));
+    }
+
+    #[tokio::test]
+    async fn test_s3_request_profile_partial() {
+        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "ot=2000 ma=5")]);
+
+        let profile = S3RequestProfile::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert_eq!(profile.operation_timeout, Some(Duration::from_millis(2000)));
+        assert_eq!(profile.operation_attempt_timeout, None);
+        assert_eq!(profile.max_attempts, Some(5));
+        assert_eq!(profile.initial_backoff, None);
+        assert_eq!(profile.max_backoff, None);
+    }
+
+    #[tokio::test]
+    async fn test_s3_request_profile_malformed_missing_equals() {
+        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "ot5000 ma=3")]);
+
+        let result = S3RequestProfile::from_request_parts(&mut parts, &()).await;
+
+        assert!(result.is_err());
+        let (status, msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("missing '='"));
+    }
+
+    #[tokio::test]
+    async fn test_s3_request_profile_invalid_duration() {
+        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "ot=abc")]);
+
+        let result = S3RequestProfile::from_request_parts(&mut parts, &()).await;
+
+        assert!(result.is_err());
+        let (status, msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("Invalid duration"));
+    }
+
+    #[tokio::test]
+    async fn test_s3_request_profile_unknown_key() {
+        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "unknown=100")]);
+
+        let result = S3RequestProfile::from_request_parts(&mut parts, &()).await;
+
+        assert!(result.is_err());
+        let (status, msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("Unknown key"));
+    }
 }
