@@ -379,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn test_s3_request_profile_parse() {
         let mut parts = create_parts_with_headers(vec![(
-            &C0_PROFILE_HEADER,
+            &C0_UPSTREAM_HEADER,
             "ot=5000 oat=1000 ma=3 ib=100 mb=5000",
         )]);
 
@@ -399,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_request_profile_partial() {
-        let mut parts = create_parts_with_headers(vec![(&C0_PROFILE_HEADER, "ot=2000 ma=5")]);
+        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "ot=2000 ma=5")]);
 
         let profile = S3RequestProfile::from_request_parts(&mut parts, &())
             .await
@@ -414,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_request_profile_malformed_missing_equals() {
-        let mut parts = create_parts_with_headers(vec![(&C0_PROFILE_HEADER, "ot5000 ma=3")]);
+        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "ot5000 ma=3")]);
 
         let result = S3RequestProfile::from_request_parts(&mut parts, &()).await;
 
@@ -426,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_request_profile_invalid_duration() {
-        let mut parts = create_parts_with_headers(vec![(&C0_PROFILE_HEADER, "ot=abc")]);
+        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "ot=abc")]);
 
         let result = S3RequestProfile::from_request_parts(&mut parts, &()).await;
 
@@ -438,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_request_profile_unknown_key() {
-        let mut parts = create_parts_with_headers(vec![(&C0_PROFILE_HEADER, "unknown=100")]);
+        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "unknown=100")]);
 
         let result = S3RequestProfile::from_request_parts(&mut parts, &()).await;
 
