@@ -24,7 +24,7 @@ use crate::{
 
 const CONTENT_TYPE: &str = "application/octet-stream";
 static C0_BUCKET_HEADER: HeaderName = HeaderName::from_static("c0-bucket");
-static C0_PROFILE_HEADER: HeaderName = HeaderName::from_static("c0-profile");
+static C0_UPSTREAM_HEADER: HeaderName = HeaderName::from_static("c0-upstream");
 
 #[derive(Debug)]
 pub struct RangeHeader(pub Range<u64>);
@@ -72,14 +72,14 @@ where
     type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let Some(header_value) = parts.headers.get(&C0_PROFILE_HEADER) else {
+        let Some(header_value) = parts.headers.get(&C0_UPSTREAM_HEADER) else {
             return Ok(S3RequestProfile::default());
         };
 
         let header_str = header_value.to_str().map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                "Invalid C0-Profile header encoding",
+                "Invalid C0-Upstream header encoding",
             )
         })?;
 
@@ -89,7 +89,7 @@ where
             let Some((key, value)) = pair.split_once('=') else {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "Malformed C0-Profile header: missing '=' in key-value pair",
+                    "Malformed C0-Upstream header: missing '=' in key-value pair",
                 ));
             };
 
@@ -97,7 +97,7 @@ where
                 v.parse::<u64>().map(Duration::from_millis).map_err(|_| {
                     (
                         StatusCode::BAD_REQUEST,
-                        "Invalid duration value in C0-Profile header",
+                        "Invalid duration value in C0-Upstream header",
                     )
                 })
             };
@@ -109,13 +109,13 @@ where
                     profile.max_attempts = Some(value.parse().map_err(|_| {
                         (
                             StatusCode::BAD_REQUEST,
-                            "Invalid max_attempts value in C0-Profile header",
+                            "Invalid max_attempts value in C0-Upstream header",
                         )
                     })?)
                 }
                 "ib" => profile.initial_backoff = Some(parse_duration(value)?),
                 "mb" => profile.max_backoff = Some(parse_duration(value)?),
-                _ => return Err((StatusCode::BAD_REQUEST, "Unknown key in C0-Profile header")),
+                _ => return Err((StatusCode::BAD_REQUEST, "Unknown key in C0-Upstream header")),
             }
         }
 
