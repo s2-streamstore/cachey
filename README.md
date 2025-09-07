@@ -13,19 +13,14 @@ A high-performance read-through cache for S3-compatible object storage.
 
 ### Fetching data
 
-#### Endpoint
+#### Request
 
 ```
 HEAD|GET /fetch/{kind}/{object}
 ```
-
 - `kind` + `object` form the cache key
-- `kind` identifies the bucket set (up to 64 chars)  
+- `kind` identifies the bucket set (up to 64 chars)
 - `object` is the S3 object key
-
-#### Request Headers
-
-All custom headers are prefixed with `C0-`.
 
 | Header | Required | Description |
 |--------|----------|-------------|
@@ -35,14 +30,14 @@ All custom headers are prefixed with `C0-`.
 
 **C0-Bucket behavior:**
 - Multiple headers indicate bucket preference order
-- If omitted, `kind` is used as the single bucket name
-- Client preference may be overridden based on latency/error stats
-- Maximum 2 buckets attempted per request
+- If omitted, `kind` is used as the singular bucket name
+- Client preference may be overridden based on internal latency/error stats
+- Maximum 2 buckets attempted per page miss
 
 **C0-Upstream overrides:**
-Space-separated `key=value` pairs to override S3 request timeouts:
+Space-separated key-value pairs to override S3 request configuration per page missing in the cache.
 - `ot=<ms>` Operation timeout
-- `oat=<ms>` Operation attempt timeout  
+- `oat=<ms>` Operation attempt timeout
 - `ma=<num>` Maximum attempts
 - `ib=<ms>` Initial backoff duration
 - `mb=<ms>` Maximum backoff duration
