@@ -25,16 +25,16 @@ HEAD|GET /fetch/{kind}/{object}
 | Header | Required | Description |
 |--------|----------|-------------|
 | `Range` | ✅ | Byte range in format `bytes={first}-{last}` |
-| `C0-Bucket` | ❌ | Bucket(s) containing the object (multiple values = preference order) |
-| `C0-Upstream` | ❌ | Override S3 request config (see below) |
+| `C0-Bucket` | ❌ | Bucket(s) containing the object |
+| `C0-Upstream` | ❌ | Override S3 request config |
 
-**C0-Bucket behavior:**
+`C0-Bucket` behavior:
 - Multiple headers indicate bucket preference order
 - If omitted, `kind` is used as the singular bucket name
 - Client preference may be overridden based on internal latency/error stats
 - Maximum 2 buckets attempted per page miss
 
-**C0-Upstream overrides:**
+`C0-Upstream` overrides:
 Space-separated key-value pairs to override S3 request configuration per page missing in the cache.
 - `ot=<ms>` Operation timeout
 - `oat=<ms>` Operation attempt timeout
@@ -54,23 +54,20 @@ C0-Upstream: ot=1500 ma=3
 
 #### Response
 
-The service maps requests to 16 MiB page-aligned ranges and returns standard HTTP semantics:
+The service maps requests to 16 MiB page-aligned ranges and the response has standard HTTP semantics (`206 Partial Content`, `404 Not Found` etc.)
 
-**Status codes:** `206` (Partial Content), `404` (Not Found), etc.
-
-**Response headers:**
 | Header | Description |
 |--------|-------------|
 | `Content-Range` | Actual byte range served |
 | `Content-Length` | Number of bytes in response |
 | `Last-Modified` | Timestamp from first page |
 | `Content-Type` | Always `application/octet-stream` |
-| `C0-Status` | Cache status for first page (format below) |
+| `C0-Status` | Status for first page |
 
-**C0-Status format:** `{first}-{last}; {bucket}; {cached_at}`
-- Byte range served from this bucket
+`C0-Status` format: `{first}-{last}; {bucket}; {cached_at}`
+- Byte range and which bucket was used
 - `cached_at` is Unix timestamp (0 = cache miss)
-- All page statuses (including the first) follow as HTTP trailers
+- Only first page status is sent as a header; status for subsequent pages follows the body as trailers.
 
 #### Example Response
 
