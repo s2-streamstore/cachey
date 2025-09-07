@@ -80,7 +80,6 @@ C0-Status: 1048576-16777215; us-west-videos; 1704067200
 
 [binary data]
 
-C0-Status: 1048576-16777215; us-west-videos; 1704067200
 C0-Status: 16777216-18874367; us-west-videos; 0
 ```
 
