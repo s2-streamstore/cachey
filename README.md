@@ -51,10 +51,10 @@ Space-separated `key=value` pairs to override S3 request timeouts:
 
 ```http
 GET /fetch/prod-videos/movie-2024.mp4 HTTP/1.1
-Range: bytes=1048576-2097151
+Range: bytes=1048576-18874367
 C0-Bucket: us-west-videos
 C0-Bucket: us-east-videos-backup
-C0-Upstream: ot=30000 ma=3
+C0-Upstream: ot=1500 ma=3
 ```
 
 #### Response
@@ -81,14 +81,15 @@ The service maps requests to 16 MiB page-aligned ranges and returns standard HTT
 
 ```http
 HTTP/1.1 206 Partial Content
-Content-Range: bytes 1048576-2097151/52428800
-Content-Length: 1048576
+Content-Range: bytes 1048576-18874367/52428800
+Content-Length: 17825792
 Content-Type: application/octet-stream
-C0-Status: 1048576-2097151; us-west-videos; 1704067200
+C0-Status: 1048576-16777215; us-west-videos; 1704067200
 
 [binary data]
 
-C0-Status: 2097152-3145727; us-west-videos; 0
+C0-Status: 1048576-16777215; us-west-videos; 1704067200
+C0-Status: 16777216-18874367; us-west-videos; 0
 ```
 
 ### Monitoring
