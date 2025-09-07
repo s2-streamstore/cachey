@@ -242,10 +242,8 @@ pub async fn fetch(
                     if chunk_idx > 0 {
                         trailers.insert("c0-status", c0_status(&chunk));
                     }
-                    let chunk_end = chunk.range.end;
-                    let object_size = chunk.object_size;
                     yield Ok(Frame::data(chunk.data));
-                    if chunk_end == object_size {
+                    if chunk.range.end == chunk.object_size {
                         break;
                     }
                 },
