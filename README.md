@@ -32,10 +32,10 @@ HEAD|GET /fetch/{kind}/{object}
 - Multiple headers indicate bucket preference order
 - If omitted, `kind` is used as the singular bucket name
 - Client preference may be overridden based on internal latency/error stats
-- Maximum 2 buckets attempted per page miss
+- At most 2 buckets attempted per page miss
 
 `C0-Upstream` overrides:
-Space-separated key-value pairs to override S3 request configuration per page missing in the cache.
+Space-separated key-value pairs to override S3 request configuration, per page miss.
 - `ot=<ms>` Operation timeout
 - `oat=<ms>` Operation attempt timeout
 - `ma=<num>` Maximum attempts
