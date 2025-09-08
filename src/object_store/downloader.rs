@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use tokio::{select, time::Instant};
 
 use crate::{
-    object_store::{BucketMetrics, profile::S3RequestProfile, stats::BucketedStats},
+    object_store::{BucketMetrics, config::RequestConfig, stats::BucketedStats},
     service::SlidingThroughput,
     types::{BucketName, BucketNameSet, ObjectKey},
 };
@@ -87,13 +87,13 @@ impl Downloader {
         buckets: &BucketNameSet,
         object: ObjectKey,
         byterange: &Range<u64>,
-        s3_profile: &S3RequestProfile,
+        req_config: &RequestConfig,
     ) -> Result<DownloadOutput, DownloadError> {
         assert!(byterange.start < byterange.end);
         let mut attempt_order = self.bucketed_stats.attempt_order(buckets.iter());
         let primary_bucket_idx = attempt_order.next().expect("non-empty");
         match (
-            self.attempt(&buckets[primary_bucket_idx], &object, byterange, s3_profile)
+            self.attempt(&buckets[primary_bucket_idx], &object, byterange, req_config)
                 .await,
             attempt_order.next(),
         ) {
@@ -109,7 +109,7 @@ impl Downloader {
                         &buckets[secondary_bucket_idx],
                         &object,
                         byterange,
-                        s3_profile,
+                        req_config,
                     )
                     .await?;
                 Ok(DownloadOutput {
@@ -128,10 +128,10 @@ impl Downloader {
         bucket: &BucketName,
         object: &ObjectKey,
         byterange: &Range<u64>,
-        s3_profile: &S3RequestProfile,
+        req_config: &RequestConfig,
     ) -> Result<ObjectPiece, DownloadError> {
         let start_time = Instant::now();
-        let primary_future = self.attempt_inner(bucket, object, byterange, s3_profile);
+        let primary_future = self.attempt_inner(bucket, object, byterange, req_config);
         tokio::pin!(primary_future);
         select! {
             primary_result = &mut primary_future => {
@@ -145,7 +145,7 @@ impl Downloader {
             }
             hedge_threshold = self.hedge_trigger(bucket, start_time) => {
                 let hedge_start_time = Instant::now();
-                let hedge_future = self.attempt_inner(bucket, object, byterange, s3_profile);
+                let hedge_future = self.attempt_inner(bucket, object, byterange, req_config);
                 select! {
                     primary_result = primary_future => {
                         self.handle_result(
@@ -175,7 +175,7 @@ impl Downloader {
         bucket: &BucketName,
         key: &ObjectKey,
         byterange: &Range<u64>,
-        s3_profile: &S3RequestProfile,
+        req_config: &RequestConfig,
     ) -> Result<
         GetObjectOutput,
         aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
@@ -188,7 +188,7 @@ impl Downloader {
             .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
 
-        if s3_profile.is_noop() {
+        if req_config.is_noop() {
             request.send().await
         } else {
             request
@@ -197,8 +197,8 @@ impl Downloader {
                     self.s3
                         .config()
                         .to_builder()
-                        .timeout_config(s3_profile.timeout_config())
-                        .retry_config(s3_profile.retry_config()),
+                        .timeout_config(req_config.timeout_config())
+                        .retry_config(req_config.retry_config()),
                 )
                 .send()
                 .await
@@ -508,7 +508,7 @@ mod tests {
                 &buckets,
                 key,
                 &Range { start: 10, end: 10 },
-                &S3RequestProfile::default(),
+                &RequestConfig::default(),
             )
             .await;
     }

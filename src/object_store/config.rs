@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct S3RequestProfile {
+pub struct RequestConfig {
+    pub connect_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
     pub operation_timeout: Option<Duration>,
     pub operation_attempt_timeout: Option<Duration>,
     pub max_attempts: Option<u32>,
@@ -9,9 +11,11 @@ pub struct S3RequestProfile {
     pub max_backoff: Option<Duration>,
 }
 
-impl S3RequestProfile {
+impl RequestConfig {
     pub fn is_noop(&self) -> bool {
-        self.operation_timeout.is_none()
+        self.connect_timeout.is_none()
+            && self.read_timeout.is_none()
+            && self.operation_timeout.is_none()
             && self.operation_attempt_timeout.is_none()
             && self.max_attempts.is_none()
             && self.initial_backoff.is_none()
@@ -21,6 +25,12 @@ impl S3RequestProfile {
     pub fn timeout_config(&self) -> aws_sdk_s3::config::timeout::TimeoutConfig {
         let mut builder = aws_sdk_s3::config::timeout::TimeoutConfig::builder();
 
+        if let Some(connect_timeout) = self.connect_timeout {
+            builder = builder.connect_timeout(connect_timeout);
+        }
+        if let Some(read_timeout) = self.read_timeout {
+            builder = builder.read_timeout(read_timeout);
+        }
         if let Some(timeout) = self.operation_timeout {
             builder = builder.operation_timeout(timeout);
         }

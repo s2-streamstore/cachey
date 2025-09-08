@@ -26,7 +26,7 @@ HEAD|GET /fetch/{kind}/{object}
 |--------|----------|-------------|
 | `Range` | ✅ | Byte range in format `bytes={first}-{last}` |
 | `C0-Bucket` | ❌ | Bucket(s) containing the object |
-| `C0-Upstream` | ❌ | Override S3 request config |
+| `C0-Config` | ❌ | Override S3 request config |
 
 `C0-Bucket` behavior:
 - Multiple headers indicate bucket preference order
@@ -34,9 +34,11 @@ HEAD|GET /fetch/{kind}/{object}
 - Client preference may be overridden based on internal latency/error stats
 - At most 2 buckets attempted per page miss
 
-`C0-Upstream` overrides:
-Space-separated key-value pairs to override S3 request configuration, per page miss.
-- `ot=<ms>` Operation timeout
+`C0-Config` overrides:
+Space-separated key-value pairs to override S3 request configuration per page miss.
+- `ct=<ms>` Connect timeout (in case an existing connection could not be reused)
+- `rt=<ms>` Read timeout (time-to-first-byte)
+- `ot=<ms>` Operation timeout (across retries)
 - `oat=<ms>` Operation attempt timeout
 - `ma=<num>` Maximum attempts
 - `ib=<ms>` Initial backoff duration
@@ -49,7 +51,7 @@ GET /fetch/prod-videos/movie-2024.mp4 HTTP/1.1
 Range: bytes=1048576-18874367
 C0-Bucket: us-west-videos
 C0-Bucket: us-east-videos-backup
-C0-Upstream: ot=1500 ma=3
+C0-Config: ct=1000 oat=1500 ma=5 ib=10 mb=100
 ```
 
 #### Response

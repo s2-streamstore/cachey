@@ -17,14 +17,14 @@ use http_body_util::{BodyExt as _, StreamBody};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-    object_store::{DownloadError, S3RequestProfile},
+    object_store::{DownloadError, RequestConfig},
     service::{CacheyService, Chunk, ServiceError, metrics},
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
 };
 
 const CONTENT_TYPE: &str = "application/octet-stream";
 static C0_BUCKET_HEADER: HeaderName = HeaderName::from_static("c0-bucket");
-static C0_UPSTREAM_HEADER: HeaderName = HeaderName::from_static("c0-upstream");
+static C0_CONFIG_HEADER: HeaderName = HeaderName::from_static("c0-config");
 
 #[derive(Debug)]
 pub struct RangeHeader(pub Range<u64>);
@@ -65,31 +65,28 @@ where
     }
 }
 
-impl<S> FromRequestParts<S> for S3RequestProfile
+impl<S> FromRequestParts<S> for RequestConfig
 where
     S: Send + Sync,
 {
     type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let Some(header_value) = parts.headers.get(&C0_UPSTREAM_HEADER) else {
-            return Ok(S3RequestProfile::default());
+        let Some(header_value) = parts.headers.get(&C0_CONFIG_HEADER) else {
+            return Ok(RequestConfig::default());
         };
 
-        let header_str = header_value.to_str().map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Invalid C0-Upstream header encoding",
-            )
-        })?;
+        let header_str = header_value
+            .to_str()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid C0-Config header encoding"))?;
 
-        let mut profile = S3RequestProfile::default();
+        let mut config = RequestConfig::default();
 
         for pair in header_str.split_whitespace() {
             let Some((key, value)) = pair.split_once('=') else {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "Malformed C0-Upstream header: missing '=' in key-value pair",
+                    "Malformed C0-Config header: missing '=' in key-value pair",
                 ));
             };
 
@@ -97,29 +94,31 @@ where
                 v.parse::<u64>().map(Duration::from_millis).map_err(|_| {
                     (
                         StatusCode::BAD_REQUEST,
-                        "Invalid duration value in C0-Upstream header",
+                        "Invalid duration value in C0-Config header",
                     )
                 })
             };
 
             match key {
-                "ot" => profile.operation_timeout = Some(parse_duration(value)?),
-                "oat" => profile.operation_attempt_timeout = Some(parse_duration(value)?),
+                "ct" => config.connect_timeout = Some(parse_duration(value)?),
+                "rt" => config.read_timeout = Some(parse_duration(value)?),
+                "ot" => config.operation_timeout = Some(parse_duration(value)?),
+                "oat" => config.operation_attempt_timeout = Some(parse_duration(value)?),
                 "ma" => {
-                    profile.max_attempts = Some(value.parse().map_err(|_| {
+                    config.max_attempts = Some(value.parse().map_err(|_| {
                         (
                             StatusCode::BAD_REQUEST,
-                            "Invalid max_attempts value in C0-Upstream header",
+                            "Invalid max_attempts value in C0-Config hheader",
                         )
                     })?)
                 }
-                "ib" => profile.initial_backoff = Some(parse_duration(value)?),
-                "mb" => profile.max_backoff = Some(parse_duration(value)?),
-                _ => return Err((StatusCode::BAD_REQUEST, "Unknown key in C0-Upstream header")),
+                "ib" => config.initial_backoff = Some(parse_duration(value)?),
+                "mb" => config.max_backoff = Some(parse_duration(value)?),
+                _ => {} // Ignore unrecognized keys
             }
         }
 
-        Ok(profile)
+        Ok(config)
     }
 }
 
@@ -152,7 +151,7 @@ pub async fn fetch(
     method: axum::http::Method,
     RangeHeader(byterange): RangeHeader,
     BucketHeaders(buckets): BucketHeaders,
-    s3_profile: S3RequestProfile,
+    req_config: RequestConfig,
 ) -> Response {
     let buckets = if buckets.is_empty() {
         BucketNameSet::new(std::iter::once(kind.clone().into()))
@@ -179,7 +178,7 @@ pub async fn fetch(
                 buckets,
                 byterange.clone(),
                 concurrency,
-                s3_profile,
+                req_config,
             )
             .await
             .peekable(),
@@ -349,102 +348,137 @@ fn on_chunk_error(
 
 #[cfg(test)]
 mod tests {
-    use axum::http::Request;
-
     use super::*;
+    use axum::http::{HeaderValue, Method, Request};
+    use std::time::Duration;
 
-    fn create_parts_with_headers(headers: Vec<(&HeaderName, &str)>) -> Parts {
-        let mut req = Request::builder();
-        for (name, value) in headers {
-            req = req.header(name, value);
-        }
-        let (parts, _) = req.body(()).unwrap().into_parts();
-        parts
+    async fn parse_c0_config(
+        header_value: &str,
+    ) -> Result<RequestConfig, (StatusCode, &'static str)> {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(&C0_CONFIG_HEADER, header_value)
+            .body(())
+            .unwrap();
+
+        let (mut parts, _) = req.into_parts();
+        RequestConfig::from_request_parts(&mut parts, &()).await
     }
 
     #[tokio::test]
-    async fn test_s3_request_profile_default() {
-        let mut parts = create_parts_with_headers(vec![]);
-        let profile = S3RequestProfile::from_request_parts(&mut parts, &())
-            .await
+    async fn test_c0_config_empty_returns_default() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(())
             .unwrap();
 
-        assert!(profile.operation_timeout.is_none());
-        assert!(profile.operation_attempt_timeout.is_none());
-        assert!(profile.max_attempts.is_none());
-        assert!(profile.initial_backoff.is_none());
-        assert!(profile.max_backoff.is_none());
+        let (mut parts, _) = req.into_parts();
+        let config = RequestConfig::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        assert_eq!(config, RequestConfig::default());
     }
 
     #[tokio::test]
-    async fn test_s3_request_profile_parse() {
-        let mut parts = create_parts_with_headers(vec![(
-            &C0_UPSTREAM_HEADER,
-            "ot=5000 oat=1000 ma=3 ib=100 mb=5000",
-        )]);
+    async fn test_c0_config_single_timeout() {
+        let config = parse_c0_config("ct=1000").await.unwrap();
+        assert_eq!(config.connect_timeout, Some(Duration::from_millis(1000)));
+        assert_eq!(config.read_timeout, None);
+    }
 
-        let profile = S3RequestProfile::from_request_parts(&mut parts, &())
+    #[tokio::test]
+    async fn test_c0_config_all_timeouts() {
+        let config = parse_c0_config("ct=1000 rt=2000 ot=3000 oat=1500")
             .await
             .unwrap();
-
-        assert_eq!(profile.operation_timeout, Some(Duration::from_millis(5000)));
+        assert_eq!(config.connect_timeout, Some(Duration::from_millis(1000)));
+        assert_eq!(config.read_timeout, Some(Duration::from_millis(2000)));
+        assert_eq!(config.operation_timeout, Some(Duration::from_millis(3000)));
         assert_eq!(
-            profile.operation_attempt_timeout,
-            Some(Duration::from_millis(1000))
+            config.operation_attempt_timeout,
+            Some(Duration::from_millis(1500))
         );
-        assert_eq!(profile.max_attempts, Some(3));
-        assert_eq!(profile.initial_backoff, Some(Duration::from_millis(100)));
-        assert_eq!(profile.max_backoff, Some(Duration::from_millis(5000)));
     }
 
     #[tokio::test]
-    async fn test_s3_request_profile_partial() {
-        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "ot=2000 ma=5")]);
+    async fn test_c0_config_backoff_settings() {
+        let config = parse_c0_config("ib=100 mb=5000 ma=3").await.unwrap();
+        assert_eq!(config.initial_backoff, Some(Duration::from_millis(100)));
+        assert_eq!(config.max_backoff, Some(Duration::from_millis(5000)));
+        assert_eq!(config.max_attempts, Some(3));
+    }
 
-        let profile = S3RequestProfile::from_request_parts(&mut parts, &())
+    #[tokio::test]
+    async fn test_c0_config_mixed_settings() {
+        let config = parse_c0_config("ct=1000 ma=5 ib=10 oat=1500")
             .await
             .unwrap();
-
-        assert_eq!(profile.operation_timeout, Some(Duration::from_millis(2000)));
-        assert_eq!(profile.operation_attempt_timeout, None);
-        assert_eq!(profile.max_attempts, Some(5));
-        assert_eq!(profile.initial_backoff, None);
-        assert_eq!(profile.max_backoff, None);
+        assert_eq!(config.connect_timeout, Some(Duration::from_millis(1000)));
+        assert_eq!(config.max_attempts, Some(5));
+        assert_eq!(config.initial_backoff, Some(Duration::from_millis(10)));
+        assert_eq!(
+            config.operation_attempt_timeout,
+            Some(Duration::from_millis(1500))
+        );
     }
 
     #[tokio::test]
-    async fn test_s3_request_profile_malformed_missing_equals() {
-        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "ot5000 ma=3")]);
-
-        let result = S3RequestProfile::from_request_parts(&mut parts, &()).await;
-
-        assert!(result.is_err());
-        let (status, msg) = result.unwrap_err();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(msg.contains("missing '='"));
+    async fn test_c0_config_ignores_unknown_keys() {
+        let config = parse_c0_config("ct=1000 unknown=123 rt=2000")
+            .await
+            .unwrap();
+        assert_eq!(config.connect_timeout, Some(Duration::from_millis(1000)));
+        assert_eq!(config.read_timeout, Some(Duration::from_millis(2000)));
     }
 
     #[tokio::test]
-    async fn test_s3_request_profile_invalid_duration() {
-        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "ot=abc")]);
-
-        let result = S3RequestProfile::from_request_parts(&mut parts, &()).await;
-
+    async fn test_c0_config_missing_equals() {
+        let result = parse_c0_config("ct1000").await;
         assert!(result.is_err());
-        let (status, msg) = result.unwrap_err();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(msg.contains("Invalid duration"));
+        assert_eq!(
+            result.unwrap_err().1,
+            "Malformed C0-Config header: missing '=' in key-value pair"
+        );
     }
 
     #[tokio::test]
-    async fn test_s3_request_profile_unknown_key() {
-        let mut parts = create_parts_with_headers(vec![(&C0_UPSTREAM_HEADER, "unknown=100")]);
-
-        let result = S3RequestProfile::from_request_parts(&mut parts, &()).await;
-
+    async fn test_c0_config_invalid_duration() {
+        let result = parse_c0_config("ct=invalid").await;
         assert!(result.is_err());
-        let (status, msg) = result.unwrap_err();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(msg.contains("Unknown key"));
+        assert_eq!(
+            result.unwrap_err().1,
+            "Invalid duration value in C0-Config header"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_c0_config_invalid_max_attempts() {
+        let result = parse_c0_config("ma=invalid").await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().1,
+            "Invalid max_attempts value in C0-Config hheader"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_c0_config_invalid_header_encoding() {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(())
+            .unwrap();
+
+        req.headers_mut().insert(
+            &C0_CONFIG_HEADER,
+            HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap(),
+        );
+
+        let (mut parts, _) = req.into_parts();
+        let result = RequestConfig::from_request_parts(&mut parts, &()).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().1, "Invalid C0-Config header encoding");
     }
 }
