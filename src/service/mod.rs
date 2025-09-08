@@ -18,7 +18,7 @@ mod routes;
 
 use crate::{
     cache::{CacheConfig, CacheKey, CacheValue, build_cache},
-    object_store::{DownloadError, Downloader, S3RequestProfile},
+    object_store::{DownloadError, Downloader, RequestConfig},
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind, PageId},
 };
 
@@ -118,7 +118,7 @@ impl CacheyService {
         buckets: BucketNameSet,
         byterange: Range<u64>,
         concurrency: usize,
-        s3_profile: S3RequestProfile,
+        req_config: RequestConfig,
     ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
         assert!(byterange.start < byterange.end);
         assert!(byterange.end <= MAX_RANGE_END);
@@ -136,7 +136,7 @@ impl CacheyService {
             object,
             buckets,
             object_size: Default::default(),
-            s3_profile,
+            req_config,
         };
 
         futures::stream::iter(
@@ -196,7 +196,7 @@ struct PageGetExecutor {
     object: ObjectKey,
     buckets: BucketNameSet,
     object_size: Arc<AtomicCell<Option<u64>>>,
-    s3_profile: S3RequestProfile,
+    req_config: RequestConfig,
 }
 
 impl PageGetExecutor {
@@ -221,7 +221,7 @@ impl PageGetExecutor {
                     let end = start + PAGE_SIZE;
                     let out = match self
                         .downloader
-                        .download(&self.buckets, self.object, &(start..end), &self.s3_profile)
+                        .download(&self.buckets, self.object, &(start..end), &self.req_config)
                         .await
                     {
                         Ok(out) => {
