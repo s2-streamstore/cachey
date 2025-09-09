@@ -182,15 +182,13 @@ async fn main() -> eyre::Result<()> {
 
 async fn shutdown_signal(handle: axum_server::Handle) {
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        signal::ctrl_c().await.expect("ctrl-c");
     };
 
     #[cfg(unix)]
-    let terminate = async {
+    let term = async {
         signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
+            .expect("SIGTERM")
             .recv()
             .await;
     };
@@ -200,9 +198,9 @@ async fn shutdown_signal(handle: axum_server::Handle) {
 
     tokio::select! {
         _ = ctrl_c => {
-            info!("received SIGINT, starting graceful shutdown");
+            info!("received Ctrl+C, starting graceful shutdown");
         },
-        _ = terminate => {
+        _ = term => {
             info!("received SIGTERM, starting graceful shutdown");
         },
     }
