@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use axum_server::tls_rustls::RustlsConfig;
 use bytesize::ByteSize;
@@ -7,6 +7,7 @@ use cachey::{
     service::{CacheyService, ServiceConfig},
 };
 use clap::{Args as ArgGroup, Parser};
+use tokio::signal;
 use tracing::info;
 
 #[derive(ArgGroup, Debug)]
@@ -127,6 +128,9 @@ async fn main() -> eyre::Result<()> {
 
     let addr = format!("0.0.0.0:{}", port);
 
+    let server_handle = axum_server::Handle::new();
+    tokio::spawn(shutdown_signal(server_handle.clone()));
+
     match (args.tls.tls_self, args.tls.tls_cert, args.tls.tls_key) {
         (false, Some(cert_path), Some(key_path)) => {
             info!(
@@ -136,6 +140,7 @@ async fn main() -> eyre::Result<()> {
             );
             let rustls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
             axum_server::bind_rustls(addr.parse()?, rustls_config)
+                .handle(server_handle)
                 .serve(app.into_make_service())
                 .await?;
         }
@@ -155,12 +160,14 @@ async fn main() -> eyre::Result<()> {
             )
             .await?;
             axum_server::bind_rustls(addr.parse()?, rustls_config)
+                .handle(server_handle)
                 .serve(app.into_make_service())
                 .await?;
         }
         (false, None, None) => {
             info!(addr, "starting plain http server");
             axum_server::bind(addr.parse()?)
+                .handle(server_handle)
                 .serve(app.into_make_service())
                 .await?;
         }
@@ -171,4 +178,34 @@ async fn main() -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+async fn shutdown_signal(handle: axum_server::Handle) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("received SIGINT, starting graceful shutdown");
+        },
+        _ = terminate => {
+            info!("received SIGTERM, starting graceful shutdown");
+        },
+    }
+
+    handle.graceful_shutdown(Some(Duration::from_secs(30)));
 }

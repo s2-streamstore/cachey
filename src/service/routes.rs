@@ -348,9 +348,11 @@ fn on_chunk_error(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use axum::http::{HeaderValue, Method, Request};
     use std::time::Duration;
+
+    use axum::http::{HeaderValue, Method, Request};
+
+    use super::*;
 
     async fn parse_c0_config(
         header_value: &str,
