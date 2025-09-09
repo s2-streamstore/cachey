@@ -1,5 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
+use al;
 use axum_server::tls_rustls::RustlsConfig;
 use bytesize::ByteSize;
 use cachey::{
@@ -7,7 +8,6 @@ use cachey::{
     service::{CacheyService, ServiceConfig},
 };
 use clap::{Args as ArgGroup, Parser};
-use tokio::signal;
 use tracing::info;
 
 #[derive(ArgGroup, Debug)]
@@ -185,12 +185,12 @@ async fn main() -> eyre::Result<()> {
 
 async fn shutdown_signal(handle: axum_server::Handle) {
     let ctrl_c = async {
-        signal::ctrl_c().await.expect("ctrl-c");
+        tokio::signal::ctrl_c().await.expect("ctrl-c");
     };
 
     #[cfg(unix)]
     let term = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("SIGTERM")
             .recv()
             .await;
