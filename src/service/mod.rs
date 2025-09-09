@@ -61,10 +61,15 @@ pub struct CacheyService {
     downloader: Downloader,
     ingress_throughput: Arc<Mutex<SlidingThroughput>>,
     egress_throughput: Arc<Mutex<SlidingThroughput>>,
+    server_handle: axum_server::Handle,
 }
 
 impl CacheyService {
-    pub async fn new(config: ServiceConfig, s3: aws_sdk_s3::Client) -> Result<Self> {
+    pub async fn new(
+        config: ServiceConfig,
+        s3: aws_sdk_s3::Client,
+        server_handle: axum_server::Handle,
+    ) -> Result<Self> {
         let cache = build_cache(config.cache).await?;
         let ingress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
         let egress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
@@ -74,6 +79,7 @@ impl CacheyService {
             downloader,
             ingress_throughput,
             egress_throughput,
+            server_handle,
         })
     }
 
@@ -100,6 +106,8 @@ impl CacheyService {
                 ("1m", ingress_throughput.bps(Duration::from_secs(60))),
             ],
         );
+
+        metrics::set_connection_count(self.server_handle.connection_count());
     }
 
     pub fn ingress_throughput_bps(&self, lookback: Duration) -> f64 {

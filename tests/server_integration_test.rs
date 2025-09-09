@@ -60,7 +60,8 @@ async fn setup_test_server() -> TestContext {
         hedge_quantile: 0.99,
     };
 
-    let cachey = CacheyService::new(service_config, s3_client.clone())
+    let server_handle = axum_server::Handle::new();
+    let cachey = CacheyService::new(service_config, s3_client.clone(), server_handle)
         .await
         .expect("Failed to create cache service");
 

@@ -115,21 +115,24 @@ async fn main() -> eyre::Result<()> {
     let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let s3_client = aws_sdk_s3::Client::new(&aws_config);
 
-    let cachey = CacheyService::new(service_config, s3_client).await?;
-    let app = cachey.into_router();
-
-    let port = args.port.unwrap_or_else(|| {
-        if args.tls.tls_self || args.tls.tls_cert.is_some() {
-            443
-        } else {
-            80
-        }
-    });
-
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = {
+        let port = args.port.unwrap_or_else(|| {
+            if args.tls.tls_self || args.tls.tls_cert.is_some() {
+                443
+            } else {
+                80
+            }
+        });
+        format!("0.0.0.0:{port}")
+    };
 
     let server_handle = axum_server::Handle::new();
+
     tokio::spawn(shutdown_signal(server_handle.clone()));
+
+    let app = CacheyService::new(service_config, s3_client, server_handle.clone())
+        .await?
+        .into_router();
 
     match (args.tls.tls_self, args.tls.tls_cert, args.tls.tls_key) {
         (false, Some(cert_path), Some(key_path)) => {
