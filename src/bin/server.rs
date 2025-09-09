@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use axum_server::tls_rustls::RustlsConfig;
 use bytesize::ByteSize;
@@ -114,18 +114,24 @@ async fn main() -> eyre::Result<()> {
     let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let s3_client = aws_sdk_s3::Client::new(&aws_config);
 
-    let cachey = CacheyService::new(service_config, s3_client).await?;
-    let app = cachey.into_router();
+    let addr = {
+        let port = args.port.unwrap_or_else(|| {
+            if args.tls.tls_self || args.tls.tls_cert.is_some() {
+                443
+            } else {
+                80
+            }
+        });
+        format!("0.0.0.0:{port}")
+    };
 
-    let port = args.port.unwrap_or_else(|| {
-        if args.tls.tls_self || args.tls.tls_cert.is_some() {
-            443
-        } else {
-            80
-        }
-    });
+    let server_handle = axum_server::Handle::new();
 
-    let addr = format!("0.0.0.0:{}", port);
+    tokio::spawn(shutdown_signal(server_handle.clone()));
+
+    let app = CacheyService::new(service_config, s3_client, server_handle.clone())
+        .await?
+        .into_router();
 
     match (args.tls.tls_self, args.tls.tls_cert, args.tls.tls_key) {
         (false, Some(cert_path), Some(key_path)) => {
@@ -136,6 +142,7 @@ async fn main() -> eyre::Result<()> {
             );
             let rustls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
             axum_server::bind_rustls(addr.parse()?, rustls_config)
+                .handle(server_handle)
                 .serve(app.into_make_service())
                 .await?;
         }
@@ -155,12 +162,14 @@ async fn main() -> eyre::Result<()> {
             )
             .await?;
             axum_server::bind_rustls(addr.parse()?, rustls_config)
+                .handle(server_handle)
                 .serve(app.into_make_service())
                 .await?;
         }
         (false, None, None) => {
             info!(addr, "starting plain http server");
             axum_server::bind(addr.parse()?)
+                .handle(server_handle)
                 .serve(app.into_make_service())
                 .await?;
         }
@@ -171,4 +180,32 @@ async fn main() -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+async fn shutdown_signal(handle: axum_server::Handle) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("ctrl-c");
+    };
+
+    #[cfg(unix)]
+    let term = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("received Ctrl+C, starting graceful shutdown");
+        },
+        _ = term => {
+            info!("received SIGTERM, starting graceful shutdown");
+        },
+    }
+
+    handle.graceful_shutdown(Some(Duration::from_secs(30)));
 }

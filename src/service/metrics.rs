@@ -2,8 +2,9 @@ use std::sync::LazyLock;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use prometheus::{
-    Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGaugeVec, TextEncoder, register_gauge_vec,
-    register_histogram_vec, register_int_counter_vec, register_int_gauge_vec,
+    Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
+    register_gauge_vec, register_histogram_vec, register_int_counter_vec, register_int_gauge,
+    register_int_gauge_vec,
 };
 
 use crate::{
@@ -169,6 +170,18 @@ pub fn observe_throughput(direction: &str, windowed_bps: &[(&str, f64)]) {
     for (window, bps) in windowed_bps {
         GAUGE.with_label_values(&[direction, window]).set(*bps);
     }
+}
+
+pub fn set_connection_count(count: usize) {
+    static CONNECTION_COUNT: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "cachey_connection_count",
+            "Current number of active connections"
+        )
+        .unwrap()
+    });
+
+    CONNECTION_COUNT.set(count as i64);
 }
 
 pub fn gather() -> Bytes {
