@@ -47,10 +47,11 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
             key.estimated_size() + value.estimated_size()
         })
         .storage()
+        .with_runtime_options(foyer::RuntimeOptions::Separated {
+            read_runtime_options: foyer::TokioRuntimeOptions::default(),
+            write_runtime_options: foyer::TokioRuntimeOptions::default(),
+        })
         .with_io_engine(io_engine().await?);
-
-    // TODO: enable dedicated Tokio runtime?
-    // though it seems to be on its way out https://github.com/foyer-rs/foyer/pull/1075
 
     if let Some(disk_config) = config.disk_cache {
         // TODO: throttling knobs?
