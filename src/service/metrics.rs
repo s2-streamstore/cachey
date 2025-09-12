@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::{sync::LazyLock, time::Duration};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use prometheus::{
@@ -182,6 +182,25 @@ pub fn set_connection_count(count: usize) {
     });
 
     CONNECTION_COUNT.set(count as i64);
+}
+
+pub fn first_chunk_latency(kind: &ObjectKind, hit: bool, latency: Duration) {
+    static HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec!(
+            "cachey_first_chunk_latency_seconds",
+            "Time to first chunk",
+            &["kind", "hit"],
+            vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
+            ]
+        )
+        .unwrap()
+    });
+
+    let hit_str = if hit { "1" } else { "0" };
+    HISTOGRAM
+        .with_label_values(&[&**kind, hit_str])
+        .observe(latency.as_secs_f64());
 }
 
 pub fn gather() -> Bytes {
