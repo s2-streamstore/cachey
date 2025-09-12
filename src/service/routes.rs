@@ -14,6 +14,7 @@ use bytes::BytesMut;
 use futures::StreamExt;
 use http_body::Frame;
 use http_body_util::{BodyExt as _, StreamBody};
+use tokio::time::Instant;
 use tracing::{debug, instrument, warn};
 
 use crate::{
@@ -153,6 +154,8 @@ pub async fn fetch(
     BucketHeaders(buckets): BucketHeaders,
     req_config: RequestConfig,
 ) -> Response {
+    let start = Instant::now();
+
     let buckets = if buckets.is_empty() {
         BucketNameSet::new(std::iter::once(kind.clone().into()))
     } else {
@@ -196,6 +199,7 @@ pub async fn fetch(
     let mut headers = HeaderMap::new();
     match first_chunk {
         Ok(chunk) => {
+            metrics::first_chunk_latency(&kind, chunk.cached_at.is_some(), start.elapsed());
             let object_size = chunk.object_size;
             let first_byte = chunk.range.start;
             let last_byte = byterange.end.min(object_size) - 1;
