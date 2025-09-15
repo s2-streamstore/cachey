@@ -1,13 +1,17 @@
 # Cachey
 
-A high-performance read-through cache for S3-compatible object storage.
+High-performance read-through cache for object storage.
 
 - Simple HTTP API
-- Hybrid memory + disk cache powered by [foyer](https://foyer.rs/)
-- Fixed 16 MiB page size – maps requested range to page-aligned lookups
+- Hybrid memory + disk cache powered by [foyer](https://github.com/foyer-rs/foyer)
+- Designed for caching immutable blobs
+- Works with any S3-compatible backend, but has its own `/fetch` API requiring a precise `Range`
+- Fixed page size (16 MiB) – maps requested byte range to page-aligned lookups
 - Coalesces concurrent requests for the same page
 - Makes hedged requests to manage tail latency of object storage
 - Can attempt redundant buckets for a given object
+
+[Motivating context](https://www.reddit.com/r/databasedevelopment/comments/1nh1goo/cachey_a_readthrough_cache_for_s3)
 
 ## API
 
@@ -24,9 +28,9 @@ HEAD|GET /fetch/{kind}/{object}
 
 | Header | Required | Description |
 |--------|----------|-------------|
-| `Range` | ✅ | Byte range in format `bytes={first}-{last}` |
-| `C0-Bucket` | ❌ | Bucket(s) containing the object |
-| `C0-Config` | ❌ | Override S3 request config |
+| `Range` | yes | Byte range in format `bytes={first}-{last}` |
+| `C0-Bucket` | no | Bucket(s) containing the object |
+| `C0-Config` | no | Override S3 request config |
 
 `C0-Bucket` behavior:
 - Multiple headers indicate bucket preference order
@@ -80,7 +84,7 @@ Content-Length: 17825792
 Content-Type: application/octet-stream
 C0-Status: 1048576-16777215; us-west-videos; 1704067200
 
-[binary data]
+<data>
 
 C0-Status: 16777216-18874367; us-west-videos; 0
 ```
@@ -92,6 +96,8 @@ C0-Status: 16777216-18874367; us-west-videos; 0
 `GET /metrics` returns a more comprehensive set of metrics in Prometheus text format.
 
 ## Command line
+
+[Docker images](https://github.com/s2-streamstore/cachey/pkgs/container/cachey) are available.
 
 ```
 Usage: server [OPTIONS]
