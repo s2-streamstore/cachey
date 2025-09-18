@@ -563,6 +563,8 @@ mod tests {
             let mut encoded = Vec::new();
             key.encode(&mut encoded).unwrap();
 
+            prop_assert_eq!(key.estimated_size(), encoded.len());
+
             let mut reader = std::io::Cursor::new(encoded);
             let decoded = CacheKey::decode(&mut reader).unwrap();
 
@@ -591,6 +593,8 @@ mod tests {
             let mut encoded = Vec::new();
             value.encode(&mut encoded).unwrap();
 
+            prop_assert_eq!(value.estimated_size(), encoded.len());
+
             let mut reader = std::io::Cursor::new(encoded);
             let decoded = CacheValue::decode(&mut reader).unwrap();
 
@@ -600,35 +604,6 @@ mod tests {
             prop_assert_eq!(value.data, decoded.data);
             prop_assert_eq!(value.cached_at, decoded.cached_at);
         }
-    }
-
-    #[test]
-    fn test_cache_key_estimated_size() {
-        let key = CacheKey {
-            kind: ObjectKind::new("test").unwrap(),
-            object: ObjectKey::new("test").unwrap(),
-            page_id: 0,
-        };
-        assert_eq!(key.estimated_size(), 13);
-
-        let key = CacheKey {
-            kind: ObjectKind::new("test").unwrap(),
-            object: ObjectKey::new("a/very/long/object/key/path.txt").unwrap(),
-            page_id: 0,
-        };
-        assert_eq!(key.estimated_size(), 40);
-    }
-
-    #[test]
-    fn test_cache_value_estimated_size() {
-        let value = CacheValue {
-            bucket: BucketName::new("test-bucket").unwrap(),
-            mtime: 0,
-            object_size: 0,
-            data: bytes::Bytes::from(vec![0; 100]),
-            cached_at: 0,
-        };
-        assert_eq!(value.estimated_size(), 128);
     }
 
     #[test]
