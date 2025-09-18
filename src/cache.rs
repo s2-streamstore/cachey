@@ -175,7 +175,7 @@ impl CacheKeyHeader {
 }
 
 /// Format:
-/// - 5 byte header that encodes format version, object kind length, object key length, and page ID
+/// - header
 /// - object kind
 /// - object key
 impl foyer::Code for CacheKey {
@@ -248,7 +248,7 @@ impl foyer::Code for CacheKey {
     }
 
     fn estimated_size(&self) -> usize {
-        20 + self.object.len()
+        size_of::<CacheKeyHeader>() + self.kind.len() + self.object.len()
     }
 }
 
@@ -345,7 +345,7 @@ impl CacheValueHeader {
 }
 
 /// Format:
-/// - 13 byte header that includes bucket name length, object size, data length and mtime
+/// - header
 /// - bucket
 /// - data
 impl foyer::Code for CacheValue {
@@ -413,7 +413,7 @@ impl foyer::Code for CacheValue {
     }
 
     fn estimated_size(&self) -> usize {
-        17 + self.bucket.len() + self.data.len()
+        size_of::<CacheValueHeader>() + self.bucket.len() + self.data.len()
     }
 }
 
@@ -609,14 +609,14 @@ mod tests {
             object: ObjectKey::new("test").unwrap(),
             page_id: 0,
         };
-        assert_eq!(key.estimated_size(), 24); // 20 + 4
+        assert_eq!(key.estimated_size(), 13);
 
         let key = CacheKey {
             kind: ObjectKind::new("test").unwrap(),
             object: ObjectKey::new("a/very/long/object/key/path.txt").unwrap(),
             page_id: 0,
         };
-        assert_eq!(key.estimated_size(), 51); // 20 + 31
+        assert_eq!(key.estimated_size(), 40);
     }
 
     #[test]
@@ -628,7 +628,7 @@ mod tests {
             data: bytes::Bytes::from(vec![0; 100]),
             cached_at: 0,
         };
-        assert_eq!(value.estimated_size(), 17 + 11 + 100); // header + bucket + data
+        assert_eq!(value.estimated_size(), 128);
     }
 
     #[test]
