@@ -48,7 +48,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 [dev-dependencies]
-proptest = "1.8"
+proptest = "1.9"
 reqwest = { version = "0.12", features = ["json"] }
 testcontainers = "0.25"
 testcontainers-modules = { version = "0.13", features = ["minio"] }
