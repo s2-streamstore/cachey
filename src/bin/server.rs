@@ -6,7 +6,7 @@ use cachey::{
     cache::{CacheConfig, DiskCacheConfig, DiskCacheKind},
     service::{CacheyService, ServiceConfig},
 };
-use clap::{Args as ArgGroup, Parser};
+use clap::{ArgAction, Args as ArgGroup, Parser};
 use tracing::info;
 
 #[derive(ArgGroup, Debug)]
@@ -64,6 +64,10 @@ struct Args {
     /// Port to listen on [default: 443 if HTTPS configured, otherwise 80 for HTTP]
     #[arg(long)]
     port: Option<u16>,
+
+    /// Use io_uring (if available) for disk IO.
+    #[arg(long, action = ArgAction::SetTrue)]
+    iouring: bool,
 }
 
 fn parse_bytes(s: &str) -> Result<ByteSize, String> {
@@ -105,6 +109,7 @@ async fn main() -> eyre::Result<()> {
                 info!("disk cache disabled");
                 None
             },
+            iouring: args.iouring,
         },
         hedge_quantile: args.hedge_quantile,
     };

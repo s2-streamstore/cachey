@@ -3,6 +3,8 @@ use std::{path::PathBuf, sync::Arc};
 use bytes::{Bytes, BytesMut};
 use bytesize::ByteSize;
 use compact_str::CompactString;
+#[cfg(target_os = "linux")]
+use foyer::UringIoEngineBuilder;
 use foyer::{
     BlockEngineBuilder, Code, DeviceBuilder, EvictionConfig, FileDeviceBuilder, FsDeviceBuilder,
     HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngine, IoEngineBuilder,
@@ -16,6 +18,7 @@ use crate::types::{BucketName, ObjectKey, ObjectKind, PageId};
 pub struct CacheConfig {
     pub memory_size: ByteSize,
     pub disk_cache: Option<DiskCacheConfig>,
+    pub iouring: bool,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -51,7 +54,7 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
             read_runtime_options: foyer::TokioRuntimeOptions::default(),
             write_runtime_options: foyer::TokioRuntimeOptions::default(),
         })
-        .with_io_engine(io_engine().await?);
+        .with_io_engine(io_engine(config.iouring).await?);
 
     if let Some(disk_config) = config.disk_cache {
         // TODO: throttling knobs?
@@ -90,8 +93,23 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
     builder.build().await
 }
 
-async fn io_engine() -> foyer::Result<Arc<dyn IoEngine>> {
-    // TODO: use iouring IO engine when on Linux
+async fn io_engine(iouring: bool) -> foyer::Result<Arc<dyn IoEngine>> {
+    #[cfg(target_os = "linux")]
+    if iouring {
+        match UringIoEngineBuilder::new().build().await {
+            Ok(engine) => {
+                tracing::info!("Using io_uring IO engine");
+                return Ok(engine);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize io_uring, falling back to sync: {}", e);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = iouring; // Suppress unused warning.
+
     PsyncIoEngineBuilder::new()
         .build()
         .await
