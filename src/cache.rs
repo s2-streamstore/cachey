@@ -68,9 +68,7 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
                 if let Some(cap) = disk_config.capacity {
                     file_device = file_device.with_capacity(cap.as_u64() as usize);
                 }
-                file_device
-                    .build()
-                    .map_err(|e| foyer::Error::Other(Box::new(e)))?
+                file_device.build()?
             }
             DiskCacheKind::FileSystem => {
                 let mut fs_device = FsDeviceBuilder::new(disk_config.path);
@@ -81,9 +79,7 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
                 if let Some(cap) = disk_config.capacity {
                     fs_device = fs_device.with_capacity(cap.as_u64() as usize);
                 }
-                fs_device
-                    .build()
-                    .map_err(|e| foyer::Error::Other(Box::new(e)))?
+                fs_device.build()?
             }
         };
         let engine = BlockEngineBuilder::new(device).with_block_size(64 * 1024 * 1024);
@@ -110,10 +106,7 @@ async fn io_engine(iouring: bool) -> foyer::Result<Arc<dyn IoEngine>> {
     #[cfg(not(target_os = "linux"))]
     let _ = iouring; // Suppress unused warning.
 
-    PsyncIoEngineBuilder::new()
-        .build()
-        .await
-        .map_err(|e| foyer::Error::Other(Box::new(e)))
+    PsyncIoEngineBuilder::new().build().await
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -197,34 +190,39 @@ impl CacheKeyHeader {
 /// - object kind
 /// - object key
 impl foyer::Code for CacheKey {
-    fn encode(
-        &self,
-        writer: &mut impl std::io::Write,
-    ) -> std::result::Result<(), foyer::CodeError> {
+    fn encode(&self, writer: &mut impl std::io::Write) -> foyer::Result<()> {
         let flag = CacheKeyHeader::new(0, self.kind.len(), self.object.len(), self.page_id)
-            .map_err(|msg| {
-                foyer::CodeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
-            })?;
-        writer.write_all(&flag.to_bytes())?;
-        writer.write_all(self.kind.as_bytes())?;
-        writer.write_all(self.object.as_bytes())?;
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+            .map_err(foyer::Error::io_error)?;
+
+        writer
+            .write_all(&flag.to_bytes())
+            .map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(self.kind.as_bytes())
+            .map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(self.object.as_bytes())
+            .map_err(foyer::Error::io_error)?;
         Ok(())
     }
 
-    fn decode(reader: &mut impl std::io::Read) -> std::result::Result<Self, foyer::CodeError>
+    fn decode(reader: &mut impl std::io::Read) -> foyer::Result<Self>
     where
         Self: Sized,
     {
         let header = {
             let mut buf = [0u8; 5];
-            reader.read_exact(&mut buf)?;
-            CacheKeyHeader::from_bytes(buf).map_err(|msg| {
-                foyer::CodeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
-            })?
+            reader
+                .read_exact(&mut buf)
+                .map_err(foyer::Error::io_error)?;
+            CacheKeyHeader::from_bytes(buf)
+                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+                .map_err(foyer::Error::io_error)?
         };
 
         if header.version() != 0 {
-            return Err(foyer::CodeError::Io(std::io::Error::new(
+            return Err(foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Unsupported version {}", header.version()),
             )));
@@ -232,28 +230,34 @@ impl foyer::Code for CacheKey {
 
         let kind = {
             let mut buf = BytesMut::zeroed(header.kind_len());
-            reader.read_exact(&mut buf)?;
+            reader
+                .read_exact(&mut buf)
+                .map_err(foyer::Error::io_error)?;
             let str = CompactString::from_utf8(buf).map_err(|_| {
-                foyer::CodeError::Io(std::io::Error::new(
+                foyer::Error::io_error(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Invalid UTF-8 in object kind",
                 ))
             })?;
             ObjectKind::new(str)
-                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?
+                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+                .map_err(foyer::Error::io_error)?
         };
 
         let object = {
             let mut buf = BytesMut::zeroed(header.key_len());
-            reader.read_exact(&mut buf)?;
+            reader
+                .read_exact(&mut buf)
+                .map_err(foyer::Error::io_error)?;
             let str = CompactString::from_utf8(buf).map_err(|_| {
-                foyer::CodeError::Io(std::io::Error::new(
+                foyer::Error::io_error(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Invalid UTF-8 in object key",
                 ))
             })?;
             ObjectKey::new(str)
-                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?
+                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+                .map_err(foyer::Error::io_error)?
         };
 
         let page_id = header.page_id();
@@ -367,10 +371,7 @@ impl CacheValueHeader {
 /// - bucket
 /// - data
 impl foyer::Code for CacheValue {
-    fn encode(
-        &self,
-        writer: &mut impl std::io::Write,
-    ) -> std::result::Result<(), foyer::CodeError> {
+    fn encode(&self, writer: &mut impl std::io::Write) -> foyer::Result<()> {
         let flag = CacheValueHeader::new(
             self.bucket.len(),
             self.object_size,
@@ -378,46 +379,59 @@ impl foyer::Code for CacheValue {
             self.data.len(),
             self.cached_at,
         )
-        .map_err(|msg| {
-            foyer::CodeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
-        })?;
-        writer.write_all(&flag.to_bytes())?;
-        writer.write_all(self.bucket.as_bytes())?;
-        writer.write_all(&self.data)?;
+        .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+        .map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(&flag.to_bytes())
+            .map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(self.bucket.as_bytes())
+            .map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(&self.data)
+            .map_err(foyer::Error::io_error)?;
         Ok(())
     }
 
-    fn decode(reader: &mut impl std::io::Read) -> std::result::Result<Self, foyer::CodeError>
+    fn decode(reader: &mut impl std::io::Read) -> foyer::Result<Self>
     where
         Self: Sized,
     {
         let header = {
             let mut buf = [0u8; 17];
-            reader.read_exact(&mut buf)?;
-            CacheValueHeader::from_bytes(buf).map_err(|msg| {
-                foyer::CodeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
-            })?
+            reader
+                .read_exact(&mut buf)
+                .map_err(foyer::Error::io_error)?;
+            CacheValueHeader::from_bytes(buf)
+                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+                .map_err(foyer::Error::io_error)?
         };
 
         let bucket = {
             let mut buf = BytesMut::zeroed(header.bucket_name_len());
-            reader.read_exact(&mut buf)?;
+            reader
+                .read_exact(&mut buf)
+                .map_err(foyer::Error::io_error)?;
 
-            let str = CompactString::from_utf8(buf).map_err(|_| {
-                foyer::CodeError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid UTF-8 in bucket name",
-                ))
-            })?;
+            let str = CompactString::from_utf8(buf)
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid UTF-8 in bucket name",
+                    )
+                })
+                .map_err(foyer::Error::io_error)?;
 
-            BucketName::new(str).map_err(|msg| {
-                foyer::CodeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
-            })?
+            BucketName::new(str)
+                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+                .map_err(foyer::Error::io_error)?
         };
 
         let data = {
             let mut buf = BytesMut::zeroed(header.data_len());
-            reader.read_exact(&mut buf)?;
+            reader
+                .read_exact(&mut buf)
+                .map_err(foyer::Error::io_error)?;
             buf.freeze()
         };
 

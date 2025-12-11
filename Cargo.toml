@@ -17,7 +17,7 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 ] }
 aws-smithy-runtime-api = "1.9"
 axum = { version = "0.8", features = ["macros"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 bytes = "1.11"
 bytesize = "2.3"
 clap = { version = "4.5", features = ["derive"] }
@@ -26,7 +26,7 @@ crossbeam = "0.8"
 dashmap = "6.1"
 exponential-decay-histogram = "0.1"
 eyre = "0.6"
-foyer = { version = "0.20" }
+foyer = { version = "0.21" }
 futures = "0.3"
 http = "1.4"
 http-body = "1.0"
@@ -50,8 +50,8 @@ tracing-subscriber = "0.3"
 [dev-dependencies]
 proptest = "1.9"
 reqwest = { version = "0.12", features = ["json"] }
-testcontainers = "0.25"
-testcontainers-modules = { version = "0.13", features = ["minio"] }
+testcontainers = "0.26"
+testcontainers-modules = { version = "0.14", features = ["minio"] }
 
 [lints.clippy]
 wildcard_imports = "warn"

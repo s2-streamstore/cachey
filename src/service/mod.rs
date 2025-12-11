@@ -1,4 +1,5 @@
 use std::{
+    net::SocketAddr,
     num::NonZeroU32,
     ops::Range,
     sync::{Arc, atomic::AtomicBool},
@@ -61,14 +62,14 @@ pub struct CacheyService {
     downloader: Downloader,
     ingress_throughput: Arc<Mutex<SlidingThroughput>>,
     egress_throughput: Arc<Mutex<SlidingThroughput>>,
-    server_handle: axum_server::Handle,
+    server_handle: axum_server::Handle<SocketAddr>,
 }
 
 impl CacheyService {
     pub async fn new(
         config: ServiceConfig,
         s3: aws_sdk_s3::Client,
-        server_handle: axum_server::Handle,
+        server_handle: axum_server::Handle<SocketAddr>,
     ) -> Result<Self> {
         let cache = build_cache(config.cache).await?;
         let ingress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
@@ -219,7 +220,7 @@ impl PageGetExecutor {
         let hit_state = Arc::new(AtomicBool::new(true));
         match self
             .cache
-            .fetch(cache_key, {
+            .get_or_fetch(&cache_key, {
                 let hit_state = hit_state.clone();
                 move || async move {
                     hit_state.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -245,8 +246,12 @@ impl PageGetExecutor {
                             }
                             out
                         }
-                        Err(e) => {
-                            return Err(foyer::Error::Other(Box::new(e)));
+                        Err(download_err) => {
+                            return Err(foyer::Error::new(
+                                foyer::ErrorKind::External,
+                                "download failed",
+                            )
+                            .with_source(download_err));
                         }
                     };
                     Ok(CacheValue {
@@ -292,12 +297,9 @@ impl PageGetExecutor {
                 }
                 Ok((page_id, value))
             }
-            Err(err @ foyer::Error::Memory(_) | err @ foyer::Error::Storage(_)) => {
-                Err(ServiceError::Cache(err))
-            }
-            Err(foyer::Error::Other(other)) => Err(match other.downcast() {
-                Ok(e) => ServiceError::Download(*e),
-                Err(e) => ServiceError::Cache(foyer::Error::Other(e)),
+            Err(err) => Err(match err.downcast_ref::<DownloadError>() {
+                Some(download_err) => ServiceError::Download(download_err.clone()),
+                None => ServiceError::Cache(err),
             }),
         }
     }
