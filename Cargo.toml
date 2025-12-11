@@ -26,7 +26,7 @@ crossbeam = "0.8"
 dashmap = "6.1"
 exponential-decay-histogram = "0.1"
 eyre = "0.6"
-foyer = { version = "0.21" }
+foyer = { path = "../foyer/foyer" }
 futures = "0.3"
 http = "1.4"
 http-body = "1.0"

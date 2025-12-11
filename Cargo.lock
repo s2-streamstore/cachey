@@ -1538,18 +1538,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a3076410a55c90011c298b04d0cfa770b00fa04e1e3c97d3f6c9de105a03844"
 
 [[package]]
-name = "flume"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
-dependencies = [
- "futures-core",
- "futures-sink",
- "nanorand",
- "spin",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1594,8 +1582,6 @@ dependencies = [
 [[package]]
 name = "foyer"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d6e14f449dffa7c8e7bf17c4847f3a1072a4115cce4e5c84f0e25b5326df561"
 dependencies = [
  "anyhow",
  "equivalent",
@@ -1604,6 +1590,7 @@ dependencies = [
  "foyer-storage",
  "futures-util",
  "madsim-tokio",
+ "mea",
  "mixtrics",
  "pin-project",
  "serde",
@@ -1614,8 +1601,6 @@ dependencies = [
 [[package]]
 name = "foyer-common"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "269e6bab6c54c5e3d5cc50e1466304aebef2f91e29223db51f395edc06fa2d50"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1641,8 +1626,6 @@ dependencies = [
 [[package]]
 name = "foyer-memory"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41abc6230d1dcb24f1ac6746a2542a2c1381406f1f5b6ef4a0860ca17fd0900c"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1655,6 +1638,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "itertools",
  "madsim-tokio",
+ "mea",
  "mixtrics",
  "parking_lot",
  "paste",
@@ -1667,8 +1651,6 @@ dependencies = [
 [[package]]
 name = "foyer-storage"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3d238ff6f0ea10c1cc585f3046fb7227a5033d1f31f180890ad17806eebf2ed"
 dependencies = [
  "allocator-api2",
  "anyhow",
@@ -1676,7 +1658,6 @@ dependencies = [
  "core_affinity",
  "equivalent",
  "fastant",
- "flume",
  "foyer-common",
  "foyer-memory",
  "fs4",
@@ -1688,6 +1669,7 @@ dependencies = [
  "libc",
  "lz4",
  "madsim-tokio",
+ "mea",
  "parking_lot",
  "pin-project",
  "rand 0.9.2",
@@ -1829,10 +1811,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "335ff9f135e4384c8150d6f27c6daed433577f86b4750418338c01a1a2528592"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "wasi",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -2546,6 +2526,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mea"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1a78f54a189049e2f554d43d2021e3010036ed65a8f5376ab12cc0432d9a341"
+dependencies = [
+ "slab",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2602,15 +2591,6 @@ name = "naive-timer"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "034a0ad7deebf0c2abcf2435950a6666c3c15ea9d8fad0c0f48efa8a7f843fed"
-
-[[package]]
-name = "nanorand"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a51313c5820b0b02bd422f4b44776fbf47961755c74ce64afc73bfad10226c3"
-dependencies = [
- "getrandom 0.2.16",
-]
 
 [[package]]
 name = "native-tls"
