@@ -249,12 +249,14 @@ impl foyer::Code for CacheKey {
             reader
                 .read_exact(&mut buf)
                 .map_err(foyer::Error::io_error)?;
-            let str = CompactString::from_utf8(buf).map_err(|_| {
-                foyer::Error::io_error(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid UTF-8 in object key",
-                ))
-            })?;
+            let str = CompactString::from_utf8(buf)
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid UTF-8 in object key",
+                    )
+                })
+                .map_err(foyer::Error::io_error)?;
             ObjectKey::new(str)
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
                 .map_err(foyer::Error::io_error)?
