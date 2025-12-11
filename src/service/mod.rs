@@ -228,33 +228,21 @@ impl PageGetExecutor {
 
                     let start = page_id as u64 * PAGE_SIZE;
                     let end = start + PAGE_SIZE;
-                    let out = match self
+                    let out = self
                         .downloader
                         .download(&self.buckets, self.object, &(start..end), &self.req_config)
-                        .await
-                    {
-                        Ok(out) => {
-                            metrics::page_download_latency(&self.kind, out.piece.latency);
-                            if out.piece.hedged.is_some() {
-                                metrics::page_request_count(&self.kind, "hedged");
-                            }
-                            if self.buckets.first() == Some(&self.buckets[out.primary_bucket_idx]) {
-                                metrics::page_request_count(&self.kind, "client_pref");
-                            }
-                            if out.used_bucket_idx != out.primary_bucket_idx {
-                                metrics::page_request_count(&self.kind, "fallback");
-                            }
-                            out
-                        }
-                        Err(download_err) => {
-                            return Err(foyer::Error::new(
-                                foyer::ErrorKind::External,
-                                "download failed",
-                            )
-                            .with_source(download_err));
-                        }
-                    };
-                    Ok(CacheValue {
+                        .await?;
+                    metrics::page_download_latency(&self.kind, out.piece.latency);
+                    if out.piece.hedged.is_some() {
+                        metrics::page_request_count(&self.kind, "hedged");
+                    }
+                    if self.buckets.first() == Some(&self.buckets[out.primary_bucket_idx]) {
+                        metrics::page_request_count(&self.kind, "client_pref");
+                    }
+                    if out.used_bucket_idx != out.primary_bucket_idx {
+                        metrics::page_request_count(&self.kind, "fallback");
+                    }
+                    Ok::<_, DownloadError>(CacheValue {
                         bucket: self.buckets[out.used_bucket_idx].clone(),
                         mtime: out.piece.mtime,
                         data: out.piece.data,
