@@ -12,7 +12,7 @@ use crate::{
     types::{BucketName, BucketNameSet, ObjectKey},
 };
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum DownloadError {
     #[error("Invalid object state: {0}")]
     InvalidObjectState(String),

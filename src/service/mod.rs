@@ -1,4 +1,5 @@
 use std::{
+    net::SocketAddr,
     num::NonZeroU32,
     ops::Range,
     sync::{Arc, atomic::AtomicBool},
@@ -61,14 +62,14 @@ pub struct CacheyService {
     downloader: Downloader,
     ingress_throughput: Arc<Mutex<SlidingThroughput>>,
     egress_throughput: Arc<Mutex<SlidingThroughput>>,
-    server_handle: axum_server::Handle,
+    server_handle: axum_server::Handle<SocketAddr>,
 }
 
 impl CacheyService {
     pub async fn new(
         config: ServiceConfig,
         s3: aws_sdk_s3::Client,
-        server_handle: axum_server::Handle,
+        server_handle: axum_server::Handle<SocketAddr>,
     ) -> Result<Self> {
         let cache = build_cache(config.cache).await?;
         let ingress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
@@ -219,7 +220,7 @@ impl PageGetExecutor {
         let hit_state = Arc::new(AtomicBool::new(true));
         match self
             .cache
-            .fetch(cache_key, {
+            .get_or_fetch(&cache_key, {
                 let hit_state = hit_state.clone();
                 move || async move {
                     hit_state.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -227,29 +228,21 @@ impl PageGetExecutor {
 
                     let start = page_id as u64 * PAGE_SIZE;
                     let end = start + PAGE_SIZE;
-                    let out = match self
+                    let out = self
                         .downloader
                         .download(&self.buckets, self.object, &(start..end), &self.req_config)
-                        .await
-                    {
-                        Ok(out) => {
-                            metrics::page_download_latency(&self.kind, out.piece.latency);
-                            if out.piece.hedged.is_some() {
-                                metrics::page_request_count(&self.kind, "hedged");
-                            }
-                            if self.buckets.first() == Some(&self.buckets[out.primary_bucket_idx]) {
-                                metrics::page_request_count(&self.kind, "client_pref");
-                            }
-                            if out.used_bucket_idx != out.primary_bucket_idx {
-                                metrics::page_request_count(&self.kind, "fallback");
-                            }
-                            out
-                        }
-                        Err(e) => {
-                            return Err(foyer::Error::Other(Box::new(e)));
-                        }
-                    };
-                    Ok(CacheValue {
+                        .await?;
+                    metrics::page_download_latency(&self.kind, out.piece.latency);
+                    if out.piece.hedged.is_some() {
+                        metrics::page_request_count(&self.kind, "hedged");
+                    }
+                    if self.buckets.first() == Some(&self.buckets[out.primary_bucket_idx]) {
+                        metrics::page_request_count(&self.kind, "client_pref");
+                    }
+                    if out.used_bucket_idx != out.primary_bucket_idx {
+                        metrics::page_request_count(&self.kind, "fallback");
+                    }
+                    Ok::<_, DownloadError>(CacheValue {
                         bucket: self.buckets[out.used_bucket_idx].clone(),
                         mtime: out.piece.mtime,
                         data: out.piece.data,
@@ -292,12 +285,9 @@ impl PageGetExecutor {
                 }
                 Ok((page_id, value))
             }
-            Err(err @ foyer::Error::Memory(_) | err @ foyer::Error::Storage(_)) => {
-                Err(ServiceError::Cache(err))
-            }
-            Err(foyer::Error::Other(other)) => Err(match other.downcast() {
-                Ok(e) => ServiceError::Download(*e),
-                Err(e) => ServiceError::Cache(foyer::Error::Other(e)),
+            Err(err) => Err(match err.downcast_ref::<DownloadError>() {
+                Some(download_err) => ServiceError::Download(download_err.clone()),
+                None => ServiceError::Cache(err),
             }),
         }
     }

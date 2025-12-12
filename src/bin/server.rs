@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use axum_server::tls_rustls::RustlsConfig;
 use bytesize::ByteSize;
@@ -187,7 +187,7 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal(handle: axum_server::Handle) {
+async fn shutdown_signal(handle: axum_server::Handle<SocketAddr>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.expect("ctrl-c");
     };
