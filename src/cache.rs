@@ -223,7 +223,10 @@ impl foyer::Code for CacheKey {
             let mut buf = BytesMut::zeroed(header.kind_len());
             reader.read_exact(&mut buf)?;
             let str = CompactString::from_utf8(buf).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in object kind")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid UTF-8 in object kind",
+                )
             })?;
             ObjectKind::new(str)
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?
@@ -233,7 +236,10 @@ impl foyer::Code for CacheKey {
             let mut buf = BytesMut::zeroed(header.key_len());
             reader.read_exact(&mut buf)?;
             let str = CompactString::from_utf8(buf).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in object key")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid UTF-8 in object key",
+                )
             })?;
             ObjectKey::new(str)
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?
@@ -380,7 +386,10 @@ impl foyer::Code for CacheValue {
             let mut buf = BytesMut::zeroed(header.bucket_name_len());
             reader.read_exact(&mut buf)?;
             let str = CompactString::from_utf8(buf).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in bucket name")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid UTF-8 in bucket name",
+                )
             })?;
             BucketName::new(str)
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?
