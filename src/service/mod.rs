@@ -183,6 +183,14 @@ impl CacheyService {
             .route("/metrics", axum::routing::get(routes::metrics))
             .route("/stats", axum::routing::get(routes::stats))
             .route(
+                "/debug/pprof/allocs",
+                axum::routing::get(routes::heap_profile),
+            )
+            .route(
+                "/debug/pprof/allocs/flamegraph",
+                axum::routing::get(routes::heap_flamegraph),
+            )
+            .route(
                 "/fetch/{kind}/{*object}",
                 axum::routing::get(routes::fetch).head(routes::fetch),
             )
