@@ -35,7 +35,6 @@ http-content-range = "0.2"
 http-range-header = "0.4.2"
 httpdate = "1.0"
 itertools = "0.14"
-tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 jemalloc_pprof = { version = "0.8", features = ["flamegraph"] }
 mixtrics = { version = "0.2", features = ["prometheus_0_14"] }
 parking_lot = "0.12"
@@ -44,6 +43,7 @@ prometheus = { version = "0.14", features = ["process"] }
 rcgen = "0.14"
 serde = "1.0"
 thiserror = "2.0"
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
