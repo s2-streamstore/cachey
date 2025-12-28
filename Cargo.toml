@@ -35,7 +35,8 @@ http-content-range = "0.2"
 http-range-header = "0.4.2"
 httpdate = "1.0"
 itertools = "0.14"
-tikv-jemallocator = "0.6"
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+jemalloc_pprof = { version = "0.8", features = ["flamegraph"] }
 mixtrics = { version = "0.2", features = ["prometheus_0_14"] }
 parking_lot = "0.12"
 pin-project-lite = "0.2"

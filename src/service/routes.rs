@@ -320,6 +320,54 @@ pub async fn stats(State(service): State<CacheyService>) -> impl IntoResponse {
     })
 }
 
+pub async fn heap_profile() -> Result<impl IntoResponse, (StatusCode, String)> {
+    let mut prof_ctl = jemalloc_pprof::PROF_CTL
+        .as_ref()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Profiling not activated".to_string(),
+        ))?
+        .lock()
+        .await;
+
+    if !prof_ctl.activated() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Profiling not activated".to_string(),
+        ));
+    }
+
+    let pprof = prof_ctl
+        .dump_pprof()
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], pprof))
+}
+
+pub async fn heap_flamegraph() -> Result<impl IntoResponse, (StatusCode, String)> {
+    let mut prof_ctl = jemalloc_pprof::PROF_CTL
+        .as_ref()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Profiling not activated".to_string(),
+        ))?
+        .lock()
+        .await;
+
+    if !prof_ctl.activated() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Profiling not activated".to_string(),
+        ));
+    }
+
+    let flamegraph = prof_ctl
+        .dump_flamegraph()
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    Ok(([(header::CONTENT_TYPE, "image/svg+xml")], flamegraph))
+}
+
 fn on_chunk_error(
     kind: &ObjectKind,
     method: &axum::http::Method,
