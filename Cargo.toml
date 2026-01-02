@@ -49,6 +49,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 [dev-dependencies]
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http2", "tokio"] }
 proptest = "1.9"
 reqwest = { version = "0.12", features = ["json"] }
 testcontainers = "0.26"

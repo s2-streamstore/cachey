@@ -243,7 +243,7 @@ pub async fn fetch(
             match chunk {
                 Ok(chunk) => {
                     if chunk_idx > 0 {
-                        trailers.insert("c0-status", c0_status(&chunk));
+                        trailers.append("c0-status", c0_status(&chunk));
                     }
                     yield Ok(Frame::data(chunk.data));
                     if chunk.range.end == chunk.object_size {

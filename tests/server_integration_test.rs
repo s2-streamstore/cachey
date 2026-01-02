@@ -8,6 +8,7 @@ use cachey::{
     cache::CacheConfig,
     service::{CacheyService, PAGE_SIZE, ServiceConfig},
 };
+use http_body_util::BodyExt;
 use testcontainers::{ContainerAsync, runners::AsyncRunner};
 use testcontainers_modules::minio::MinIO;
 use tokio::net::TcpListener;
@@ -725,4 +726,97 @@ async fn test_fetch_endpoint_multi_page_range() {
 
     assert_eq!(body2.len(), end2 - start2);
     assert_eq!(body2, test_data.slice(start2..end2));
+}
+
+#[tokio::test]
+async fn test_fetch_endpoint_multi_page_trailers() {
+    let ctx = setup_test_server().await;
+
+    let object_size = 3 * PAGE_SIZE as usize;
+    let mut test_data = BytesMut::zeroed(object_size);
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = (i % 256) as u8;
+    }
+    let test_data = test_data.freeze();
+    let object_key = "multi-page-trailers.bin";
+    upload_test_object(
+        &ctx.s3_client,
+        &ctx.bucket_name,
+        object_key,
+        test_data.clone(),
+    )
+    .await;
+
+    let uri = format!(
+        "{}/fetch/{}/{}",
+        ctx.server_url, &ctx.bucket_name, object_key
+    )
+    .parse::<hyper::Uri>()
+    .expect("Failed to parse URI");
+
+    let req = hyper::Request::builder()
+        .uri(uri)
+        .version(hyper::Version::HTTP_2)
+        .header("Range", format!("bytes=0-{}", object_size - 1))
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("Failed to build request");
+
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .http2_only(true)
+        .build_http();
+
+    let response = client.request(req).await.expect("Failed to send request");
+
+    assert_eq!(response.status(), 206);
+    assert_eq!(response.version(), hyper::Version::HTTP_2);
+
+    let c0_status_header = response
+        .headers()
+        .get("c0-status")
+        .expect("Missing c0-status header for first chunk");
+    assert!(
+        !c0_status_header.is_empty(),
+        "c0-status header should contain first chunk status"
+    );
+
+    let (_parts, body) = response.into_parts();
+    let collected = body.collect().await.expect("Failed to collect body");
+
+    let trailers = collected
+        .trailers()
+        .cloned()
+        .expect("Expected trailers to be present in HTTP/2 response");
+
+    let body_bytes = collected.to_bytes();
+    assert_eq!(body_bytes.len(), object_size);
+    assert_eq!(body_bytes, test_data);
+
+    let c0_status_trailers: Vec<_> = trailers.get_all("c0-status").iter().collect();
+
+    assert!(
+        c0_status_trailers.len() >= 2,
+        "Expected at least 2 trailer values (one for each chunk after the first), got {}. \
+         With 3 pages, we should have trailers for chunks 1 and 2.",
+        c0_status_trailers.len()
+    );
+
+    for (idx, trailer_value) in c0_status_trailers.iter().enumerate() {
+        let trailer_str = trailer_value
+            .to_str()
+            .expect("Trailer should be valid UTF-8");
+
+        assert!(
+            trailer_str.contains(&ctx.bucket_name),
+            "Trailer {} should contain bucket name, got: {}",
+            idx,
+            trailer_str
+        );
+
+        assert!(
+            trailer_str.contains('-'),
+            "Trailer {} should contain byte range with '-', got: {}",
+            idx,
+            trailer_str
+        );
+    }
 }
