@@ -116,6 +116,10 @@ pub struct CacheKey {
     pub page_id: PageId,
 }
 
+impl CacheKey {
+    const VERSION: u8 = 1;
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct CacheKeyHeader(
     /// 8 bits version
@@ -132,8 +136,10 @@ impl CacheKeyHeader {
         key_len: usize,
         page_id: PageId,
     ) -> Result<Self, &'static str> {
-        // version is u8, so it's always valid (0-255)
-        if kind_len >= (1 << 6) {
+        if kind_len == 0 {
+            return Err("Kind length cannot be zero");
+        }
+        if kind_len > (1 << 6) {
             return Err("Kind length exceeds 6 bits");
         }
         if key_len >= (1 << 10) {
@@ -145,8 +151,8 @@ impl CacheKeyHeader {
         // Byte 0: version (8 bits)
         bytes[0] = version;
 
-        // Byte 1: kind_len (6 bits, upper) | key_len bits 9-8 (2 bits, lower)
-        bytes[1] = ((kind_len as u8) << 2) | ((key_len >> 8) as u8 & 0b11);
+        // Byte 1: (kind_len - 1) (6 bits, upper) | key_len bits 9-8 (2 bits, lower)
+        bytes[1] = (((kind_len - 1) as u8) << 2) | ((key_len >> 8) as u8 & 0b11);
 
         // Byte 2: key_len bits 7-0 (8 bits)
         bytes[2] = (key_len & 0xFF) as u8;
@@ -163,7 +169,7 @@ impl CacheKeyHeader {
     }
 
     fn kind_len(&self) -> usize {
-        (self.0[1] >> 2) as usize
+        ((self.0[1] >> 2) as usize) + 1
     }
 
     fn key_len(&self) -> usize {
@@ -191,8 +197,13 @@ impl CacheKeyHeader {
 /// - object key
 impl foyer::Code for CacheKey {
     fn encode(&self, writer: &mut impl std::io::Write) -> foyer::Result<()> {
-        let flag = CacheKeyHeader::new(0, self.kind.len(), self.object.len(), self.page_id)
-            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+        let flag = CacheKeyHeader::new(
+            Self::VERSION,
+            self.kind.len(),
+            self.object.len(),
+            self.page_id,
+        )
+        .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
 
         writer.write_all(&flag.to_bytes())?;
         writer.write_all(self.kind.as_bytes())?;
@@ -211,7 +222,7 @@ impl foyer::Code for CacheKey {
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?
         };
 
-        if header.version() != 0 {
+        if header.version() != Self::VERSION {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Unsupported version {}", header.version()),
@@ -286,7 +297,10 @@ impl CacheValueHeader {
         data_len: usize,
         cached_at: u32,
     ) -> Result<Self, &'static str> {
-        if bucket_name_len >= (1 << 6) {
+        if bucket_name_len == 0 {
+            return Err("Bucket name length cannot be zero");
+        }
+        if bucket_name_len > (1 << 6) {
             return Err("Bucket name length exceeds limit");
         }
         if object_size >= (1 << 40) {
@@ -296,7 +310,7 @@ impl CacheValueHeader {
             return Err("Data length exceeds limit");
         }
         let bytes = [
-            (bucket_name_len as u8) & 0b111111,
+            ((bucket_name_len - 1) as u8) & 0b111111,
             (object_size >> 32) as u8,
             ((object_size >> 24) & 0xff) as u8,
             ((object_size >> 16) & 0xff) as u8,
@@ -318,7 +332,7 @@ impl CacheValueHeader {
     }
 
     fn bucket_name_len(self) -> usize {
-        (self.0[0] & 0b111111) as usize
+        ((self.0[0] & 0b111111) as usize) + 1
     }
 
     fn object_size(self) -> u64 {
@@ -435,8 +449,16 @@ mod tests {
         let decoded = CacheKeyHeader::from_bytes(bytes).unwrap();
         assert_eq!(header, decoded);
 
+        // Test maximum kind_len (64)
+        let header_max = CacheKeyHeader::new(1, 64, 1023, 65535).unwrap();
+        assert_eq!(header_max.kind_len(), 64);
+        let bytes_max = header_max.to_bytes();
+        let decoded_max = CacheKeyHeader::from_bytes(bytes_max).unwrap();
+        assert_eq!(decoded_max.kind_len(), 64);
+
         // Test error cases
-        assert!(CacheKeyHeader::new(0, 64, 0, 0).is_err()); // kind_len too large (>= 64)
+        assert!(CacheKeyHeader::new(0, 0, 0, 0).is_err()); // kind_len cannot be zero
+        assert!(CacheKeyHeader::new(0, 65, 0, 0).is_err()); // kind_len too large (> 64)
         assert!(CacheKeyHeader::new(0, 0, 1024, 0).is_err()); // key_len too large (>= 1024)
     }
 
@@ -456,10 +478,19 @@ mod tests {
         let decoded = CacheValueHeader::from_bytes(bytes).unwrap();
         assert_eq!(header.0, decoded.0);
 
+        // Test maximum bucket_name_len (64)
+        let header_max =
+            CacheValueHeader::new(64, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1700000000).unwrap();
+        assert_eq!(header_max.bucket_name_len(), 64);
+        let bytes_max = header_max.to_bytes();
+        let decoded_max = CacheValueHeader::from_bytes(bytes_max).unwrap();
+        assert_eq!(decoded_max.bucket_name_len(), 64);
+
         // Test error cases
-        assert!(CacheValueHeader::new(64, 0, 0, 0, 0).is_err()); // bucket_name_len too large
-        assert!(CacheValueHeader::new(0, 1 << 40, 0, 0, 0).is_err()); // object_size too large
-        assert!(CacheValueHeader::new(0, 0, 0, 1 << 24, 0).is_err()); // data_len too large
+        assert!(CacheValueHeader::new(0, 0, 0, 0, 0).is_err()); // bucket_name_len cannot be zero
+        assert!(CacheValueHeader::new(65, 0, 0, 0, 0).is_err()); // bucket_name_len too large (> 64)
+        assert!(CacheValueHeader::new(1, 1 << 40, 0, 0, 0).is_err()); // object_size too large
+        assert!(CacheValueHeader::new(1, 0, 0, 1 << 24, 0).is_err()); // data_len too large
     }
 
     #[test]
@@ -502,12 +533,53 @@ mod tests {
         assert_eq!(value.cached_at, decoded.cached_at);
     }
 
+    #[test]
+    fn test_max_length_bucket_and_kind() {
+        let bucket_64 = "a".repeat(64);
+        let kind_64 = "b".repeat(64);
+        let key = "c".repeat(100);
+
+        let cache_key = CacheKey {
+            kind: ObjectKind::new(kind_64.clone()).unwrap(),
+            object: ObjectKey::new(key.clone()).unwrap(),
+            page_id: 42,
+        };
+
+        let mut encoded_key = Vec::new();
+        cache_key.encode(&mut encoded_key).unwrap();
+
+        let mut reader = std::io::Cursor::new(encoded_key);
+        let decoded_key = CacheKey::decode(&mut reader).unwrap();
+
+        assert_eq!(cache_key.kind.len(), 64);
+        assert_eq!(decoded_key.kind.len(), 64);
+        assert_eq!(cache_key, decoded_key);
+
+        let cache_value = CacheValue {
+            bucket: BucketName::new(bucket_64.clone()).unwrap(),
+            mtime: 1234567890,
+            object_size: 9876543210,
+            data: bytes::Bytes::from(vec![1, 2, 3, 4, 5]),
+            cached_at: 1700000000,
+        };
+
+        let mut encoded_value = Vec::new();
+        cache_value.encode(&mut encoded_value).unwrap();
+
+        let mut reader = std::io::Cursor::new(encoded_value);
+        let decoded_value = CacheValue::decode(&mut reader).unwrap();
+
+        assert_eq!(cache_value.bucket.len(), 64);
+        assert_eq!(decoded_value.bucket.len(), 64);
+        assert_eq!(cache_value.bucket, decoded_value.bucket);
+    }
+
     // Property-based tests
     proptest! {
         #[test]
         fn prop_cache_key_header_roundtrip(
             version in 0u8..=255,
-            kind_len in 0usize..64,
+            kind_len in 1usize..=64,
             key_len in 0usize..1024,
             page_id in 0u16..=u16::MAX
         ) {
@@ -523,7 +595,7 @@ mod tests {
 
         #[test]
         fn prop_cache_value_header_roundtrip(
-            bucket_name_len in 0usize..64,
+            bucket_name_len in 1usize..=64,
             object_size in 0u64..(1u64 << 40),
             mtime in 0u32..=u32::MAX,
             data_len in 0usize..(1 << 24),
@@ -612,7 +684,7 @@ mod tests {
         assert!(CacheKey::decode(&mut reader).is_err());
 
         // Test unsupported version
-        let header = CacheKeyHeader::new(1, 4, 4, 0).unwrap(); // version 1
+        let header = CacheKeyHeader::new(0, 4, 4, 0).unwrap(); // version 0 (old version)
         let mut data = Vec::new();
         data.extend_from_slice(&header.to_bytes());
         data.extend_from_slice(b"kind"); // object kind
@@ -621,7 +693,7 @@ mod tests {
         assert!(CacheKey::decode(&mut reader).is_err());
 
         // Test invalid UTF-8 in object kind
-        let header = CacheKeyHeader::new(0, 4, 4, 0).unwrap();
+        let header = CacheKeyHeader::new(1, 4, 4, 0).unwrap();
         let mut data = Vec::new();
         data.extend_from_slice(&header.to_bytes());
         data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // invalid UTF-8 in kind
@@ -630,7 +702,7 @@ mod tests {
         assert!(CacheKey::decode(&mut reader).is_err());
 
         // Test invalid UTF-8 in object key
-        let header = CacheKeyHeader::new(0, 4, 4, 0).unwrap();
+        let header = CacheKeyHeader::new(1, 4, 4, 0).unwrap();
         let mut data = Vec::new();
         data.extend_from_slice(&header.to_bytes());
         data.extend_from_slice(b"kind"); // object kind
