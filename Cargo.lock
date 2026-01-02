@@ -978,6 +978,8 @@ dependencies = [
  "http-content-range",
  "http-range-header",
  "httpdate",
+ "hyper",
+ "hyper-util",
  "itertools",
  "jemalloc_pprof",
  "mixtrics",
