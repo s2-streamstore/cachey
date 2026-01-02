@@ -27,6 +27,16 @@ pub const PAGE_SIZE: u64 = 16 * 1024 * 1024;
 
 pub const MAX_RANGE_END: u64 = PAGE_SIZE * PageId::MAX as u64;
 
+fn page_id_for_byte_offset(byte_offset: u64) -> PageId {
+    (byte_offset / PAGE_SIZE) as PageId
+}
+
+fn page_bounds_for_range(byterange: &Range<u64>) -> (PageId, PageId) {
+    let first_page = page_id_for_byte_offset(byterange.start);
+    let last_page = page_id_for_byte_offset(byterange.end - 1);
+    (first_page, last_page)
+}
+
 #[derive(Debug)]
 pub struct ServiceConfig {
     pub cache: CacheConfig,
@@ -132,8 +142,7 @@ impl CacheyService {
         assert!(byterange.start < byterange.end);
         assert!(byterange.end <= MAX_RANGE_END);
 
-        let first_page = (byterange.start / PAGE_SIZE) as PageId;
-        let last_page = (byterange.end / PAGE_SIZE) as PageId;
+        let (first_page, last_page) = page_bounds_for_range(&byterange);
 
         metrics::fetch_request_bytes(&kind, byterange.end - byterange.start);
         metrics::fetch_request_pages(&kind, last_page - first_page + 1);
@@ -153,16 +162,17 @@ impl CacheyService {
         )
         .buffered(concurrency)
         .map_ok(move |(page_id, value)| {
-            let mut range_start = page_id as u64 * PAGE_SIZE;
-            let mut range_end = range_start + value.data.len() as u64;
+            let page_start = page_id as u64 * PAGE_SIZE;
+            let mut range_start = page_start;
+            let mut range_end = page_start + value.data.len() as u64;
             let mut start_offset = 0;
             let mut end_offset = value.data.len();
             if page_id == first_page {
-                start_offset = (byterange.start % PAGE_SIZE) as usize;
+                start_offset = (byterange.start - page_start) as usize;
                 range_start = byterange.start;
             }
             if page_id == last_page {
-                end_offset = (byterange.end % PAGE_SIZE) as usize;
+                end_offset = (byterange.end - page_start) as usize;
                 range_end = byterange.end;
             }
             let data = value.data.slice(start_offset..end_offset);
@@ -298,5 +308,37 @@ impl PageGetExecutor {
                 None => ServiceError::Cache(err),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_id_for_byte_offset_matches_page_boundaries() {
+        assert_eq!(page_id_for_byte_offset(0), 0);
+        assert_eq!(page_id_for_byte_offset(PAGE_SIZE - 1), 0);
+        assert_eq!(page_id_for_byte_offset(PAGE_SIZE), 1);
+        assert_eq!(page_id_for_byte_offset(PAGE_SIZE + 123), 1);
+        assert_eq!(page_id_for_byte_offset(2 * PAGE_SIZE), 2);
+    }
+
+    #[test]
+    fn page_bounds_for_range_end_on_page_boundary_does_not_advance_last_page() {
+        let byterange = 0..PAGE_SIZE;
+        assert_eq!(page_bounds_for_range(&byterange), (0, 0));
+
+        let byterange = 0..(2 * PAGE_SIZE);
+        assert_eq!(page_bounds_for_range(&byterange), (0, 1));
+    }
+
+    #[test]
+    fn page_bounds_for_range_crosses_page_boundary() {
+        let byterange = (PAGE_SIZE - 1)..(PAGE_SIZE + 1);
+        assert_eq!(page_bounds_for_range(&byterange), (0, 1));
+
+        let byterange = PAGE_SIZE..(2 * PAGE_SIZE);
+        assert_eq!(page_bounds_for_range(&byterange), (1, 1));
     }
 }

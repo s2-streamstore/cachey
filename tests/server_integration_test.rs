@@ -407,6 +407,44 @@ async fn test_fetch_endpoint_cache_hit() {
 }
 
 #[tokio::test]
+async fn test_fetch_endpoint_range_ending_at_page_boundary() {
+    let ctx = setup_test_server().await;
+
+    let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize);
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = (i % 256) as u8;
+    }
+    let test_data = test_data.freeze();
+    let object_key = "exact-page-size.bin";
+    upload_test_object(
+        &ctx.s3_client,
+        &ctx.bucket_name,
+        object_key,
+        test_data.clone(),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "{}/fetch/{}/{}",
+            ctx.server_url, &ctx.bucket_name, object_key
+        ))
+        .header("Range", format!("bytes=0-{}", PAGE_SIZE - 1))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 206);
+
+    let body = response
+        .bytes()
+        .await
+        .expect("Failed to read response body");
+    assert_eq!(body, test_data);
+}
+
+#[tokio::test]
 async fn test_fetch_endpoint_concurrent_requests() {
     let ctx = setup_test_server().await;
 
