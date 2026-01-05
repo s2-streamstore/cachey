@@ -62,3 +62,7 @@ enum_glob_use = "warn"
 
 [lints.rust]
 unsafe_code = "warn"
+
+[profile.release]
+debug = 1
+strip = false
