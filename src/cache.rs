@@ -117,7 +117,7 @@ pub struct CacheKey {
 }
 
 impl CacheKey {
-    const VERSION: u8 = 1;
+    const VERSION: u8 = 2;
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -281,9 +281,9 @@ pub struct CacheValue {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct CacheValueHeader(
-    /// 1B: 2b reserved | 6b for bucket name length
+    /// 1B: 1b reserved | 1b empty flag | 6b for bucket name length
     /// 5B: object size
-    /// 3B: data len
+    /// 3B: data_len_minus_one (ignored if empty flag set)
     /// 4B: mtime
     /// 4B: cached_at
     [u8; 17],
@@ -306,19 +306,20 @@ impl CacheValueHeader {
         if object_size >= (1 << 40) {
             return Err("Object size exceeds limit");
         }
-        if data_len >= (1 << 24) {
+        if data_len > (1 << 24) {
             return Err("Data length exceeds limit");
         }
+        let data_len_minus_one = (data_len as u32).saturating_sub(1);
         let bytes = [
-            ((bucket_name_len - 1) as u8) & 0b111111,
+            ((data_len == 0) as u8) << 6 | ((bucket_name_len - 1) as u8 & 0b0011_1111),
             (object_size >> 32) as u8,
             ((object_size >> 24) & 0xff) as u8,
             ((object_size >> 16) & 0xff) as u8,
             ((object_size >> 8) & 0xff) as u8,
             (object_size & 0xff) as u8,
-            ((data_len >> 16) & 0xff) as u8,
-            ((data_len >> 8) & 0xff) as u8,
-            (data_len & 0xff) as u8,
+            ((data_len_minus_one >> 16) & 0xff) as u8,
+            ((data_len_minus_one >> 8) & 0xff) as u8,
+            (data_len_minus_one & 0xff) as u8,
             (mtime >> 24) as u8,
             ((mtime >> 16) & 0xff) as u8,
             ((mtime >> 8) & 0xff) as u8,
@@ -332,7 +333,7 @@ impl CacheValueHeader {
     }
 
     fn bucket_name_len(self) -> usize {
-        ((self.0[0] & 0b111111) as usize) + 1
+        ((self.0[0] & 0b0011_1111) as usize) + 1
     }
 
     fn object_size(self) -> u64 {
@@ -342,7 +343,11 @@ impl CacheValueHeader {
     }
 
     fn data_len(self) -> usize {
-        u32::from_be_bytes([0, self.0[6], self.0[7], self.0[8]]) as usize
+        if self.0[0] & 0b0100_0000 != 0 {
+            return 0;
+        }
+        let data_len_minus_one = u32::from_be_bytes([0, self.0[6], self.0[7], self.0[8]]);
+        (data_len_minus_one + 1) as usize
     }
 
     fn mtime(self) -> u32 {
@@ -354,10 +359,21 @@ impl CacheValueHeader {
     }
 
     fn from_bytes(bytes: [u8; 17]) -> Result<Self, &'static str> {
-        if bytes[0] & 0b11000000 != 0 {
+        if bytes[0] & 0b1000_0000 != 0 {
             return Err("Invalid header");
         }
-        Ok(Self(bytes))
+        let header = Self(bytes);
+
+        let empty = header.0[0] & 0b0100_0000 != 0;
+        let data_len_minus_one = u32::from_be_bytes([0, header.0[6], header.0[7], header.0[8]]);
+        if empty {
+            if data_len_minus_one != 0 {
+                return Err("Invalid header");
+            }
+        } else if (data_len_minus_one + 1) > (1 << 24) {
+            return Err("Invalid header");
+        }
+        Ok(header)
     }
 
     fn to_bytes(self) -> [u8; 17] {
@@ -434,6 +450,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::service::PAGE_SIZE;
 
     #[test]
     fn test_cache_key_header() {
@@ -490,7 +507,22 @@ mod tests {
         assert!(CacheValueHeader::new(0, 0, 0, 0, 0).is_err()); // bucket_name_len cannot be zero
         assert!(CacheValueHeader::new(65, 0, 0, 0, 0).is_err()); // bucket_name_len too large (> 64)
         assert!(CacheValueHeader::new(1, 1 << 40, 0, 0, 0).is_err()); // object_size too large
-        assert!(CacheValueHeader::new(1, 0, 0, 1 << 24, 0).is_err()); // data_len too large
+        assert!(CacheValueHeader::new(1, 0, 0, (1 << 24) + 1, 0).is_err()); // data_len too large
+    }
+
+    #[test]
+    fn test_cache_value_header_supports_page_size() {
+        let header = CacheValueHeader::new(1, PAGE_SIZE, 0, PAGE_SIZE as usize, 0).unwrap();
+        assert_eq!(header.data_len(), PAGE_SIZE as usize);
+    }
+
+    #[test]
+    fn test_cache_value_header_supports_empty_data() {
+        let header = CacheValueHeader::new(1, 0, 0, 0, 0).unwrap();
+        assert_eq!(header.data_len(), 0);
+
+        let decoded = CacheValueHeader::from_bytes(header.to_bytes()).unwrap();
+        assert_eq!(decoded.data_len(), 0);
     }
 
     #[test]
@@ -598,7 +630,7 @@ mod tests {
             bucket_name_len in 1usize..=64,
             object_size in 0u64..(1u64 << 40),
             mtime in 0u32..=u32::MAX,
-            data_len in 0usize..(1 << 24),
+            data_len in 0usize..=(1 << 24),
             cached_at in 0u32..=u32::MAX
         ) {
             let header = CacheValueHeader::new(bucket_name_len, object_size, mtime, data_len, cached_at).unwrap();
