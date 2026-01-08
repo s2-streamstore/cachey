@@ -5,6 +5,7 @@ edition = "2024"
 authors = ["s2 team <hi@s2.dev>"]
 license = "MIT"
 repository = "https://github.com/s2-streamstore/cachey"
+description = "Read-through cache for object storage"
 
 [dependencies]
 async-stream = "0.3"
