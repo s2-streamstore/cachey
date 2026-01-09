@@ -4,7 +4,7 @@ default:
 
 # Build the server binary
 build:
-    cargo build --release --bin server
+    cargo build --locked --release --bin server
 
 # Run clippy linter
 clippy:
@@ -20,7 +20,11 @@ test:
 
 # Run the server locally
 run:
-    cargo run --release --bin server
+    cargo run --locked --release --bin server
+
+# Verify Cargo.lock is up-to-date
+check-locked:
+    cargo metadata --locked --format-version 1 >/dev/null
 
 # Clean build artifacts
 clean:
@@ -30,6 +34,7 @@ clean:
 release TAG:
     #!/usr/bin/env bash
     set -euo pipefail
+    just check-locked
     echo "Creating release tag: {{TAG}}"
     git tag {{TAG}}
     git push origin {{TAG}}
