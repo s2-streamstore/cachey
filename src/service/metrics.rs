@@ -6,6 +6,7 @@ use prometheus::{
     register_gauge_vec, register_histogram_vec, register_int_counter_vec, register_int_gauge,
     register_int_gauge_vec,
 };
+use tikv_jemalloc_ctl::{epoch, stats};
 
 use crate::{
     object_store::BucketMetrics,
@@ -201,6 +202,80 @@ pub fn first_chunk_latency(kind: &ObjectKind, hit: bool, latency: Duration) {
     HISTOGRAM
         .with_label_values(&[&**kind, hit_str])
         .observe(latency.as_secs_f64());
+}
+
+pub fn observe_jemalloc_metrics() {
+    static ALLOCATED: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "cachey_jemalloc_allocated_bytes",
+            "jemalloc stats.allocated (live bytes requested by the application)"
+        )
+        .unwrap()
+    });
+    static ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "cachey_jemalloc_active_bytes",
+            "jemalloc stats.active (bytes in active pages used for allocations)"
+        )
+        .unwrap()
+    });
+    static RESIDENT: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "cachey_jemalloc_resident_bytes",
+            "jemalloc stats.resident (resident physical bytes for jemalloc-managed memory)"
+        )
+        .unwrap()
+    });
+    static RETAINED: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "cachey_jemalloc_retained_bytes",
+            "jemalloc stats.retained (bytes retained in virtual memory mappings for reuse; not RSS: use resident/active/allocated for fragmentation/overhead ratios)"
+        )
+        .unwrap()
+    });
+    static MAPPED: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "cachey_jemalloc_mapped_bytes",
+            "jemalloc stats.mapped (virtual memory mapped by jemalloc)"
+        )
+        .unwrap()
+    });
+    static METADATA: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "cachey_jemalloc_metadata_bytes",
+            "jemalloc stats.metadata (jemalloc internal metadata bytes)"
+        )
+        .unwrap()
+    });
+
+    fn usize_to_i64(value: usize) -> i64 {
+        i64::try_from(value).unwrap_or(i64::MAX)
+    }
+
+    if epoch::advance().is_err() {
+        return;
+    }
+
+    let (allocated, active, resident, retained, mapped, metadata) = match (
+        stats::allocated::read(),
+        stats::active::read(),
+        stats::resident::read(),
+        stats::retained::read(),
+        stats::mapped::read(),
+        stats::metadata::read(),
+    ) {
+        (Ok(allocated), Ok(active), Ok(resident), Ok(retained), Ok(mapped), Ok(metadata)) => {
+            (allocated, active, resident, retained, mapped, metadata)
+        }
+        _ => return,
+    };
+
+    ALLOCATED.set(usize_to_i64(allocated));
+    ACTIVE.set(usize_to_i64(active));
+    RESIDENT.set(usize_to_i64(resident));
+    RETAINED.set(usize_to_i64(retained));
+    MAPPED.set(usize_to_i64(mapped));
+    METADATA.set(usize_to_i64(metadata));
 }
 
 pub fn gather() -> Bytes {

@@ -993,6 +993,7 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "thiserror 2.0.17",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "tracing",
