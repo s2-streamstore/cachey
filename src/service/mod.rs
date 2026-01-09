@@ -98,6 +98,8 @@ impl CacheyService {
         self.downloader
             .observe_bucket_metrics(metrics::set_bucket_stats);
 
+        metrics::observe_jemalloc_metrics();
+
         let mut egress_throughput = self.egress_throughput.lock();
         metrics::observe_throughput(
             "egress",

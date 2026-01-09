@@ -204,7 +204,7 @@ pub fn first_chunk_latency(kind: &ObjectKind, hit: bool, latency: Duration) {
         .observe(latency.as_secs_f64());
 }
 
-fn update_jemalloc_gauges() {
+pub fn observe_jemalloc_metrics() {
     static ALLOCATED: LazyLock<IntGauge> = LazyLock::new(|| {
         register_int_gauge!(
             "cachey_jemalloc_allocated_bytes",
@@ -256,23 +256,18 @@ fn update_jemalloc_gauges() {
         return;
     }
 
-    let Ok(allocated) = stats::allocated::read() else {
-        return;
-    };
-    let Ok(active) = stats::active::read() else {
-        return;
-    };
-    let Ok(resident) = stats::resident::read() else {
-        return;
-    };
-    let Ok(retained) = stats::retained::read() else {
-        return;
-    };
-    let Ok(mapped) = stats::mapped::read() else {
-        return;
-    };
-    let Ok(metadata) = stats::metadata::read() else {
-        return;
+    let (allocated, active, resident, retained, mapped, metadata) = match (
+        stats::allocated::read(),
+        stats::active::read(),
+        stats::resident::read(),
+        stats::retained::read(),
+        stats::mapped::read(),
+        stats::metadata::read(),
+    ) {
+        (Ok(allocated), Ok(active), Ok(resident), Ok(retained), Ok(mapped), Ok(metadata)) => {
+            (allocated, active, resident, retained, mapped, metadata)
+        }
+        _ => return,
     };
 
     ALLOCATED.set(usize_to_i64(allocated));
@@ -284,8 +279,6 @@ fn update_jemalloc_gauges() {
 }
 
 pub fn gather() -> Bytes {
-    update_jemalloc_gauges();
-
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();
     let mut buffer = BytesMut::new().writer();
