@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use bytes::{Bytes, BytesMut};
 use bytesize::ByteSize;
@@ -49,6 +52,11 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
         .storage()
         .with_spawner(
             tokio::runtime::Builder::new_multi_thread()
+                .thread_name_fn(|| {
+                    static TID: AtomicUsize = AtomicUsize::new(0);
+                    let id = TID.fetch_add(1, Ordering::Relaxed);
+                    format!("foyer-{}", id)
+                })
                 .enable_all()
                 .build()?
                 .into(),
