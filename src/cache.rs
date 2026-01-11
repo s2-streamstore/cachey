@@ -1,14 +1,11 @@
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use bytes::{Bytes, BytesMut};
 use bytesize::ByteSize;
 use compact_str::CompactString;
-#[cfg(target_os = "linux")]
-use foyer::UringIoEngineBuilder;
 use foyer::{
-    BlockEngineBuilder, Code, DeviceBuilder, EvictionConfig, FileDeviceBuilder, FsDeviceBuilder,
-    HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngine, IoEngineBuilder,
-    PsyncIoEngineBuilder, S3FifoConfig,
+    BlockEngineConfig, Code, DeviceBuilder, EvictionConfig, FileDeviceBuilder, FsDeviceBuilder,
+    HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineConfig, S3FifoConfig,
 };
 use mixtrics::registry::prometheus_0_14::PrometheusMetricsRegistry;
 
@@ -18,7 +15,6 @@ use crate::types::{BucketName, ObjectKey, ObjectKind, PageId};
 pub struct CacheConfig {
     pub memory_size: ByteSize,
     pub disk_cache: Option<DiskCacheConfig>,
-    pub iouring: bool,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -34,6 +30,7 @@ pub struct DiskCacheConfig {
     pub path: PathBuf,
     pub kind: DiskCacheKind,
     pub capacity: Option<ByteSize>,
+    pub iouring: bool,
 }
 
 pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<CacheKey, CacheValue>> {
@@ -50,11 +47,12 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
             key.estimated_size() + value.estimated_size()
         })
         .storage()
-        .with_runtime_options(foyer::RuntimeOptions::Separated {
-            read_runtime_options: foyer::TokioRuntimeOptions::default(),
-            write_runtime_options: foyer::TokioRuntimeOptions::default(),
-        })
-        .with_io_engine(io_engine(config.iouring).await?);
+        .with_spawner(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .into(),
+        );
 
     if let Some(disk_config) = config.disk_cache {
         // TODO: throttling knobs?
@@ -82,31 +80,23 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
                 fs_device.build()?
             }
         };
-        let engine = BlockEngineBuilder::new(device).with_block_size(64 * 1024 * 1024);
-        builder = builder.with_engine_config(engine);
+        let engine = BlockEngineConfig::new(device).with_block_size(64 * 1024 * 1024);
+        builder = builder
+            .with_engine_config(engine)
+            .with_io_engine_config(io_engine_config(disk_config.iouring));
     }
 
     builder.build().await
 }
 
-async fn io_engine(iouring: bool) -> foyer::Result<Arc<dyn IoEngine>> {
+fn io_engine_config(iouring: bool) -> Box<dyn IoEngineConfig> {
     #[cfg(target_os = "linux")]
     if iouring {
-        match UringIoEngineBuilder::new().build().await {
-            Ok(engine) => {
-                tracing::info!("Using io_uring IO engine");
-                return Ok(engine);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize io_uring, falling back to sync: {}", e);
-            }
-        }
+        return foyer::UringIoEngineConfig::new().boxed();
     }
-
     #[cfg(not(target_os = "linux"))]
     let _ = iouring; // Suppress unused warning.
-
-    PsyncIoEngineBuilder::new().build().await
+    foyer::PsyncIoEngineConfig::new().boxed()
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]

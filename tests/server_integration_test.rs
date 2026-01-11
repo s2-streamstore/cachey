@@ -57,7 +57,6 @@ async fn setup_test_server() -> TestContext {
         cache: CacheConfig {
             memory_size: ByteSize::mib(256),
             disk_cache: None,
-            iouring: false,
         },
         hedge_quantile: 0.99,
     };
