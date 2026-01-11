@@ -23,6 +23,10 @@ struct DiskCacheGroup {
     /// If not specified, up to 80% of the available space will be used
     #[arg(long, value_parser = parse_bytes, requires = "disk_path")]
     disk_capacity: Option<ByteSize>,
+
+    /// Use io_uring (if available) for disk IO.
+    #[arg(long, action = ArgAction::SetTrue)]
+    iouring: bool,
 }
 
 #[derive(ArgGroup, Debug, Clone)]
@@ -64,10 +68,6 @@ struct Args {
     /// Port to listen on [default: 443 if HTTPS configured, otherwise 80 for HTTP]
     #[arg(long)]
     port: Option<u16>,
-
-    /// Use io_uring (if available) for disk IO.
-    #[arg(long, action = ArgAction::SetTrue)]
-    iouring: bool,
 }
 
 fn parse_bytes(s: &str) -> Result<ByteSize, String> {
@@ -104,12 +104,12 @@ async fn main() -> eyre::Result<()> {
                     path,
                     kind: args.disk_cache.disk_kind,
                     capacity: args.disk_cache.disk_capacity,
+                    iouring: args.disk_cache.iouring,
                 })
             } else {
                 info!("disk cache disabled");
                 None
             },
-            iouring: args.iouring,
         },
         hedge_quantile: args.hedge_quantile,
     };
@@ -201,7 +201,7 @@ async fn shutdown_signal(handle: axum_server::Handle<SocketAddr>) {
     };
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let term = std::future::pending::<()>();
 
     tokio::select! {
         _ = ctrl_c => {
