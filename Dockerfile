@@ -31,4 +31,4 @@ WORKDIR /app
 COPY --from=builder /build/target/release/server /app/cachey
 
 # Run the server
-CMD ["./cachey"]
+ENTRYPOINT ["./cachey"]
