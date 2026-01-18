@@ -320,6 +320,7 @@ pub async fn stats(State(service): State<CacheyService>) -> impl IntoResponse {
     })
 }
 
+#[cfg(feature = "jemalloc")]
 pub async fn heap_profile() -> Result<impl IntoResponse, (StatusCode, String)> {
     let mut prof_ctl = jemalloc_pprof::PROF_CTL
         .as_ref()
@@ -344,6 +345,12 @@ pub async fn heap_profile() -> Result<impl IntoResponse, (StatusCode, String)> {
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], pprof))
 }
 
+#[cfg(not(feature = "jemalloc"))]
+pub async fn heap_profile() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, "jemalloc profiling not enabled")
+}
+
+#[cfg(feature = "jemalloc")]
 pub async fn heap_flamegraph() -> Result<impl IntoResponse, (StatusCode, String)> {
     let mut prof_ctl = jemalloc_pprof::PROF_CTL
         .as_ref()
@@ -366,6 +373,11 @@ pub async fn heap_flamegraph() -> Result<impl IntoResponse, (StatusCode, String)
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     Ok(([(header::CONTENT_TYPE, "image/svg+xml")], flamegraph))
+}
+
+#[cfg(not(feature = "jemalloc"))]
+pub async fn heap_flamegraph() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, "jemalloc profiling not enabled")
 }
 
 fn on_chunk_error(

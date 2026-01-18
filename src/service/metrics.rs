@@ -6,7 +6,6 @@ use prometheus::{
     register_gauge_vec, register_histogram_vec, register_int_counter_vec, register_int_gauge,
     register_int_gauge_vec,
 };
-use tikv_jemalloc_ctl::{epoch, stats};
 
 use crate::{
     object_store::BucketMetrics,
@@ -204,7 +203,10 @@ pub fn first_chunk_latency(kind: &ObjectKind, hit: bool, latency: Duration) {
         .observe(latency.as_secs_f64());
 }
 
+#[cfg(feature = "jemalloc")]
 pub fn observe_jemalloc_metrics() {
+    use tikv_jemalloc_ctl::{epoch, stats};
+
     static ALLOCATED: LazyLock<IntGauge> = LazyLock::new(|| {
         register_int_gauge!(
             "cachey_jemalloc_allocated_bytes",
@@ -277,6 +279,9 @@ pub fn observe_jemalloc_metrics() {
     MAPPED.set(usize_to_i64(mapped));
     METADATA.set(usize_to_i64(metadata));
 }
+
+#[cfg(not(feature = "jemalloc"))]
+pub fn observe_jemalloc_metrics() {}
 
 pub fn gather() -> Bytes {
     let encoder = TextEncoder::new();
