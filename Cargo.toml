@@ -1,6 +1,6 @@
 [package]
 name = "cachey"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2024"
 authors = ["s2 team <hi@s2.dev>"]
 license = "MIT"
