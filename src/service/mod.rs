@@ -174,8 +174,8 @@ impl CacheyService {
                 range_start = byterange.start;
             }
             if page_id == last_page {
-                end_offset = (byterange.end - page_start) as usize;
-                range_end = byterange.end;
+                end_offset = ((byterange.end - page_start) as usize).min(end_offset);
+                range_end = page_start + end_offset as u64;
             }
             let data = value.data.slice(start_offset..end_offset);
             self.egress_throughput.lock().record(data.len());
