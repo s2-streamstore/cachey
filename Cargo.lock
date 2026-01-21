@@ -927,7 +927,7 @@ checksum = "6bd91ee7b2422bcb158d90ef4d14f75ef67f340943fc4149891dcce8f8b972a3"
 
 [[package]]
 name = "cachey"
-version = "0.8.8"
+version = "0.8.9"
 dependencies = [
  "async-stream",
  "aws-config",
