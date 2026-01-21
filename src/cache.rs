@@ -115,14 +115,14 @@ pub struct CacheKey {
 }
 
 impl CacheKey {
-    const VERSION: u8 = 2;
+    const VERSION: u8 = 3;
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct CacheKeyHeader(
     /// 8 bits version
     /// 6 bits object kind length
-    /// 10 bits object key length
+    /// 10 bits object key length minus one
     /// 16 bits page ID
     [u8; 5],
 );
@@ -140,20 +140,24 @@ impl CacheKeyHeader {
         if kind_len > (1 << 6) {
             return Err("Kind length exceeds 6 bits");
         }
-        if key_len >= (1 << 10) {
+        if key_len == 0 {
+            return Err("Key length cannot be zero");
+        }
+        if key_len > (1 << 10) {
             return Err("Key length exceeds 10 bits");
         }
 
         let mut bytes = [0u8; 5];
+        let key_len_minus_one = key_len - 1;
 
         // Byte 0: version (8 bits)
         bytes[0] = version;
 
-        // Byte 1: (kind_len - 1) (6 bits, upper) | key_len bits 9-8 (2 bits, lower)
-        bytes[1] = (((kind_len - 1) as u8) << 2) | ((key_len >> 8) as u8 & 0b11);
+        // Byte 1: (kind_len - 1) (6 bits, upper) | key_len_minus_one bits 9-8 (2 bits, lower)
+        bytes[1] = (((kind_len - 1) as u8) << 2) | ((key_len_minus_one >> 8) as u8 & 0b11);
 
-        // Byte 2: key_len bits 7-0 (8 bits)
-        bytes[2] = (key_len & 0xFF) as u8;
+        // Byte 2: key_len_minus_one bits 7-0 (8 bits)
+        bytes[2] = (key_len_minus_one & 0xFF) as u8;
 
         // Bytes 3-4: page_id (16 bits, big-endian)
         bytes[3] = (page_id >> 8) as u8;
@@ -173,7 +177,7 @@ impl CacheKeyHeader {
     fn key_len(&self) -> usize {
         let high_bits = ((self.0[1] & 0b11) as usize) << 8;
         let low_bits = self.0[2] as usize;
-        high_bits | low_bits
+        (high_bits | low_bits) + 1
     }
 
     fn page_id(&self) -> PageId {
@@ -453,10 +457,10 @@ mod tests {
     #[test]
     fn test_cache_key_header() {
         // Test valid header creation
-        let header = CacheKeyHeader::new(255, 63, 1023, 65535).unwrap();
+        let header = CacheKeyHeader::new(255, 63, 1024, 65535).unwrap();
         assert_eq!(header.version(), 255);
         assert_eq!(header.kind_len(), 63);
-        assert_eq!(header.key_len(), 1023);
+        assert_eq!(header.key_len(), 1024);
         assert_eq!(header.page_id(), 65535);
 
         // Test roundtrip
@@ -465,7 +469,7 @@ mod tests {
         assert_eq!(header, decoded);
 
         // Test maximum kind_len (64)
-        let header_max = CacheKeyHeader::new(1, 64, 1023, 65535).unwrap();
+        let header_max = CacheKeyHeader::new(1, 64, 1024, 65535).unwrap();
         assert_eq!(header_max.kind_len(), 64);
         let bytes_max = header_max.to_bytes();
         let decoded_max = CacheKeyHeader::from_bytes(bytes_max).unwrap();
@@ -474,7 +478,8 @@ mod tests {
         // Test error cases
         assert!(CacheKeyHeader::new(0, 0, 0, 0).is_err()); // kind_len cannot be zero
         assert!(CacheKeyHeader::new(0, 65, 0, 0).is_err()); // kind_len too large (> 64)
-        assert!(CacheKeyHeader::new(0, 0, 1024, 0).is_err()); // key_len too large (>= 1024)
+        assert!(CacheKeyHeader::new(0, 1, 0, 0).is_err()); // key_len cannot be zero
+        assert!(CacheKeyHeader::new(0, 1, 1025, 0).is_err()); // key_len too large (> 1024)
     }
 
     #[test]
@@ -610,7 +615,7 @@ mod tests {
         fn prop_cache_key_header_roundtrip(
             version in 0u8..=255,
             kind_len in 1usize..=64,
-            key_len in 0usize..1024,
+            key_len in 1usize..=1024,
             page_id in 0u16..=u16::MAX
         ) {
             let header = CacheKeyHeader::new(version, kind_len, key_len, page_id).unwrap();
@@ -723,7 +728,7 @@ mod tests {
         assert!(CacheKey::decode(&mut reader).is_err());
 
         // Test invalid UTF-8 in object kind
-        let header = CacheKeyHeader::new(1, 4, 4, 0).unwrap();
+        let header = CacheKeyHeader::new(CacheKey::VERSION, 4, 4, 0).unwrap();
         let mut data = Vec::new();
         data.extend_from_slice(&header.to_bytes());
         data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // invalid UTF-8 in kind
@@ -732,7 +737,7 @@ mod tests {
         assert!(CacheKey::decode(&mut reader).is_err());
 
         // Test invalid UTF-8 in object key
-        let header = CacheKeyHeader::new(1, 4, 4, 0).unwrap();
+        let header = CacheKeyHeader::new(CacheKey::VERSION, 4, 4, 0).unwrap();
         let mut data = Vec::new();
         data.extend_from_slice(&header.to_bytes());
         data.extend_from_slice(b"kind"); // object kind
