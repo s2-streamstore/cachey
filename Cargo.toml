@@ -16,7 +16,7 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",
     "default-https-client",
 ] }
-aws-smithy-runtime-api = "1.9"
+aws-smithy-runtime-api = "1.10"
 axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 bytes = "1.11"
