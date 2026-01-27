@@ -69,7 +69,7 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: BucketMetrics) {
         .set(metrics.latency_hedge.as_secs_f64());
     CIRCUIT_BREAKER_OPEN
         .with_label_values(&[bucket])
-        .set(if metrics.circuit_breaker_open { 1 } else { 0 });
+        .set(i64::from(metrics.circuit_breaker_open));
     CONSECUTIVE_FAILURES
         .with_label_values(&[bucket])
         .set(metrics.consecutive_failures as i64);
