@@ -85,7 +85,7 @@ similar_names = "allow"
 module_name_repetitions = "allow"
 struct_field_names = "allow"
 too_many_lines = "allow"
-trivially_copy_passable_by_ref = "allow"
+trivially_copy_pass_by_ref = "allow"
 needless_pass_by_value = "allow"
 
 # Allow: match/option style preferences
@@ -107,6 +107,15 @@ semicolon_if_nothing_returned = "allow"
 
 # Allow: match style
 match_same_arms = "allow"
+
+# Allow: let...else style
+manual_let_else = "allow"
+
+# Allow: unnecessary Result wrapper for API consistency
+unnecessary_wraps = "allow"
+
+# Allow: unused async where sync is simpler
+unused_async = "allow"
 
 # Allow: async/futures
 large_futures = "allow"
