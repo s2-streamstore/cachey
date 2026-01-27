@@ -63,8 +63,63 @@ testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
 
 [lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
 wildcard_imports = "warn"
 enum_glob_use = "warn"
+
+# Allow: intentional casts where truncation/precision loss is acceptable
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+
+# Allow: documentation requirements too verbose for this codebase
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# Allow: code style preferences
+similar_names = "allow"
+module_name_repetitions = "allow"
+struct_field_names = "allow"
+too_many_lines = "allow"
+trivially_copy_passable_by_ref = "allow"
+needless_pass_by_value = "allow"
+
+# Allow: match/option style preferences
+single_match_else = "allow"
+match_wildcard_for_single_variants = "allow"
+option_if_let_else = "allow"
+or_fun_call = "allow"
+map_unwrap_or = "allow"
+if_not_else = "allow"
+
+# Allow: explicit unit type matching
+ignored_unit_patterns = "allow"
+
+# Allow: duration arithmetic in controlled contexts
+unchecked_time_subtraction = "allow"
+
+# Allow: formatting preferences
+semicolon_if_nothing_returned = "allow"
+
+# Allow: match style
+match_same_arms = "allow"
+
+# Allow: async/futures
+large_futures = "allow"
+significant_drop_tightening = "allow"
+
+# Allow: const fn suggestions often not useful
+missing_const_for_fn = "allow"
+
+# Allow: #[must_use] suggestions too noisy
+must_use_candidate = "allow"
+
+# Allow: doc formatting
+doc_markdown = "allow"
 
 [lints.rust]
 unsafe_code = "warn"
