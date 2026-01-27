@@ -806,16 +806,12 @@ async fn test_fetch_endpoint_multi_page_trailers() {
 
         assert!(
             trailer_str.contains(&ctx.bucket_name),
-            "Trailer {} should contain bucket name, got: {}",
-            idx,
-            trailer_str
+            "Trailer {idx} should contain bucket name, got: {trailer_str}",
         );
 
         assert!(
             trailer_str.contains('-'),
-            "Trailer {} should contain byte range with '-', got: {}",
-            idx,
-            trailer_str
+            "Trailer {idx} should contain byte range with '-', got: {trailer_str}",
         );
     }
 }
