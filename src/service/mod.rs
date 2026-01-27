@@ -155,7 +155,7 @@ impl CacheyService {
             kind,
             object,
             buckets,
-            object_size: Default::default(),
+            object_size: Arc::default(),
             req_config,
         };
 
