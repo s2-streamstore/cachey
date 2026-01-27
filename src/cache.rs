@@ -576,8 +576,8 @@ mod tests {
         let key = "c".repeat(100);
 
         let cache_key = CacheKey {
-            kind: ObjectKind::new(kind_64.clone()).unwrap(),
-            object: ObjectKey::new(key.clone()).unwrap(),
+            kind: ObjectKind::new(kind_64).unwrap(),
+            object: ObjectKey::new(key).unwrap(),
             page_id: 42,
         };
 
@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(cache_key, decoded_key);
 
         let cache_value = CacheValue {
-            bucket: BucketName::new(bucket_64.clone()).unwrap(),
+            bucket: BucketName::new(bucket_64).unwrap(),
             mtime: 1_234_567_890,
             object_size: 9_876_543_210,
             data: bytes::Bytes::from(vec![1, 2, 3, 4, 5]),

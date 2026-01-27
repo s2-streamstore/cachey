@@ -628,7 +628,7 @@ mod tests {
             stats.observe(eu_west.clone(), Ok(Duration::from_millis(400)));
         }
 
-        let buckets = vec![us_east.clone(), eu_west.clone(), ap_south.clone()];
+        let buckets = vec![us_east.clone(), eu_west, ap_south];
         let ordered = get_attempt_order(&stats, &buckets);
 
         // Should still prefer us-east as it has lower latency
@@ -672,7 +672,7 @@ mod tests {
         // Even with some errors on primary, it should still be preferred if error rate is low
         stats.observe(primary.clone(), Err(())); // 1 error out of 6 attempts = ~16% error rate
 
-        let buckets = vec![primary.clone(), secondary.clone(), tertiary.clone()];
+        let buckets = vec![primary.clone(), secondary, tertiary];
         let ordered = get_attempt_order(&stats, &buckets);
 
         // Primary: base(0) + err(16) + lat(2000) = 2016
