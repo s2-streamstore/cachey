@@ -32,11 +32,11 @@ pub enum DownloadError {
 impl DownloadError {
     fn should_attempt_fallback_bucket(&self) -> bool {
         match self {
-            DownloadError::InvalidObjectState(_) => true,
-            DownloadError::NoSuchKey => true,
-            DownloadError::RangeNotSatisfied { .. } => false,
-            DownloadError::BodyStreaming(_) => true,
-            DownloadError::Unknown { .. } => true,
+            Self::InvalidObjectState(_) => true,
+            Self::NoSuchKey => true,
+            Self::RangeNotSatisfied { .. } => false,
+            Self::BodyStreaming(_) => true,
+            Self::Unknown { .. } => true,
         }
     }
 }

@@ -59,7 +59,7 @@ where
                 http_range_header::StartPosition::Index(first_byte),
                 http_range_header::EndPosition::Index(last_byte),
             ) if first_byte <= last_byte && last_byte < super::MAX_RANGE_END => {
-                Ok(RangeHeader(first_byte..(last_byte + 1)))
+                Ok(Self(first_byte..(last_byte + 1)))
             }
             _ => Err((StatusCode::RANGE_NOT_SATISFIABLE, "Unsupported range")),
         }
@@ -74,14 +74,14 @@ where
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let Some(header_value) = parts.headers.get(&C0_CONFIG_HEADER) else {
-            return Ok(RequestConfig::default());
+            return Ok(Self::default());
         };
 
         let header_str = header_value
             .to_str()
             .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid C0-Config header encoding"))?;
 
-        let mut config = RequestConfig::default();
+        let mut config = Self::default();
 
         for pair in header_str.split_whitespace() {
             let Some((key, value)) = pair.split_once('=') else {
@@ -141,7 +141,7 @@ where
             let bucket = BucketName::new(s).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
             names.push(bucket);
         }
-        Ok(BucketHeaders(names))
+        Ok(Self(names))
     }
 }
 
