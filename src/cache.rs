@@ -487,12 +487,12 @@ mod tests {
     fn test_cache_value_header() {
         // Test valid header creation
         let header =
-            CacheValueHeader::new(63, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1700000000).unwrap();
+            CacheValueHeader::new(63, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1_700_000_000).unwrap();
         assert_eq!(header.bucket_name_len(), 63);
         assert_eq!(header.object_size(), (1 << 40) - 1);
         assert_eq!(header.mtime(), u32::MAX);
         assert_eq!(header.data_len(), (1 << 24) - 1);
-        assert_eq!(header.cached_at(), 1700000000);
+        assert_eq!(header.cached_at(), 1_700_000_000);
 
         // Test roundtrip
         let bytes = header.to_bytes();
@@ -501,7 +501,7 @@ mod tests {
 
         // Test maximum bucket_name_len (64)
         let header_max =
-            CacheValueHeader::new(64, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1700000000).unwrap();
+            CacheValueHeader::new(64, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1_700_000_000).unwrap();
         assert_eq!(header_max.bucket_name_len(), 64);
         let bytes_max = header_max.to_bytes();
         let decoded_max = CacheValueHeader::from_bytes(bytes_max).unwrap();
@@ -550,10 +550,10 @@ mod tests {
     fn test_cache_value_encode_decode() {
         let value = CacheValue {
             bucket: BucketName::new("test-bucket").unwrap(),
-            mtime: 1234567890,
-            object_size: 9876543210,
+            mtime: 1_234_567_890,
+            object_size: 9_876_543_210,
             data: bytes::Bytes::from(vec![1, 2, 3, 4, 5]),
-            cached_at: 1700000000,
+            cached_at: 1_700_000_000,
         };
 
         let mut encoded = Vec::new();
@@ -593,10 +593,10 @@ mod tests {
 
         let cache_value = CacheValue {
             bucket: BucketName::new(bucket_64.clone()).unwrap(),
-            mtime: 1234567890,
-            object_size: 9876543210,
+            mtime: 1_234_567_890,
+            object_size: 9_876_543_210,
             data: bytes::Bytes::from(vec![1, 2, 3, 4, 5]),
-            cached_at: 1700000000,
+            cached_at: 1_700_000_000,
         };
 
         let mut encoded_value = Vec::new();

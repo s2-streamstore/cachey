@@ -328,7 +328,7 @@ mod tests {
         let test_data = b"0123456789";
         let output = GetObjectOutput::builder()
             .content_range("bytes 0-9/100")
-            .last_modified(DateTime::from_secs(1234567890))
+            .last_modified(DateTime::from_secs(1_234_567_890))
             .body(aws_sdk_s3::primitives::ByteStream::from(test_data.to_vec()))
             .build();
 
@@ -345,7 +345,7 @@ mod tests {
 
         assert_eq!(result.data, Bytes::from(test_data.to_vec()));
         assert_eq!(result.object_size, 100);
-        assert_eq!(result.mtime, 1234567890);
+        assert_eq!(result.mtime, 1_234_567_890);
     }
 
     #[tokio::test]
