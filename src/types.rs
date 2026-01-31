@@ -2,7 +2,7 @@ use std::{ops::Deref, str::FromStr};
 
 use compact_str::CompactString;
 use itertools::Itertools;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
 pub type PageId = u16;
 
@@ -44,7 +44,7 @@ impl AsRef<str> for BucketName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ObjectKind(CompactString);
 
 impl std::fmt::Display for ObjectKind {
@@ -65,6 +65,16 @@ impl ObjectKind {
             return Err("Object kind too long");
         }
         Ok(Self(key))
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = CompactString::deserialize(deserializer)?;
+        Self::new(s).map_err(D::Error::custom)
     }
 }
 
@@ -90,7 +100,7 @@ impl From<ObjectKind> for BucketName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ObjectKey(CompactString);
 
 impl std::fmt::Display for ObjectKey {
@@ -111,6 +121,16 @@ impl ObjectKey {
             return Err("Object key too long");
         }
         Ok(Self(key))
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = CompactString::deserialize(deserializer)?;
+        Self::new(s).map_err(D::Error::custom)
     }
 }
 
@@ -157,5 +177,56 @@ impl IntoIterator for BucketNameSet {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_kind_deserialize_rejects_empty() {
+        let result: Result<ObjectKind, _> = serde_json::from_str(r#""""#);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn object_kind_deserialize_rejects_too_long() {
+        let long_str = "a".repeat(ObjectKind::MAX_LEN + 1);
+        let json = format!(r#""{long_str}""#);
+        let result: Result<ObjectKind, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too long"));
+    }
+
+    #[test]
+    fn object_kind_deserialize_accepts_valid() {
+        let result: Result<ObjectKind, _> = serde_json::from_str(r#""valid-kind""#);
+        assert!(result.is_ok());
+        assert_eq!(&*result.unwrap(), "valid-kind");
+    }
+
+    #[test]
+    fn object_key_deserialize_rejects_empty() {
+        let result: Result<ObjectKey, _> = serde_json::from_str(r#""""#);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn object_key_deserialize_rejects_too_long() {
+        let long_str = "a".repeat(ObjectKey::MAX_LEN + 1);
+        let json = format!(r#""{long_str}""#);
+        let result: Result<ObjectKey, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too long"));
+    }
+
+    #[test]
+    fn object_key_deserialize_accepts_valid() {
+        let result: Result<ObjectKey, _> = serde_json::from_str(r#""valid-key""#);
+        assert!(result.is_ok());
+        assert_eq!(&*result.unwrap(), "valid-key");
     }
 }
