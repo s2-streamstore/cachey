@@ -18,6 +18,7 @@ use crate::types::{BucketName, ObjectKey, ObjectKind, PageId};
 pub struct CacheConfig {
     pub memory_size: ByteSize,
     pub disk_cache: Option<DiskCacheConfig>,
+    pub metrics_registry: Option<prometheus::Registry>,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -37,13 +38,13 @@ pub struct DiskCacheConfig {
 }
 
 pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<CacheKey, CacheValue>> {
-    let builder = HybridCacheBuilder::new();
+    let mut builder = HybridCacheBuilder::new().with_policy(HybridCachePolicy::WriteOnEviction);
+
+    if let Some(registry) = config.metrics_registry {
+        builder = builder.with_metrics_registry(Box::new(PrometheusMetricsRegistry::new(registry)));
+    }
 
     let mut builder = builder
-        .with_policy(HybridCachePolicy::WriteOnEviction)
-        .with_metrics_registry(Box::new(PrometheusMetricsRegistry::new(
-            prometheus::default_registry().clone(),
-        )))
         .memory(config.memory_size.as_u64() as usize)
         .with_eviction_config(EvictionConfig::S3Fifo(S3FifoConfig::default()))
         .with_weighter(|key: &CacheKey, value: &CacheValue| {

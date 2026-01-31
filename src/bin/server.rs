@@ -114,6 +114,7 @@ async fn main() -> eyre::Result<()> {
                 info!("disk cache disabled");
                 None
             },
+            metrics_registry: Some(prometheus::default_registry().clone()),
         },
         hedge_quantile: args.hedge_quantile,
     };
