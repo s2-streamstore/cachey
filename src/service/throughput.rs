@@ -7,6 +7,8 @@ pub struct SlidingThroughput<const NUM_BUCKETS: usize = 60> {
     buckets: [u64; NUM_BUCKETS],
     head_idx: usize,
     head_tick: u64,
+    last_evicted_tick: Option<u64>,
+    last_evicted_bytes: u64,
     base: Instant,
 }
 
@@ -16,6 +18,8 @@ impl<const NUM_BUCKETS: usize> Default for SlidingThroughput<NUM_BUCKETS> {
             buckets: [0; NUM_BUCKETS],
             head_idx: 0,
             head_tick: 0,
+            last_evicted_tick: None,
+            last_evicted_bytes: 0,
             base: Instant::now(),
         }
     }
@@ -33,12 +37,24 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
             self.buckets.fill(0);
             self.head_idx = ((self.head_idx as u64 + steps_u64) % len as u64) as usize;
             self.head_tick = now_tick;
+            self.last_evicted_tick = None;
+            self.last_evicted_bytes = 0;
             return;
         }
         let steps = steps_u64 as usize;
-        for _ in 0..steps {
+        for step in 1..=steps {
             self.head_idx = (self.head_idx + 1) % len;
+            let evicted_bytes = self.buckets[self.head_idx];
             self.buckets[self.head_idx] = 0;
+            if step == steps {
+                if now_tick >= len as u64 {
+                    self.last_evicted_tick = Some(now_tick - len as u64);
+                    self.last_evicted_bytes = evicted_bytes;
+                } else {
+                    self.last_evicted_tick = None;
+                    self.last_evicted_bytes = 0;
+                }
+            }
         }
         self.head_tick = now_tick;
     }
@@ -50,25 +66,78 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
     }
 
     pub fn bps(&mut self, lookback: Duration) -> f64 {
-        let now_tick = self.now_secs();
-        self.advance_to(now_tick);
-
-        let requested_secs = lookback.as_secs();
-        if requested_secs == 0 {
+        let lookback_secs = lookback.as_secs_f64();
+        if lookback_secs <= 0.0 {
             return 0.0;
         }
 
-        let window_secs = requested_secs.clamp(1, NUM_BUCKETS as u64) as usize;
-
-        // Sum last `window_secs` buckets starting from head (inclusive) going backwards
-        let mut sum: u64 = 0;
-        let mut idx = self.head_idx;
-        for _ in 0..window_secs {
-            sum = sum.saturating_add(self.buckets[idx]);
-            idx = (idx + self.buckets.len() - 1) % self.buckets.len();
+        let len = self.buckets.len();
+        if len == 0 {
+            return 0.0;
         }
 
-        sum as f64 / window_secs as f64
+        let now = self.base.elapsed();
+        let now_tick = now.as_secs();
+        self.advance_to(now_tick);
+
+        const MIN_SUBSEC: f64 = 1e-9;
+        let mut now_subsec = f64::from(now.subsec_nanos()) * MIN_SUBSEC;
+        if now_subsec == 0.0 && self.buckets[self.head_idx] > 0 {
+            now_subsec = MIN_SUBSEC;
+        }
+
+        let window_end = now_tick as f64 + now_subsec;
+        let window_start = window_end - lookback_secs;
+
+        let earliest_tick = self.head_tick.saturating_sub((len - 1) as u64);
+        let start_tick = if window_start <= earliest_tick as f64 {
+            earliest_tick
+        } else {
+            window_start.floor() as u64
+        };
+        let start_tick = start_tick.min(self.head_tick);
+
+        let mut total = 0.0;
+        for tick in start_tick..=self.head_tick {
+            let bucket_start = tick as f64;
+            let bucket_end = bucket_start + 1.0;
+            let overlap_start = window_start.max(bucket_start);
+            let overlap_end = window_end.min(bucket_end);
+            let overlap = overlap_end - overlap_start;
+            if overlap <= 0.0 {
+                continue;
+            }
+
+            let bucket_available = if tick == self.head_tick {
+                now_subsec
+            } else {
+                1.0
+            };
+            if bucket_available <= 0.0 {
+                continue;
+            }
+            let weight = (overlap / bucket_available).min(1.0);
+
+            let offset = (self.head_tick - tick) as usize;
+            let idx = (self.head_idx + len - offset) % len;
+            total += self.buckets[idx] as f64 * weight;
+        }
+
+        if let Some(evicted_tick) = self.last_evicted_tick {
+            if evicted_tick + 1 == earliest_tick {
+                let bucket_start = evicted_tick as f64;
+                let bucket_end = bucket_start + 1.0;
+                let overlap_start = window_start.max(bucket_start);
+                let overlap_end = window_end.min(bucket_end);
+                let overlap = overlap_end - overlap_start;
+                if overlap > 0.0 {
+                    let weight = overlap.min(1.0);
+                    total += self.last_evicted_bytes as f64 * weight;
+                }
+            }
+        }
+
+        total / lookback_secs
     }
 
     #[inline]
@@ -128,8 +197,12 @@ mod tests {
         t.record(500);
         assert_close(t.bps(Duration::from_secs(60)), 1_500.0 / 60.0);
 
-        // After exactly 60s from start, bucket 0 should be evicted but bucket 1 remains
+        // After exactly 60s from start, bucket 0 is still within the window
         tokio::time::advance(Duration::from_millis(59_000)).await; // total 60_000ms
+        assert_close(t.bps(Duration::from_secs(60)), 1_500.0 / 60.0);
+
+        // After 61s from start, bucket 0 falls out but bucket 1 remains
+        tokio::time::advance(Duration::from_millis(1_000)).await;
         assert_close(t.bps(Duration::from_secs(60)), 500.0 / 60.0);
 
         // After another 1s, bucket 1 also evicted -> zero
@@ -161,7 +234,32 @@ mod tests {
         assert_close(t120.bps(Duration::from_secs(120)), 2_000.0 / 120.0);
 
         // Verify window clamping works correctly with different sizes
-        assert_close(t10.bps(Duration::from_secs(20)), 1_000.0 / 10.0); // clamped to 10
-        assert_close(t120.bps(Duration::from_secs(150)), 2_000.0 / 120.0); // clamped to 120
+        assert_close(t10.bps(Duration::from_secs(20)), 1_000.0 / 20.0);
+        assert_close(t120.bps(Duration::from_secs(150)), 2_000.0 / 150.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn includes_previous_bucket_at_boundary() {
+        let mut t = SlidingThroughput::<60>::default();
+        for _ in 0..10 {
+            t.record(100);
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+
+        assert_close(t.bps(Duration::from_secs(1)), 1_000.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn weights_partial_oldest_bucket() {
+        let mut t = SlidingThroughput::<60>::default();
+        t.record(1_000);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        t.record(1_000);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+
+        assert_close(t.bps(Duration::from_secs(2)), 1_500.0 / 2.0);
     }
 }
