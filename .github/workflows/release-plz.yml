@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       releases_created: ${{ steps.release-plz.outputs.releases_created }}
-      version: ${{ fromJSON(steps.release-plz.outputs.releases)[0].version }}
+      version: ${{ steps.release-plz.outputs.releases_created == 'true' && fromJSON(steps.release-plz.outputs.releases)[0].version || '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
