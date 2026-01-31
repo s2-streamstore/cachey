@@ -66,10 +66,11 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
     }
 
     pub fn bps(&mut self, lookback: Duration) -> f64 {
-        let lookback_secs = lookback.as_secs_f64();
-        if lookback_secs <= 0.0 {
+        let requested_lookback_secs = lookback.as_secs_f64();
+        if requested_lookback_secs <= 0.0 {
             return 0.0;
         }
+        let lookback_secs = requested_lookback_secs.max(1.0);
 
         let len = self.buckets.len();
         if len == 0 {
@@ -246,6 +247,15 @@ mod tests {
             tokio::time::advance(Duration::from_millis(100)).await;
         }
 
+        assert_close(t.bps(Duration::from_secs(1)), 1_000.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sub_second_lookback_clamps_to_one_second() {
+        let mut t = SlidingThroughput::<60>::default();
+        t.record(1_000);
+
+        assert_close(t.bps(Duration::from_millis(500)), 1_000.0);
         assert_close(t.bps(Duration::from_secs(1)), 1_000.0);
     }
 
