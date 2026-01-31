@@ -4,6 +4,7 @@ use tokio::time::Instant;
 
 #[derive(Debug)]
 pub struct SlidingThroughput<const NUM_BUCKETS: usize = 60> {
+    // TODO: Switch back to `[u64; NUM_BUCKETS + 1]` once generic const exprs are available.
     buckets: Vec<u64>,
     head_idx: usize,
     head_tick: u64,
