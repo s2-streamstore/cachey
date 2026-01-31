@@ -1,0 +1,102 @@
+name: release-plz
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: s2-streamstore/cachey
+
+jobs:
+  release-plz:
+    runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      version: ${{ fromJSON(steps.release-plz.outputs.releases)[0].version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  build-images:
+    name: Build ${{ matrix.arch }} image
+    needs: release-plz
+    if: needs.release-plz.outputs.releases_created == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86-64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.release-plz.outputs.version }}
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        run: |
+          docker build \
+            --target runtime \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.release-plz.outputs.version }}-${{ matrix.arch }} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.arch }} \
+            .
+
+      - name: Push images
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.release-plz.outputs.version }}-${{ matrix.arch }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.arch }}
+
+  create-manifest:
+    name: Create multi-arch manifests
+    needs: [release-plz, build-images]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push versioned manifest
+        run: |
+          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.release-plz.outputs.version }} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.release-plz.outputs.version }}-x86-64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.release-plz.outputs.version }}-arm64
+          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.release-plz.outputs.version }}
+
+      - name: Create and push latest manifest
+        run: |
+          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-x86-64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-arm64
+          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
