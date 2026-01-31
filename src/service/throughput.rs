@@ -123,17 +123,17 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
             total += self.buckets[idx] as f64 * weight;
         }
 
-        if let Some(evicted_tick) = self.last_evicted_tick {
-            if evicted_tick + 1 == earliest_tick {
-                let bucket_start = evicted_tick as f64;
-                let bucket_end = bucket_start + 1.0;
-                let overlap_start = window_start.max(bucket_start);
-                let overlap_end = window_end.min(bucket_end);
-                let overlap = overlap_end - overlap_start;
-                if overlap > 0.0 {
-                    let weight = overlap.min(1.0);
-                    total += self.last_evicted_bytes as f64 * weight;
-                }
+        if let Some(evicted_tick) = self.last_evicted_tick
+            && evicted_tick + 1 == earliest_tick
+        {
+            let bucket_start = evicted_tick as f64;
+            let bucket_end = bucket_start + 1.0;
+            let overlap_start = window_start.max(bucket_start);
+            let overlap_end = window_end.min(bucket_end);
+            let overlap = overlap_end - overlap_start;
+            if overlap > 0.0 {
+                let weight = overlap.min(1.0);
+                total += self.last_evicted_bytes as f64 * weight;
             }
         }
 
