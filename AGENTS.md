@@ -19,3 +19,4 @@ cachey is a read-through cache for S3-compatible object storage
 - Prefer structured logging
 - Provide helpful error messages
 - Use conventional commit format for commit messages and PR titles
+- PR descriptions should include `Closes #<issue>` when applicable

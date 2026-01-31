@@ -37,6 +37,37 @@ fn page_bounds_for_range(byterange: &Range<u64>) -> (PageId, PageId) {
     (first_page, last_page)
 }
 
+fn slice_page_data(
+    page_id: PageId,
+    first_page: PageId,
+    last_page: PageId,
+    byterange: &Range<u64>,
+    value: &CacheValue,
+) -> Result<(Bytes, Range<u64>), ServiceError> {
+    let page_start = page_id as u64 * PAGE_SIZE;
+    let data_len = value.data.len();
+    let mut range_start = page_start;
+    let mut range_end = page_start + data_len as u64;
+    let mut start_offset = 0;
+    let mut end_offset = data_len;
+    if page_id == first_page {
+        start_offset = (byterange.start - page_start) as usize;
+        if start_offset >= data_len {
+            return Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
+                requested: byterange.clone(),
+                object_size: Some(value.object_size),
+            }));
+        }
+        range_start = byterange.start;
+    }
+    if page_id == last_page {
+        end_offset = ((byterange.end - page_start) as usize).min(end_offset);
+        range_end = page_start + end_offset as u64;
+    }
+    let data = value.data.slice(start_offset..end_offset);
+    Ok((data, range_start..range_end))
+}
+
 #[derive(Debug)]
 pub struct ServiceConfig {
     pub cache: CacheConfig,
@@ -163,30 +194,21 @@ impl CacheyService {
             (first_page..=last_page).map(move |page_id| executor.clone().execute(page_id)),
         )
         .buffered(concurrency)
-        .map_ok(move |(page_id, value)| {
-            let page_start = page_id as u64 * PAGE_SIZE;
-            let mut range_start = page_start;
-            let mut range_end = page_start + value.data.len() as u64;
-            let mut start_offset = 0;
-            let mut end_offset = value.data.len();
-            if page_id == first_page {
-                start_offset = (byterange.start - page_start) as usize;
-                range_start = byterange.start;
-            }
-            if page_id == last_page {
-                end_offset = ((byterange.end - page_start) as usize).min(end_offset);
-                range_end = page_start + end_offset as u64;
-            }
-            let data = value.data.slice(start_offset..end_offset);
+        .and_then(move |(page_id, value)| {
+            let (data, range) =
+                match slice_page_data(page_id, first_page, last_page, &byterange, &value) {
+                    Ok(result) => result,
+                    Err(err) => return futures::future::ready(Err(err)),
+                };
             self.egress_throughput.lock().record(data.len());
-            Chunk {
+            futures::future::ready(Ok(Chunk {
                 bucket: value.bucket,
                 mtime: value.mtime,
                 data,
-                range: range_start..range_end,
+                range,
                 object_size: value.object_size,
                 cached_at: NonZeroU32::new(value.cached_at),
-            }
+            }))
         })
     }
 
@@ -342,5 +364,32 @@ mod tests {
 
         let byterange = PAGE_SIZE..(2 * PAGE_SIZE);
         assert_eq!(page_bounds_for_range(&byterange), (1, 1));
+    }
+
+    #[test]
+    fn slice_page_data_rejects_range_start_past_object_end() {
+        let object_len = 1024 * 1024;
+        let byterange = (2 * 1024 * 1024)..(3 * 1024 * 1024);
+        let data = Bytes::from(vec![0_u8; object_len]);
+        let value = CacheValue {
+            bucket: BucketName::new("test-bucket").expect("bucket name"),
+            mtime: 0,
+            data: data.clone(),
+            object_size: object_len as u64,
+            cached_at: 0,
+        };
+        let (first_page, last_page) = page_bounds_for_range(&byterange);
+        let err = slice_page_data(first_page, first_page, last_page, &byterange, &value)
+            .expect_err("expected range error");
+        match err {
+            ServiceError::Download(DownloadError::RangeNotSatisfied {
+                requested,
+                object_size,
+            }) => {
+                assert_eq!(requested, byterange);
+                assert_eq!(object_size, Some(object_len as u64));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
