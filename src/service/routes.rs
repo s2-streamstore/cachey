@@ -183,7 +183,6 @@ pub async fn fetch(
                 concurrency,
                 req_config,
             )
-            .await
             .peekable(),
     );
 

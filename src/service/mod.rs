@@ -164,7 +164,7 @@ impl CacheyService {
     }
 
     /// Panics if range `start > end` or `end >= max_range_end`.
-    pub async fn get(
+    pub fn get(
         self,
         kind: ObjectKind,
         object: ObjectKey,
