@@ -163,35 +163,28 @@ impl BucketedStats {
     /// deprioritized to ensure failed buckets are avoided in favor of any healthy bucket.
     fn score(&self, now: Instant, bucket: &BucketName, idx: usize) -> u64 {
         let base = (idx as u64) * 200;
-        self.by_bucket
-            .get(bucket)
-            .map(|s| {
-                let mut guard = s.lock();
+        self.by_bucket.get(bucket).map_or(base + 5000, |s| {
+            let mut guard = s.lock();
 
-                // Calculate latency component: 1 point per 100 µs = 0.1 ms
-                // - S3 Express same-AZ: ~4ms → 40 points
-                // - S3 Express cross-AZ: ~8ms → 80 points
-                // - Standard S3 same-region: ~200ms → 2000 points
-                // - Standard S3 cross-region: 300-1000ms → 3000-10000 points
-                let lat = guard
-                    .latency_micros_snapshot(now, self.hedge_latency_quantile)
-                    .mean
-                    / 100;
+            // Calculate latency component: 1 point per 100 µs = 0.1 ms
+            // - S3 Express same-AZ: ~4ms → 40 points
+            // - S3 Express cross-AZ: ~8ms → 80 points
+            // - Standard S3 same-region: ~200ms → 2000 points
+            // - Standard S3 cross-region: 300-1000ms → 3000-10000 points
+            let lat = guard
+                .latency_micros_snapshot(now, self.hedge_latency_quantile)
+                .mean
+                / 100;
 
-                // Calculate error component based on circuit breaker state
-                let err = if guard.is_circuit_open(now) {
-                    10000
-                } else {
-                    (guard.error_rate(now) * 100.0).round() as u64
-                };
+            // Calculate error component based on circuit breaker state
+            let err = if guard.is_circuit_open(now) {
+                10000
+            } else {
+                (guard.error_rate(now) * 100.0).round() as u64
+            };
 
-                base + err + lat
-            })
-            // Default penalty for unknown buckets: assume 500ms latency
-            // This is higher than typical same-region S3 latencies (~200ms) and
-            // most cross-region latencies (300-400ms) to avoid preferring unknown
-            // distant buckets over known ones
-            .unwrap_or(base + 5000)
+            base + err + lat
+        })
     }
 
     /// Returns `Duration::ZERO` if hedging is disabled or no latency datapoints are available.
@@ -200,19 +193,16 @@ impl BucketedStats {
             // Disable hedging when quantile is 0
             return Duration::ZERO;
         }
-        self.by_bucket
-            .get(bucket)
-            .map(|s| {
-                Duration::from_micros(
-                    s.lock()
-                        .latency_micros_snapshot(now, self.hedge_latency_quantile)
-                        .hedge,
-                )
-            })
-            .unwrap_or(Duration::ZERO)
+        self.by_bucket.get(bucket).map_or(Duration::ZERO, |s| {
+            Duration::from_micros(
+                s.lock()
+                    .latency_micros_snapshot(now, self.hedge_latency_quantile)
+                    .hedge,
+            )
+        })
     }
 
-    pub fn export_bucket_metrics(&self, mut f: impl FnMut(&BucketName, BucketMetrics)) {
+    pub fn export_bucket_metrics(&self, mut f: impl FnMut(&BucketName, &BucketMetrics)) {
         let now = Instant::now();
         for entry in self.by_bucket.iter() {
             let bucket = entry.key();
@@ -220,7 +210,7 @@ impl BucketedStats {
                 .value()
                 .lock()
                 .metrics(now, self.hedge_latency_quantile);
-            f(bucket, metrics);
+            f(bucket, &metrics);
         }
     }
 }
@@ -404,7 +394,7 @@ mod tests {
         assert_eq!(stats.score(now, &bucket, 0), 10000);
 
         // Still open before recovery time
-        tokio::time::advance(RECOVERY_TIME - Duration::from_secs(1)).await;
+        tokio::time::advance(RECOVERY_TIME.checked_sub(Duration::from_secs(1)).unwrap()).await;
         let now = Instant::now();
         assert_eq!(stats.score(now, &bucket, 0), 10000);
 
@@ -628,7 +618,7 @@ mod tests {
             stats.observe(eu_west.clone(), Ok(Duration::from_millis(400)));
         }
 
-        let buckets = vec![us_east.clone(), eu_west.clone(), ap_south.clone()];
+        let buckets = vec![us_east.clone(), eu_west, ap_south];
         let ordered = get_attempt_order(&stats, &buckets);
 
         // Should still prefer us-east as it has lower latency
@@ -672,7 +662,7 @@ mod tests {
         // Even with some errors on primary, it should still be preferred if error rate is low
         stats.observe(primary.clone(), Err(())); // 1 error out of 6 attempts = ~16% error rate
 
-        let buckets = vec![primary.clone(), secondary.clone(), tertiary.clone()];
+        let buckets = vec![primary.clone(), secondary, tertiary];
         let ordered = get_attempt_order(&stats, &buckets);
 
         // Primary: base(0) + err(16) + lat(2000) = 2016

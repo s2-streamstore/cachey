@@ -63,8 +63,15 @@ testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
 
 [lints.clippy]
-wildcard_imports = "warn"
-enum_glob_use = "warn"
+pedantic = { level = "warn", priority = -1 }
+
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+missing_errors_doc = "allow"
+similar_names = "allow"
+unnecessary_wraps = "allow"
 
 [lints.rust]
 unsafe_code = "warn"

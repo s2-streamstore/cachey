@@ -56,7 +56,7 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
                 .thread_name_fn(|| {
                     static TID: AtomicUsize = AtomicUsize::new(0);
                     let id = TID.fetch_add(1, Ordering::Relaxed);
-                    format!("foyer-{}", id)
+                    format!("foyer-{id}")
                 })
                 .enable_all()
                 .build()?
@@ -167,21 +167,21 @@ impl CacheKeyHeader {
         Ok(Self(bytes))
     }
 
-    fn version(&self) -> u8 {
+    fn version(self) -> u8 {
         self.0[0]
     }
 
-    fn kind_len(&self) -> usize {
+    fn kind_len(self) -> usize {
         ((self.0[1] >> 2) as usize) + 1
     }
 
-    fn key_len(&self) -> usize {
+    fn key_len(self) -> usize {
         let high_bits = ((self.0[1] & 0b11) as usize) << 8;
         let low_bits = self.0[2] as usize;
         (high_bits | low_bits) + 1
     }
 
-    fn page_id(&self) -> PageId {
+    fn page_id(self) -> PageId {
         u16::from_be_bytes([self.0[3], self.0[4]])
     }
 
@@ -284,11 +284,11 @@ pub struct CacheValue {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct CacheValueHeader(
-    /// 1B: 1b reserved | 1b empty flag | 6b for bucket name length
-    /// 5B: object size
-    /// 3B: data_len_minus_one (ignored if empty flag set)
-    /// 4B: mtime
-    /// 4B: cached_at
+    // 1B: 1b reserved | 1b empty flag | 6b for bucket name length
+    // 5B: object size
+    // 3B: data_len_minus_one (ignored if empty flag set)
+    // 4B: mtime
+    // 4B: cached_at
     [u8; 17],
 );
 
@@ -314,7 +314,7 @@ impl CacheValueHeader {
         }
         let data_len_minus_one = (data_len as u32).saturating_sub(1);
         let bytes = [
-            ((data_len == 0) as u8) << 6 | ((bucket_name_len - 1) as u8 & 0b0011_1111),
+            u8::from(data_len == 0) << 6 | ((bucket_name_len - 1) as u8 & 0b0011_1111),
             (object_size >> 32) as u8,
             ((object_size >> 24) & 0xff) as u8,
             ((object_size >> 16) & 0xff) as u8,
@@ -487,12 +487,13 @@ mod tests {
     fn test_cache_value_header() {
         // Test valid header creation
         let header =
-            CacheValueHeader::new(63, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1700000000).unwrap();
+            CacheValueHeader::new(63, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1_700_000_000)
+                .unwrap();
         assert_eq!(header.bucket_name_len(), 63);
         assert_eq!(header.object_size(), (1 << 40) - 1);
         assert_eq!(header.mtime(), u32::MAX);
         assert_eq!(header.data_len(), (1 << 24) - 1);
-        assert_eq!(header.cached_at(), 1700000000);
+        assert_eq!(header.cached_at(), 1_700_000_000);
 
         // Test roundtrip
         let bytes = header.to_bytes();
@@ -501,7 +502,8 @@ mod tests {
 
         // Test maximum bucket_name_len (64)
         let header_max =
-            CacheValueHeader::new(64, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1700000000).unwrap();
+            CacheValueHeader::new(64, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1_700_000_000)
+                .unwrap();
         assert_eq!(header_max.bucket_name_len(), 64);
         let bytes_max = header_max.to_bytes();
         let decoded_max = CacheValueHeader::from_bytes(bytes_max).unwrap();
@@ -550,10 +552,10 @@ mod tests {
     fn test_cache_value_encode_decode() {
         let value = CacheValue {
             bucket: BucketName::new("test-bucket").unwrap(),
-            mtime: 1234567890,
-            object_size: 9876543210,
+            mtime: 1_234_567_890,
+            object_size: 9_876_543_210,
             data: bytes::Bytes::from(vec![1, 2, 3, 4, 5]),
-            cached_at: 1700000000,
+            cached_at: 1_700_000_000,
         };
 
         let mut encoded = Vec::new();
@@ -576,8 +578,8 @@ mod tests {
         let key = "c".repeat(100);
 
         let cache_key = CacheKey {
-            kind: ObjectKind::new(kind_64.clone()).unwrap(),
-            object: ObjectKey::new(key.clone()).unwrap(),
+            kind: ObjectKind::new(kind_64).unwrap(),
+            object: ObjectKey::new(key).unwrap(),
             page_id: 42,
         };
 
@@ -592,11 +594,11 @@ mod tests {
         assert_eq!(cache_key, decoded_key);
 
         let cache_value = CacheValue {
-            bucket: BucketName::new(bucket_64.clone()).unwrap(),
-            mtime: 1234567890,
-            object_size: 9876543210,
+            bucket: BucketName::new(bucket_64).unwrap(),
+            mtime: 1_234_567_890,
+            object_size: 9_876_543_210,
             data: bytes::Bytes::from(vec![1, 2, 3, 4, 5]),
-            cached_at: 1700000000,
+            cached_at: 1_700_000_000,
         };
 
         let mut encoded_value = Vec::new();

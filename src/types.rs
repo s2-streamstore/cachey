@@ -96,7 +96,7 @@ impl Deref for ObjectKind {
 
 impl From<ObjectKind> for BucketName {
     fn from(value: ObjectKind) -> Self {
-        BucketName(value.0)
+        Self(value.0)
     }
 }
 

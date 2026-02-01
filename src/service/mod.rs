@@ -42,7 +42,7 @@ fn slice_page_data(
     byterange: &Range<u64>,
     value: &CacheValue,
 ) -> Result<(Bytes, Range<u64>), ServiceError> {
-    let page_start = page_id as u64 * PAGE_SIZE;
+    let page_start = u64::from(page_id) * PAGE_SIZE;
     let data_len = value.data.len();
     let mut range_start = page_start;
     let mut range_end = page_start + data_len as u64;
@@ -88,7 +88,7 @@ pub enum ServiceError {
     /// 500
     #[error("Cache error: {0}")]
     Cache(#[from] foyer::Error),
-    /// NoSuchKey 404; RangeNotSatisfied 416; otherwise 500
+    /// `NoSuchKey` 404; `RangeNotSatisfied` 416; otherwise 500
     #[error("Object store: {0}")]
     Download(#[from] DownloadError),
     /// 409
@@ -153,16 +153,20 @@ impl CacheyService {
         metrics::set_connection_count(self.server_handle.connection_count());
     }
 
+    #[must_use]
     pub fn ingress_throughput_bps(&self, lookback: Duration) -> f64 {
         self.ingress_throughput.lock().bps(lookback)
     }
 
+    #[must_use]
     pub fn egress_throughput_bps(&self, lookback: Duration) -> f64 {
         self.egress_throughput.lock().bps(lookback)
     }
 
-    /// Panics if range `start > end` or `end >= max_range_end`.
-    pub async fn get(
+    /// # Panics
+    ///
+    /// if `byterange.start > byterange.end` or `byterange.end >= MAX_RANGE_END`.
+    pub fn get(
         self,
         kind: ObjectKind,
         object: ObjectKey,
@@ -185,7 +189,7 @@ impl CacheyService {
             kind,
             object,
             buckets,
-            object_size: Default::default(),
+            object_size: Arc::default(),
             req_config,
         };
 
@@ -263,7 +267,7 @@ impl PageGetExecutor {
                     hit_state.store(false, std::sync::atomic::Ordering::Relaxed);
                     metrics::page_request_count(&self.kind, "download");
 
-                    let start = page_id as u64 * PAGE_SIZE;
+                    let start = u64::from(page_id) * PAGE_SIZE;
                     let end = start + PAGE_SIZE;
                     let out = self
                         .downloader

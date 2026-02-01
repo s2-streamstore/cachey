@@ -32,11 +32,11 @@ pub enum DownloadError {
 impl DownloadError {
     fn should_attempt_fallback_bucket(&self) -> bool {
         match self {
-            DownloadError::InvalidObjectState(_) => true,
-            DownloadError::NoSuchKey => true,
-            DownloadError::RangeNotSatisfied { .. } => false,
-            DownloadError::BodyStreaming(_) => true,
-            DownloadError::Unknown { .. } => true,
+            Self::RangeNotSatisfied { .. } => false,
+            Self::InvalidObjectState(_)
+            | Self::NoSuchKey
+            | Self::BodyStreaming(_)
+            | Self::Unknown { .. } => true,
         }
     }
 }
@@ -78,10 +78,13 @@ impl Downloader {
         }
     }
 
-    pub fn observe_bucket_metrics(&self, f: impl FnMut(&BucketName, BucketMetrics)) {
-        self.bucketed_stats.export_bucket_metrics(f)
+    pub fn observe_bucket_metrics(&self, f: impl FnMut(&BucketName, &BucketMetrics)) {
+        self.bucketed_stats.export_bucket_metrics(f);
     }
 
+    /// # Panics
+    ///
+    /// if `byterange.start > byterange.end`
     pub async fn download(
         &self,
         buckets: &BucketNameSet,
@@ -328,7 +331,7 @@ mod tests {
         let test_data = b"0123456789";
         let output = GetObjectOutput::builder()
             .content_range("bytes 0-9/100")
-            .last_modified(DateTime::from_secs(1234567890))
+            .last_modified(DateTime::from_secs(1_234_567_890))
             .body(aws_sdk_s3::primitives::ByteStream::from(test_data.to_vec()))
             .build();
 
@@ -345,7 +348,7 @@ mod tests {
 
         assert_eq!(result.data, Bytes::from(test_data.to_vec()));
         assert_eq!(result.object_size, 100);
-        assert_eq!(result.mtime, 1234567890);
+        assert_eq!(result.mtime, 1_234_567_890);
     }
 
     #[tokio::test]
@@ -478,7 +481,7 @@ mod tests {
 
         tokio::select! {
             _ = hedge_future => panic!("hedge_trigger should not complete when there's no data"),
-            _ = timeout_future => {} // Expected: timeout completes first
+            () = timeout_future => {} // Expected: timeout completes first
         }
     }
 

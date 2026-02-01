@@ -12,7 +12,7 @@ use crate::{
     types::{BucketName, ObjectKind},
 };
 
-pub fn set_bucket_stats(bucket: &BucketName, metrics: BucketMetrics) {
+pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     static ERROR_RATE: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_error_rate",
@@ -69,10 +69,10 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: BucketMetrics) {
         .set(metrics.latency_hedge.as_secs_f64());
     CIRCUIT_BREAKER_OPEN
         .with_label_values(&[bucket])
-        .set(if metrics.circuit_breaker_open { 1 } else { 0 });
+        .set(i64::from(metrics.circuit_breaker_open));
     CONSECUTIVE_FAILURES
         .with_label_values(&[bucket])
-        .set(metrics.consecutive_failures as i64);
+        .set(i64::from(metrics.consecutive_failures));
 }
 
 pub fn fetch_request_count(kind: &ObjectKind, method: &axum::http::Method, typ: &str) {
@@ -97,12 +97,12 @@ pub fn fetch_request_bytes(kind: &ObjectKind, bytes: u64) {
             "Number of bytes requested",
             &["kind"],
             vec![
-                (512 * 1024) as f64,       // 512 KiB
-                (1024 * 1024) as f64,      // 1 MiB
-                (2 * 1024 * 1024) as f64,  // 2 MiB
-                (4 * 1024 * 1024) as f64,  // 4 MiB
-                (8 * 1024 * 1024) as f64,  // 8 MiB
-                (16 * 1024 * 1024) as f64, // 16 MiB
+                f64::from(512 * 1024),       // 512 KiB
+                f64::from(1024 * 1024),      // 1 MiB
+                f64::from(2 * 1024 * 1024),  // 2 MiB
+                f64::from(4 * 1024 * 1024),  // 4 MiB
+                f64::from(8 * 1024 * 1024),  // 8 MiB
+                f64::from(16 * 1024 * 1024), // 16 MiB
             ]
         )
         .unwrap()
@@ -126,7 +126,7 @@ pub fn fetch_request_pages(kind: &ObjectKind, pages: u16) {
 
     HISTOGRAM
         .with_label_values(&[&**kind])
-        .observe(pages as f64);
+        .observe(f64::from(pages));
 }
 
 pub fn page_request_count(kind: &ObjectKind, typ: &str) {
@@ -258,18 +258,15 @@ pub fn observe_jemalloc_metrics() {
         return;
     }
 
-    let (allocated, active, resident, retained, mapped, metadata) = match (
+    let (Ok(allocated), Ok(active), Ok(resident), Ok(retained), Ok(mapped), Ok(metadata)) = (
         stats::allocated::read(),
         stats::active::read(),
         stats::resident::read(),
         stats::retained::read(),
         stats::mapped::read(),
         stats::metadata::read(),
-    ) {
-        (Ok(allocated), Ok(active), Ok(resident), Ok(retained), Ok(mapped), Ok(metadata)) => {
-            (allocated, active, resident, retained, mapped, metadata)
-        }
-        _ => return,
+    ) else {
+        return;
     };
 
     ALLOCATED.set(usize_to_i64(allocated));

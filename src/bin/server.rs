@@ -28,12 +28,13 @@ struct DiskCacheGroup {
     #[arg(long, value_parser = parse_bytes, requires = "disk_path")]
     disk_capacity: Option<ByteSize>,
 
-    /// Use io_uring (if available) for disk IO.
+    /// Use `io_uring` (if available) for disk IO.
     #[arg(long, action = ArgAction::SetTrue)]
     iouring: bool,
 }
 
 #[derive(ArgGroup, Debug, Clone)]
+#[allow(clippy::struct_field_names)]
 struct TlsConfig {
     /// Use a self-signed certificate for TLS
     #[arg(long, conflicts_with_all = ["tls_cert", "tls_key"])]
@@ -209,10 +210,10 @@ async fn shutdown_signal(handle: axum_server::Handle<SocketAddr>) {
     let term = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {
+        () = ctrl_c => {
             info!("received Ctrl+C, starting graceful shutdown");
         },
-        _ = term => {
+        () = term => {
             info!("received SIGTERM, starting graceful shutdown");
         },
     }
