@@ -258,18 +258,15 @@ pub fn observe_jemalloc_metrics() {
         return;
     }
 
-    let (allocated, active, resident, retained, mapped, metadata) = match (
+    let (Ok(allocated), Ok(active), Ok(resident), Ok(retained), Ok(mapped), Ok(metadata)) = (
         stats::allocated::read(),
         stats::active::read(),
         stats::resident::read(),
         stats::retained::read(),
         stats::mapped::read(),
         stats::metadata::read(),
-    ) {
-        (Ok(allocated), Ok(active), Ok(resident), Ok(retained), Ok(mapped), Ok(metadata)) => {
-            (allocated, active, resident, retained, mapped, metadata)
-        }
-        _ => return,
+    ) else {
+        return;
     };
 
     ALLOCATED.set(usize_to_i64(allocated));
