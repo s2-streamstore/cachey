@@ -481,7 +481,7 @@ mod tests {
 
         tokio::select! {
             _ = hedge_future => panic!("hedge_trigger should not complete when there's no data"),
-            _ = timeout_future => {} // Expected: timeout completes first
+            () = timeout_future => {} // Expected: timeout completes first
         }
     }
 

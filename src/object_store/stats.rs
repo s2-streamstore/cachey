@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(stats.score(now, &bucket, 0), 10000);
 
         // Still open before recovery time
-        tokio::time::advance(RECOVERY_TIME - Duration::from_secs(1)).await;
+        tokio::time::advance(RECOVERY_TIME.checked_sub(Duration::from_secs(1)).unwrap()).await;
         let now = Instant::now();
         assert_eq!(stats.score(now, &bucket, 0), 10000);
 

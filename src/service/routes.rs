@@ -428,7 +428,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let (mut parts, _) = req.into_parts();
+        let (mut parts, ()) = req.into_parts();
         RequestConfig::from_request_parts(&mut parts, &()).await
     }
 
@@ -440,7 +440,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let (mut parts, _) = req.into_parts();
+        let (mut parts, ()) = req.into_parts();
         let config = RequestConfig::from_request_parts(&mut parts, &())
             .await
             .unwrap();
@@ -542,7 +542,7 @@ mod tests {
             HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap(),
         );
 
-        let (mut parts, _) = req.into_parts();
+        let (mut parts, ()) = req.into_parts();
         let result = RequestConfig::from_request_parts(&mut parts, &()).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().1, "Invalid C0-Config header encoding");
