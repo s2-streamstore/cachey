@@ -165,7 +165,7 @@ impl BucketedStats {
         let base = (idx as u64) * 200;
         self.by_bucket
             .get(bucket)
-            .map(|s| {
+            .map_or(base + 5000, |s| {
                 let mut guard = s.lock();
 
                 // Calculate latency component: 1 point per 100 µs = 0.1 ms
@@ -187,11 +187,6 @@ impl BucketedStats {
 
                 base + err + lat
             })
-            // Default penalty for unknown buckets: assume 500ms latency
-            // This is higher than typical same-region S3 latencies (~200ms) and
-            // most cross-region latencies (300-400ms) to avoid preferring unknown
-            // distant buckets over known ones
-            .unwrap_or(base + 5000)
     }
 
     /// Returns `Duration::ZERO` if hedging is disabled or no latency datapoints are available.
@@ -202,14 +197,13 @@ impl BucketedStats {
         }
         self.by_bucket
             .get(bucket)
-            .map(|s| {
+            .map_or(Duration::ZERO, |s| {
                 Duration::from_micros(
                     s.lock()
                         .latency_micros_snapshot(now, self.hedge_latency_quantile)
                         .hedge,
                 )
             })
-            .unwrap_or(Duration::ZERO)
     }
 
     pub fn export_bucket_metrics(&self, mut f: impl FnMut(&BucketName, BucketMetrics)) {

@@ -289,7 +289,7 @@ fn c0_status(chunk: &Chunk) -> HeaderValue {
         chunk.range.start,
         chunk.range.end - 1,
         chunk.bucket,
-        chunk.cached_at.map(NonZeroU32::get).unwrap_or(0)
+        chunk.cached_at.map_or(0, NonZeroU32::get)
     )
     .unwrap();
 
