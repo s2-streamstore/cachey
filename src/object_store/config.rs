@@ -12,6 +12,7 @@ pub struct RequestConfig {
 }
 
 impl RequestConfig {
+    #[must_use]
     pub fn is_noop(&self) -> bool {
         self.connect_timeout.is_none()
             && self.read_timeout.is_none()
@@ -22,6 +23,7 @@ impl RequestConfig {
             && self.max_backoff.is_none()
     }
 
+    #[must_use]
     pub fn timeout_config(&self) -> aws_sdk_s3::config::timeout::TimeoutConfig {
         let mut builder = aws_sdk_s3::config::timeout::TimeoutConfig::builder();
 
@@ -41,6 +43,7 @@ impl RequestConfig {
         builder.build()
     }
 
+    #[must_use]
     pub fn retry_config(&self) -> aws_sdk_s3::config::retry::RetryConfig {
         let mut config = aws_sdk_s3::config::retry::RetryConfig::standard();
 

@@ -153,10 +153,12 @@ impl CacheyService {
         metrics::set_connection_count(self.server_handle.connection_count());
     }
 
+    #[must_use]
     pub fn ingress_throughput_bps(&self, lookback: Duration) -> f64 {
         self.ingress_throughput.lock().bps(lookback)
     }
 
+    #[must_use]
     pub fn egress_throughput_bps(&self, lookback: Duration) -> f64 {
         self.egress_throughput.lock().bps(lookback)
     }
