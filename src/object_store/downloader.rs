@@ -78,7 +78,7 @@ impl Downloader {
         }
     }
 
-    pub fn observe_bucket_metrics(&self, f: impl FnMut(&BucketName, BucketMetrics)) {
+    pub fn observe_bucket_metrics(&self, f: impl FnMut(&BucketName, &BucketMetrics)) {
         self.bucketed_stats.export_bucket_metrics(f);
     }
 

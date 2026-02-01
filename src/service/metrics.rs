@@ -12,7 +12,7 @@ use crate::{
     types::{BucketName, ObjectKind},
 };
 
-pub fn set_bucket_stats(bucket: &BucketName, metrics: BucketMetrics) {
+pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     static ERROR_RATE: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_error_rate",
