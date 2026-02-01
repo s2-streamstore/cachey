@@ -130,22 +130,25 @@ impl Downloader {
         byterange: &Range<u64>,
         req_config: &RequestConfig,
     ) -> Result<ObjectPiece, DownloadError> {
+        let attempt_full = |start_time: Instant, hedged: Option<Duration>| {
+            let bucket = bucket.clone();
+            async move {
+                let result = self
+                    .attempt_inner(&bucket, object, byterange, req_config)
+                    .await;
+                let latency = start_time.elapsed();
+                self.handle_result(bucket, byterange, result, latency, hedged)
+                    .await
+            }
+        };
         let start_time = Instant::now();
-        let primary_attempt =
-            self.attempt_full(bucket, object, byterange, req_config, start_time, None);
+        let primary_attempt = attempt_full(start_time, None);
         tokio::pin!(primary_attempt);
         select! {
             primary_result = &mut primary_attempt => primary_result,
             hedge_threshold = self.hedge_trigger(bucket, start_time) => {
                 let hedge_start_time = Instant::now();
-                let hedge_attempt = self.attempt_full(
-                    bucket,
-                    object,
-                    byterange,
-                    req_config,
-                    hedge_start_time,
-                    hedge_threshold,
-                );
+                let hedge_attempt = attempt_full(hedge_start_time, hedge_threshold);
                 tokio::pin!(hedge_attempt);
                 select! {
                     primary_result = &mut primary_attempt => primary_result,
@@ -153,23 +156,6 @@ impl Downloader {
                 }
             }
         }
-    }
-
-    async fn attempt_full(
-        &self,
-        bucket: &BucketName,
-        object: &ObjectKey,
-        byterange: &Range<u64>,
-        req_config: &RequestConfig,
-        start_time: Instant,
-        hedged: Option<Duration>,
-    ) -> Result<ObjectPiece, DownloadError> {
-        let result = self
-            .attempt_inner(bucket, object, byterange, req_config)
-            .await;
-        let latency = start_time.elapsed();
-        self.handle_result(bucket.clone(), byterange, result, latency, hedged)
-            .await
     }
 
     async fn attempt_inner(
