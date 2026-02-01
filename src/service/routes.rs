@@ -111,7 +111,7 @@ where
                             StatusCode::BAD_REQUEST,
                             "Invalid max_attempts value in C0-Config hheader",
                         )
-                    })?)
+                    })?);
                 }
                 "ib" => config.initial_backoff = Some(parse_duration(value)?),
                 "mb" => config.max_backoff = Some(parse_duration(value)?),

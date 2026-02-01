@@ -97,9 +97,6 @@ ignored_unit_patterns = "allow"
 # Allow: duration arithmetic in controlled contexts
 unchecked_time_subtraction = "allow"
 
-# Allow: formatting preferences
-semicolon_if_nothing_returned = "allow"
-
 # TODO: look into this
 unnecessary_wraps = "allow"
 
