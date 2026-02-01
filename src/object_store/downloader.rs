@@ -130,41 +130,29 @@ impl Downloader {
         byterange: &Range<u64>,
         req_config: &RequestConfig,
     ) -> Result<ObjectPiece, DownloadError> {
-        let start_time = Instant::now();
-        let primary_future = self.attempt_inner(bucket, object, byterange, req_config);
-        tokio::pin!(primary_future);
-        select! {
-            primary_result = &mut primary_future => {
-                self.handle_result(
-                    bucket.clone(),
-                    byterange,
-                    primary_result,
-                    start_time.elapsed(),
-                    None,
-                ).await
+        let attempt_full = |start_time: Instant, hedged: Option<Duration>| {
+            let bucket = bucket.clone();
+            async move {
+                let result = self
+                    .attempt_inner(&bucket, object, byterange, req_config)
+                    .await;
+                let latency = start_time.elapsed();
+                self.handle_result(bucket, byterange, result, latency, hedged)
+                    .await
             }
+        };
+        let start_time = Instant::now();
+        let primary_attempt = attempt_full(start_time, None);
+        tokio::pin!(primary_attempt);
+        select! {
+            primary_result = &mut primary_attempt => primary_result,
             hedge_threshold = self.hedge_trigger(bucket, start_time) => {
                 let hedge_start_time = Instant::now();
-                let hedge_future = self.attempt_inner(bucket, object, byterange, req_config);
+                let hedge_attempt = attempt_full(hedge_start_time, hedge_threshold);
+                tokio::pin!(hedge_attempt);
                 select! {
-                    primary_result = primary_future => {
-                        self.handle_result(
-                            bucket.clone(),
-                            byterange,
-                            primary_result,
-                            start_time.elapsed(),
-                            None,
-                        ).await
-                    }
-                    hedge_result = hedge_future => {
-                        self.handle_result(
-                            bucket.clone(),
-                            byterange,
-                            hedge_result,
-                            hedge_start_time.elapsed(),
-                            hedge_threshold,
-                        ).await
-                    }
+                    primary_result = &mut primary_attempt => primary_result,
+                    hedge_result = &mut hedge_attempt => hedge_result,
                 }
             }
         }
