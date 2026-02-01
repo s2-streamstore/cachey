@@ -1,7 +1,7 @@
 use std::{
     net::SocketAddr,
     num::NonZeroU32,
-    ops::Range,
+    ops::{Range, RangeInclusive},
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
@@ -31,16 +31,14 @@ fn page_id_for_byte_offset(byte_offset: u64) -> PageId {
     (byte_offset / PAGE_SIZE) as PageId
 }
 
-fn page_bounds_for_range(byterange: &Range<u64>) -> (PageId, PageId) {
+fn pagerange(byterange: &Range<u64>) -> RangeInclusive<PageId> {
     let first_page = page_id_for_byte_offset(byterange.start);
     let last_page = page_id_for_byte_offset(byterange.end - 1);
-    (first_page, last_page)
+    first_page..=last_page
 }
 
 fn slice_page_data(
     page_id: PageId,
-    first_page: PageId,
-    last_page: PageId,
     byterange: &Range<u64>,
     value: &CacheValue,
 ) -> Result<(Bytes, Range<u64>), ServiceError> {
@@ -50,7 +48,8 @@ fn slice_page_data(
     let mut range_end = page_start + data_len as u64;
     let mut start_offset = 0;
     let mut end_offset = data_len;
-    if page_id == first_page {
+    let pagerange = pagerange(byterange);
+    if page_id == *pagerange.start() {
         start_offset = (byterange.start - page_start) as usize;
         if start_offset >= data_len {
             return Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
@@ -60,7 +59,7 @@ fn slice_page_data(
         }
         range_start = byterange.start;
     }
-    if page_id == last_page {
+    if page_id == *pagerange.end() {
         end_offset = ((byterange.end - page_start) as usize).min(end_offset);
         range_end = page_start + end_offset as u64;
     }
@@ -175,10 +174,10 @@ impl CacheyService {
         assert!(byterange.start < byterange.end);
         assert!(byterange.end <= MAX_RANGE_END);
 
-        let (first_page, last_page) = page_bounds_for_range(&byterange);
+        let pagerange = pagerange(&byterange);
 
         metrics::fetch_request_bytes(&kind, byterange.end - byterange.start);
-        metrics::fetch_request_pages(&kind, last_page - first_page + 1);
+        metrics::fetch_request_pages(&kind, pagerange.end() - pagerange.start() + 1);
 
         let executor = PageGetExecutor {
             cache: self.cache,
@@ -190,25 +189,22 @@ impl CacheyService {
             req_config,
         };
 
-        futures::stream::iter(
-            (first_page..=last_page).map(move |page_id| executor.clone().execute(page_id)),
-        )
-        .buffered(concurrency)
-        .map(move |res| {
-            res.and_then(|(page_id, value)| {
-                let (data, range) =
-                    slice_page_data(page_id, first_page, last_page, &byterange, &value)?;
-                self.egress_throughput.lock().record(data.len());
-                Ok(Chunk {
-                    bucket: value.bucket,
-                    mtime: value.mtime,
-                    data,
-                    range,
-                    object_size: value.object_size,
-                    cached_at: NonZeroU32::new(value.cached_at),
+        futures::stream::iter(pagerange.map(move |page_id| executor.clone().execute(page_id)))
+            .buffered(concurrency)
+            .map(move |res| {
+                res.and_then(|(page_id, value)| {
+                    let (data, range) = slice_page_data(page_id, &byterange, &value)?;
+                    self.egress_throughput.lock().record(data.len());
+                    Ok(Chunk {
+                        bucket: value.bucket,
+                        mtime: value.mtime,
+                        data,
+                        range,
+                        object_size: value.object_size,
+                        cached_at: NonZeroU32::new(value.cached_at),
+                    })
                 })
             })
-        })
     }
 
     pub fn into_router(self) -> axum::Router {
@@ -350,19 +346,19 @@ mod tests {
     #[test]
     fn page_bounds_for_range_end_on_page_boundary_does_not_advance_last_page() {
         let byterange = 0..PAGE_SIZE;
-        assert_eq!(page_bounds_for_range(&byterange), (0, 0));
+        assert_eq!(pagerange(&byterange), 0..=0);
 
         let byterange = 0..(2 * PAGE_SIZE);
-        assert_eq!(page_bounds_for_range(&byterange), (0, 1));
+        assert_eq!(pagerange(&byterange), 0..=1);
     }
 
     #[test]
     fn page_bounds_for_range_crosses_page_boundary() {
         let byterange = (PAGE_SIZE - 1)..(PAGE_SIZE + 1);
-        assert_eq!(page_bounds_for_range(&byterange), (0, 1));
+        assert_eq!(pagerange(&byterange), 0..=1);
 
         let byterange = PAGE_SIZE..(2 * PAGE_SIZE);
-        assert_eq!(page_bounds_for_range(&byterange), (1, 1));
+        assert_eq!(pagerange(&byterange), 1..=1);
     }
 
     #[test]
@@ -377,8 +373,7 @@ mod tests {
             object_size: object_len as u64,
             cached_at: 0,
         };
-        let (first_page, last_page) = page_bounds_for_range(&byterange);
-        let err = slice_page_data(first_page, first_page, last_page, &byterange, &value)
+        let err = slice_page_data(page_id_for_byte_offset(byterange.start), &byterange, &value)
             .expect_err("expected range error");
         match err {
             ServiceError::Download(DownloadError::RangeNotSatisfied {
