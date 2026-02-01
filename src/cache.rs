@@ -314,7 +314,7 @@ impl CacheValueHeader {
         }
         let data_len_minus_one = (data_len as u32).saturating_sub(1);
         let bytes = [
-            ((data_len == 0) as u8) << 6 | ((bucket_name_len - 1) as u8 & 0b0011_1111),
+            u8::from(data_len == 0) << 6 | ((bucket_name_len - 1) as u8 & 0b0011_1111),
             (object_size >> 32) as u8,
             ((object_size >> 24) & 0xff) as u8,
             ((object_size >> 16) & 0xff) as u8,

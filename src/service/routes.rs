@@ -146,6 +146,7 @@ where
 }
 
 #[instrument(skip(service))]
+#[allow(clippy::too_many_lines)]
 pub async fn fetch(
     State(service): State<CacheyService>,
     Path((kind, object)): Path<(ObjectKind, ObjectKey)>,
@@ -215,7 +216,7 @@ pub async fn fetch(
             headers.insert(
                 header::LAST_MODIFIED,
                 HeaderValue::from_str(&httpdate::fmt_http_date(
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(chunk.mtime as u64),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(chunk.mtime)),
                 ))
                 .unwrap(),
             );

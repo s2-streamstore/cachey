@@ -82,6 +82,9 @@ impl Downloader {
         self.bucketed_stats.export_bucket_metrics(f);
     }
 
+    /// # Panics
+    ///
+    /// if `byterange.start > byterange.end`
     pub async fn download(
         &self,
         buckets: &BucketNameSet,

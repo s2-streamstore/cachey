@@ -69,19 +69,7 @@ cast_possible_truncation = "allow"
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
-cast_lossless = "allow"
-
-# Allow: documentation requirements too verbose for this codebase
 missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-
-# Allow: code style preferences
-similar_names = "allow"
-module_name_repetitions = "allow"
-struct_field_names = "allow"
-too_many_lines = "allow"
-
-# TODO: look into this
 unnecessary_wraps = "allow"
 
 [lints.rust]

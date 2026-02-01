@@ -42,7 +42,7 @@ fn slice_page_data(
     byterange: &Range<u64>,
     value: &CacheValue,
 ) -> Result<(Bytes, Range<u64>), ServiceError> {
-    let page_start = page_id as u64 * PAGE_SIZE;
+    let page_start = u64::from(page_id) * PAGE_SIZE;
     let data_len = value.data.len();
     let mut range_start = page_start;
     let mut range_end = page_start + data_len as u64;
@@ -163,7 +163,9 @@ impl CacheyService {
         self.egress_throughput.lock().bps(lookback)
     }
 
-    /// Panics if range `start > end` or `end >= max_range_end`.
+    /// # Panics
+    ///
+    /// if `byterange.start > byterange.end` or `byterange.end >= MAX_RANGE_END`.
     pub fn get(
         self,
         kind: ObjectKind,
@@ -265,7 +267,7 @@ impl PageGetExecutor {
                     hit_state.store(false, std::sync::atomic::Ordering::Relaxed);
                     metrics::page_request_count(&self.kind, "download");
 
-                    let start = page_id as u64 * PAGE_SIZE;
+                    let start = u64::from(page_id) * PAGE_SIZE;
                     let end = start + PAGE_SIZE;
                     let out = self
                         .downloader

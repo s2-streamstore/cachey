@@ -34,6 +34,7 @@ struct DiskCacheGroup {
 }
 
 #[derive(ArgGroup, Debug, Clone)]
+#[allow(clippy::struct_field_names)]
 struct TlsConfig {
     /// Use a self-signed certificate for TLS
     #[arg(long, conflicts_with_all = ["tls_cert", "tls_key"])]
