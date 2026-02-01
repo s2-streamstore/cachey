@@ -88,7 +88,7 @@ pub enum ServiceError {
     /// 500
     #[error("Cache error: {0}")]
     Cache(#[from] foyer::Error),
-    /// NoSuchKey 404; RangeNotSatisfied 416; otherwise 500
+    /// `NoSuchKey` 404; `RangeNotSatisfied` 416; otherwise 500
     #[error("Object store: {0}")]
     Download(#[from] DownloadError),
     /// 409

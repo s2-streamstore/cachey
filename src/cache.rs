@@ -284,11 +284,11 @@ pub struct CacheValue {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct CacheValueHeader(
-    /// 1B: 1b reserved | 1b empty flag | 6b for bucket name length
-    /// 5B: object size
-    /// 3B: data_len_minus_one (ignored if empty flag set)
-    /// 4B: mtime
-    /// 4B: cached_at
+    // 1B: 1b reserved | 1b empty flag | 6b for bucket name length
+    // 5B: object size
+    // 3B: data_len_minus_one (ignored if empty flag set)
+    // 4B: mtime
+    // 4B: cached_at
     [u8; 17],
 );
 
@@ -487,7 +487,8 @@ mod tests {
     fn test_cache_value_header() {
         // Test valid header creation
         let header =
-            CacheValueHeader::new(63, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1_700_000_000).unwrap();
+            CacheValueHeader::new(63, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1_700_000_000)
+                .unwrap();
         assert_eq!(header.bucket_name_len(), 63);
         assert_eq!(header.object_size(), (1 << 40) - 1);
         assert_eq!(header.mtime(), u32::MAX);
@@ -501,7 +502,8 @@ mod tests {
 
         // Test maximum bucket_name_len (64)
         let header_max =
-            CacheValueHeader::new(64, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1_700_000_000).unwrap();
+            CacheValueHeader::new(64, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1_700_000_000)
+                .unwrap();
         assert_eq!(header_max.bucket_name_len(), 64);
         let bytes_max = header_max.to_bytes();
         let decoded_max = CacheValueHeader::from_bytes(bytes_max).unwrap();

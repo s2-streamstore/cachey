@@ -28,7 +28,7 @@ struct DiskCacheGroup {
     #[arg(long, value_parser = parse_bytes, requires = "disk_path")]
     disk_capacity: Option<ByteSize>,
 
-    /// Use io_uring (if available) for disk IO.
+    /// Use `io_uring` (if available) for disk IO.
     #[arg(long, action = ArgAction::SetTrue)]
     iouring: bool,
 }
