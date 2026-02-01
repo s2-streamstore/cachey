@@ -167,21 +167,21 @@ impl CacheKeyHeader {
         Ok(Self(bytes))
     }
 
-    fn version(&self) -> u8 {
+    fn version(self) -> u8 {
         self.0[0]
     }
 
-    fn kind_len(&self) -> usize {
+    fn kind_len(self) -> usize {
         ((self.0[1] >> 2) as usize) + 1
     }
 
-    fn key_len(&self) -> usize {
+    fn key_len(self) -> usize {
         let high_bits = ((self.0[1] & 0b11) as usize) << 8;
         let low_bits = self.0[2] as usize;
         (high_bits | low_bits) + 1
     }
 
-    fn page_id(&self) -> PageId {
+    fn page_id(self) -> PageId {
         u16::from_be_bytes([self.0[3], self.0[4]])
     }
 
