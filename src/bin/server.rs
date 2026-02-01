@@ -209,10 +209,10 @@ async fn shutdown_signal(handle: axum_server::Handle<SocketAddr>) {
     let term = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {
+        () = ctrl_c => {
             info!("received Ctrl+C, starting graceful shutdown");
         },
-        _ = term => {
+        () = term => {
             info!("received SIGTERM, starting graceful shutdown");
         },
     }

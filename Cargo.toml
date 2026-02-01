@@ -91,12 +91,6 @@ or_fun_call = "allow"
 map_unwrap_or = "allow"
 if_not_else = "allow"
 
-# Allow: explicit unit type matching
-ignored_unit_patterns = "allow"
-
-# Allow: duration arithmetic in controlled contexts
-unchecked_time_subtraction = "allow"
-
 # TODO: look into this
 unnecessary_wraps = "allow"
 
