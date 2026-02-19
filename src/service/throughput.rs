@@ -58,6 +58,7 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
             return 0.0;
         }
 
+        let lookback_seconds_f64 = lookback.as_secs_f64().max(1.0);
         let lookback_secs = lookback.as_secs().max(1);
 
         let now_tick = self.now_secs();
@@ -76,7 +77,7 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
             idx = (idx + len - 1) % len;
         }
 
-        sum as f64 / lookback_secs as f64
+        sum as f64 / lookback_seconds_f64
     }
 
     #[inline]
@@ -200,6 +201,15 @@ mod tests {
 
         assert_close(t.bps(Duration::from_millis(500)), 1_000.0);
         assert_close(t.bps(Duration::from_secs(1)), 1_000.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fractional_lookback_uses_fractional_divisor() {
+        let mut t = SlidingThroughput::<60>::default();
+        t.record(1_000);
+        tokio::time::advance(Duration::from_millis(1_500)).await;
+
+        assert_close(t.bps(Duration::from_millis(1_500)), 1_000.0 / 1.5);
     }
 
     #[tokio::test(start_paused = true)]
