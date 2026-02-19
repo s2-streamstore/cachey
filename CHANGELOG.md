@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/s2-streamstore/cachey/compare/0.9.3...0.10.0) - 2026-02-19
+
+### Added
+
+- [**breaking**] use default eviction policy ([#73](https://github.com/s2-streamstore/cachey/pull/73))
+
+### Fixed
+
+- *(downloader)* record bucket success after response validation ([#75](https://github.com/s2-streamstore/cachey/pull/75))
+
 ## [0.9.3](https://github.com/s2-streamstore/cachey/compare/0.9.2...0.9.3) - 2026-02-01
 
 ### Other
