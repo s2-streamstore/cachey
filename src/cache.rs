@@ -7,8 +7,8 @@ use bytes::{Bytes, BytesMut};
 use bytesize::ByteSize;
 use compact_str::CompactString;
 use foyer::{
-    BlockEngineConfig, Code, DeviceBuilder, EvictionConfig, FileDeviceBuilder, FsDeviceBuilder,
-    HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineConfig, S3FifoConfig,
+    BlockEngineConfig, Code, DeviceBuilder, FileDeviceBuilder, FsDeviceBuilder, HybridCache,
+    HybridCacheBuilder, HybridCachePolicy, IoEngineConfig,
 };
 use mixtrics::registry::prometheus_0_14::PrometheusMetricsRegistry;
 
@@ -46,7 +46,6 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
 
     let mut builder = builder
         .memory(config.memory_size.as_u64() as usize)
-        .with_eviction_config(EvictionConfig::S3Fifo(S3FifoConfig::default()))
         .with_weighter(|key: &CacheKey, value: &CacheValue| {
             key.estimated_size() + value.estimated_size()
         })
