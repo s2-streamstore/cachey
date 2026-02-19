@@ -14,7 +14,6 @@ const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 5;
 const RECOVERY_TIME: Duration = Duration::from_secs(30);
 const POSITION_PENALTY: u64 = 2_000;
 const UNKNOWN_BUCKET_PENALTY: u64 = 5000;
-const LATENCY_SCORE_DIVISOR_MICROS: u64 = 100;
 const ERROR_RATE_SCORE_MULTIPLIER: f64 = 100_000.0;
 const ERROR_RATE_MAX: f64 = 1.0;
 const CIRCUIT_OPEN_SCORE_PENALTY: u64 = 1_000_000;
@@ -182,7 +181,7 @@ impl BucketedStats {
                 let lat = guard
                     .latency_micros_snapshot(now, self.hedge_latency_quantile)
                     .mean
-                    / LATENCY_SCORE_DIVISOR_MICROS;
+                    / 100;
 
                 // Calculate error component based on circuit breaker state
                 let err = if guard.is_circuit_open(now) {
