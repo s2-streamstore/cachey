@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/s2-streamstore/cachey/compare/0.10.0...0.10.1) - 2026-02-19
+
+### Fixed
+
+- *(throughput)* use fractional lookback divisor ([#78](https://github.com/s2-streamstore/cachey/pull/78))
+- *(object_store)* prioritize client-ordered buckets and correct decay ([#76](https://github.com/s2-streamstore/cachey/pull/76))
+
 ## [0.10.0](https://github.com/s2-streamstore/cachey/compare/0.9.3...0.10.0) - 2026-02-19
 
 ### Added
