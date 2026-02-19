@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2](https://github.com/s2-streamstore/cachey/compare/0.10.1...0.10.2) - 2026-02-19
+
+### Fixed
+
+- *(ci)* use buildx imagetools for multi-arch manifest creation ([#79](https://github.com/s2-streamstore/cachey/pull/79))
+
+### Other
+
+- add conventional commit check for PR titles ([#81](https://github.com/s2-streamstore/cachey/pull/81))
+
 ## [0.10.1](https://github.com/s2-streamstore/cachey/compare/0.10.0...0.10.1) - 2026-02-19
 
 ### Fixed
