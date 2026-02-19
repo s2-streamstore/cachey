@@ -148,7 +148,7 @@ impl BucketedStats {
         let now = Instant::now();
         buckets
             .enumerate()
-            .sorted_by_cached_key(|(i, bucket)| self.score(now, bucket, *i))
+            .sorted_by_cached_key(|(i, bucket)| (self.score(now, bucket, *i), *i))
             .map(|(i, _bucket)| i)
     }
 
@@ -523,6 +523,27 @@ mod tests {
         assert_eq!(ordered[0], bucket1);
         assert_eq!(ordered[1], bucket2);
         assert_eq!(ordered[2], bucket3);
+    }
+
+    #[test]
+    fn test_tie_break_prefers_client_order() {
+        let stats = make_test_stats();
+        let first_bucket = BucketName::new("first-bucket").unwrap();
+        let second_bucket = BucketName::new("second-bucket").unwrap();
+
+        for _ in 0..10 {
+            stats.observe(first_bucket.clone(), Ok(Duration::from_millis(250)));
+            stats.observe(second_bucket.clone(), Ok(Duration::from_millis(50)));
+        }
+
+        // Tie by score:
+        // - first: base(0) + lat(2500) = 2500
+        // - second: base(2000) + lat(500) = 2500
+        // Client order should win ties.
+        let buckets = vec![first_bucket.clone(), second_bucket.clone()];
+        let ordered = get_attempt_order(&stats, &buckets);
+        assert_eq!(ordered[0], first_bucket);
+        assert_eq!(ordered[1], second_bucket);
     }
 
     #[test]
