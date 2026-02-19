@@ -16,6 +16,7 @@ const POSITION_PENALTY: u64 = 2_000;
 const UNKNOWN_BUCKET_PENALTY: u64 = 5000;
 const LATENCY_SCORE_DIVISOR_MICROS: u64 = 100;
 const ERROR_RATE_SCORE_MULTIPLIER: f64 = 100_000.0;
+const ERROR_RATE_MAX: f64 = 1.0;
 const CIRCUIT_OPEN_SCORE_PENALTY: u64 = 1_000_000;
 
 #[derive(Debug, Clone)]
@@ -136,7 +137,7 @@ impl BucketedStats {
             // Failure: update error rate and increment failures
             stats.consecutive_failures += 1;
             stats.last_failure_time = now;
-            stats.error_rate += ALPHA;
+            stats.error_rate = (stats.error_rate + ALPHA).min(ERROR_RATE_MAX);
         }
         stats.last_update = now;
     }
@@ -372,6 +373,27 @@ mod tests {
         assert_eq!(
             score_after, score_before,
             "Error penalty should not decay without elapsed time"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_rate_is_capped_after_repeated_failures() {
+        tokio::time::pause();
+
+        let stats = make_test_stats();
+        let bucket = BucketName::new("error-rate-cap").unwrap();
+
+        for _ in 0..200 {
+            stats.observe(bucket.clone(), Err(()));
+        }
+
+        // Let circuit breaker recovery window expire so scoring uses error_rate again.
+        tokio::time::advance(RECOVERY_TIME + Duration::from_secs(1)).await;
+        let score = stats.score(Instant::now(), &bucket, 0);
+
+        assert!(
+            score <= ERROR_RATE_SCORE_MULTIPLIER as u64,
+            "Score exceeded max error-rate penalty: {score}"
         );
     }
 
