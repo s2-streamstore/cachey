@@ -182,15 +182,21 @@ impl Downloader {
         if req_config.is_noop() {
             request.send().await
         } else {
+            let client_config = self.s3.config();
+            let mut config_override = client_config.to_builder();
+            if let Some(timeout_config) =
+                req_config.merged_timeout_config(client_config.timeout_config())
+            {
+                config_override = config_override.timeout_config(timeout_config);
+            }
+            if let Some(retry_config) = req_config.merged_retry_config(client_config.retry_config())
+            {
+                config_override = config_override.retry_config(retry_config);
+            }
+
             request
                 .customize()
-                .config_override(
-                    self.s3
-                        .config()
-                        .to_builder()
-                        .timeout_config(req_config.timeout_config())
-                        .retry_config(req_config.retry_config()),
-                )
+                .config_override(config_override)
                 .send()
                 .await
         }
