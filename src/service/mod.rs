@@ -244,8 +244,14 @@ fn now() -> u32 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheLookupOutcome {
-    Hit,
+    Hit(HitKind),
     Miss(MissKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HitKind {
+    Memory,
+    Disk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,7 +274,8 @@ fn cache_lookup_outcome_for_source(
                 CacheLookupOutcome::Miss(MissKind::Coalesced)
             }
         }
-        Source::Memory | Source::Disk => CacheLookupOutcome::Hit,
+        Source::Memory => CacheLookupOutcome::Hit(HitKind::Memory),
+        Source::Disk => CacheLookupOutcome::Hit(HitKind::Disk),
     }
 }
 
@@ -358,8 +365,19 @@ impl PageGetExecutor {
                     fetched_by_current_request.load(Ordering::Relaxed),
                     &mut value,
                 ) {
-                    CacheLookupOutcome::Hit => {
+                    CacheLookupOutcome::Hit(HitKind::Memory) => {
                         metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
+                        metrics::page_request_count(
+                            &key.kind,
+                            metrics::PageRequestType::CacheHitMemory,
+                        );
+                    }
+                    CacheLookupOutcome::Hit(HitKind::Disk) => {
+                        metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
+                        metrics::page_request_count(
+                            &key.kind,
+                            metrics::PageRequestType::CacheHitDisk,
+                        );
                     }
                     CacheLookupOutcome::Miss(MissKind::Coalesced) => {
                         metrics::page_request_count(&key.kind, metrics::PageRequestType::Coalesced);
@@ -478,7 +496,7 @@ mod tests {
         };
         assert_eq!(
             cache_lookup_outcome_for_source(Source::Memory, false, &mut memory_value),
-            CacheLookupOutcome::Hit
+            CacheLookupOutcome::Hit(HitKind::Memory)
         );
         assert_eq!(memory_value.cached_at, 123);
 
@@ -491,7 +509,7 @@ mod tests {
         };
         assert_eq!(
             cache_lookup_outcome_for_source(Source::Disk, false, &mut disk_value),
-            CacheLookupOutcome::Hit
+            CacheLookupOutcome::Hit(HitKind::Disk)
         );
         assert_eq!(disk_value.cached_at, 456);
     }

@@ -138,6 +138,8 @@ pub(super) enum PageRequestType {
     Fallback,
     Success,
     CacheHit,
+    CacheHitMemory,
+    CacheHitDisk,
     Coalesced,
 }
 
@@ -151,6 +153,8 @@ impl PageRequestType {
             Self::Fallback => "fallback",
             Self::Success => "success",
             Self::CacheHit => "cache_hit",
+            Self::CacheHitMemory => "cache_hit_memory",
+            Self::CacheHitDisk => "cache_hit_disk",
             Self::Coalesced => "coalesced",
         }
     }
