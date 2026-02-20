@@ -243,41 +243,6 @@ fn now() -> u32 {
         .as_secs() as u32
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CacheLookupOutcome {
-    Hit(HitKind),
-    Miss(MissKind),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HitKind {
-    Memory,
-    Disk,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MissKind {
-    Leader,
-    Coalesced,
-}
-
-fn cache_lookup_outcome_for_source(
-    source: Source,
-    fetched_by_current_request: bool,
-) -> CacheLookupOutcome {
-    match source {
-        Source::Outer => {
-            if fetched_by_current_request {
-                CacheLookupOutcome::Miss(MissKind::Leader)
-            } else {
-                CacheLookupOutcome::Miss(MissKind::Coalesced)
-            }
-        }
-        Source::Memory => CacheLookupOutcome::Hit(HitKind::Memory),
-        Source::Disk => CacheLookupOutcome::Hit(HitKind::Disk),
-    }
-}
-
 #[derive(Debug, Clone)]
 struct PageGetExecutor {
     cache: foyer::HybridCache<CacheKey, CacheValue>,
@@ -359,32 +324,30 @@ impl PageGetExecutor {
                     }
                     Ok(Some(_)) | Err(None) => unreachable!("CAS"),
                 }
-                let cache_lookup_outcome = cache_lookup_outcome_for_source(
-                    entry.source(),
-                    fetched_by_current_request.load(Ordering::Relaxed),
-                );
-                if matches!(cache_lookup_outcome, CacheLookupOutcome::Miss(_)) {
-                    value.cached_at = 0;
-                }
-                match cache_lookup_outcome {
-                    CacheLookupOutcome::Hit(HitKind::Memory) => {
+                match entry.source() {
+                    Source::Memory => {
                         metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
                         metrics::page_request_count(
                             &key.kind,
                             metrics::PageRequestType::CacheHitMemory,
                         );
                     }
-                    CacheLookupOutcome::Hit(HitKind::Disk) => {
+                    Source::Disk => {
                         metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
                         metrics::page_request_count(
                             &key.kind,
                             metrics::PageRequestType::CacheHitDisk,
                         );
                     }
-                    CacheLookupOutcome::Miss(MissKind::Coalesced) => {
-                        metrics::page_request_count(&key.kind, metrics::PageRequestType::Coalesced);
+                    Source::Outer => {
+                        value.cached_at = 0;
+                        if !fetched_by_current_request.load(Ordering::Relaxed) {
+                            metrics::page_request_count(
+                                &key.kind,
+                                metrics::PageRequestType::Coalesced,
+                            );
+                        }
                     }
-                    CacheLookupOutcome::Miss(MissKind::Leader) => {}
                 }
                 Ok((page_id, value))
             }
