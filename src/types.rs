@@ -26,6 +26,9 @@ impl BucketName {
         if name.len() > Self::MAX_LEN {
             return Err("Bucket name too long");
         }
+        if name.chars().any(char::is_control) {
+            return Err("Bucket name cannot contain control characters");
+        }
         Ok(Self(name))
     }
 }
@@ -183,6 +186,12 @@ impl IntoIterator for BucketNameSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_name_rejects_control_characters() {
+        let result = BucketName::new("bucket\nname");
+        assert_eq!(result, Err("Bucket name cannot contain control characters"));
+    }
 
     #[test]
     fn object_kind_deserialize_rejects_empty() {
