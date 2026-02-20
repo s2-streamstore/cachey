@@ -26,6 +26,9 @@ impl BucketName {
         if name.len() > Self::MAX_LEN {
             return Err("Bucket name too long");
         }
+        if name.chars().any(char::is_control) {
+            return Err("Bucket name cannot contain control characters");
+        }
         Ok(Self(name))
     }
 }
@@ -63,6 +66,9 @@ impl ObjectKind {
         }
         if key.len() > Self::MAX_LEN {
             return Err("Object kind too long");
+        }
+        if key.chars().any(char::is_control) {
+            return Err("Object kind cannot contain control characters");
         }
         Ok(Self(key))
     }
@@ -183,6 +189,18 @@ impl IntoIterator for BucketNameSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_name_rejects_control_characters() {
+        let result = BucketName::new("bucket\nname");
+        assert_eq!(result, Err("Bucket name cannot contain control characters"));
+    }
+
+    #[test]
+    fn object_kind_rejects_control_characters() {
+        let result = ObjectKind::new("kind\nname");
+        assert_eq!(result, Err("Object kind cannot contain control characters"));
+    }
 
     #[test]
     fn object_kind_deserialize_rejects_empty() {
