@@ -135,7 +135,7 @@ pub enum PageRequestType {
     Access,
     /// Page requests that fetched bytes from object storage.
     Download,
-    /// Object-storage fetches where a hedged request was issued.
+    /// Object storage fetches where a hedged request was issued.
     Hedged,
     /// Fetches whose primary attempt used the client-preferred bucket.
     ClientPref,
