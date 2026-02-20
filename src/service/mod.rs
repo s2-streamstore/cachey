@@ -396,7 +396,159 @@ impl PageGetExecutor {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+        time::Duration,
+    };
+
+    use aws_config::BehaviorVersion;
+    use aws_sdk_s3::config::{Credentials, Region};
+    use axum::{
+        Router,
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::get,
+    };
+    use bytesize::ByteSize;
+
     use super::*;
+
+    #[derive(Debug, Clone)]
+    struct MockS3State {
+        expected_bucket: String,
+        expected_key: String,
+        object: Bytes,
+        request_count: Arc<AtomicUsize>,
+        response_delay: Duration,
+    }
+
+    fn parse_range_header(range_header: &str) -> Option<(u64, u64)> {
+        let range = range_header.strip_prefix("bytes=")?;
+        let (start, end) = range.split_once('-')?;
+        Some((start.parse().ok()?, end.parse().ok()?))
+    }
+
+    async fn mock_get_object(
+        State(state): State<Arc<MockS3State>>,
+        Path((bucket, key)): Path<(String, String)>,
+        headers: HeaderMap,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        if bucket != state.expected_bucket || key != state.expected_key {
+            return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new());
+        }
+
+        let Some(range_header) = headers
+            .get(http::header::RANGE)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return (StatusCode::BAD_REQUEST, HeaderMap::new(), Bytes::new());
+        };
+        let Some((requested_start, requested_end)) = parse_range_header(range_header) else {
+            return (StatusCode::BAD_REQUEST, HeaderMap::new(), Bytes::new());
+        };
+
+        state.request_count.fetch_add(1, AtomicOrdering::Relaxed);
+        tokio::time::sleep(state.response_delay).await;
+
+        let object_size = state.object.len() as u64;
+        if requested_start >= object_size {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_RANGE,
+                format!("bytes */{object_size}")
+                    .parse()
+                    .expect("content-range"),
+            );
+            return (StatusCode::RANGE_NOT_SATISFIABLE, headers, Bytes::new());
+        }
+
+        let response_end = requested_end.min(object_size.saturating_sub(1));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_RANGE,
+            format!("bytes {requested_start}-{response_end}/{object_size}")
+                .parse()
+                .expect("content-range"),
+        );
+        headers.insert(
+            http::header::LAST_MODIFIED,
+            "Tue, 15 Nov 1994 08:12:31 GMT"
+                .parse()
+                .expect("last-modified"),
+        );
+        let data = state
+            .object
+            .slice((requested_start as usize)..=(response_end as usize));
+        (StatusCode::PARTIAL_CONTENT, headers, data)
+    }
+
+    async fn spawn_mock_s3_server(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        object: Bytes,
+        response_delay: Duration,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(MockS3State {
+            expected_bucket: bucket.to_string(),
+            expected_key: key.to_string(),
+            object,
+            request_count: Arc::clone(&request_count),
+            response_delay,
+        });
+        let app = Router::new()
+            .route("/{bucket}/{*key}", get(mock_get_object))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock s3");
+        });
+        (endpoint, request_count, handle)
+    }
+
+    fn mock_s3_client(endpoint: &str) -> aws_sdk_s3::Client {
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .region(Region::new("us-east-1"))
+            .build();
+        aws_sdk_s3::Client::from_conf(config)
+    }
+
+    fn metric_page_request_total(kind: &ObjectKind, typ: &str) -> u64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "cachey_page_request_total")
+            .and_then(|family| {
+                family.metric.iter().find_map(|metric| {
+                    let mut metric_kind = None;
+                    let mut metric_type = None;
+                    for label in &metric.label {
+                        match label.name() {
+                            "kind" => metric_kind = Some(label.value()),
+                            "type" => metric_type = Some(label.value()),
+                            _ => {}
+                        }
+                    }
+                    if metric_kind == Some(&**kind) && metric_type == Some(typ) {
+                        Some(metric.counter.value().round() as u64)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    fn unique_name(prefix: &str) -> String {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        format!("{prefix}-{}", NEXT_ID.fetch_add(1, AtomicOrdering::Relaxed))
+    }
 
     #[test]
     fn page_id_for_byte_offset_matches_page_boundaries() {
@@ -451,66 +603,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cache_lookup_outcome_for_source_marks_leader_outer_as_miss() {
-        let mut value = CacheValue {
-            bucket: BucketName::new("test-bucket").expect("bucket name"),
-            mtime: 0,
-            data: Bytes::from_static(b"hello"),
-            object_size: 5,
-            cached_at: 123,
+    #[tokio::test]
+    async fn page_get_executor_coalesced_miss_is_counted_end_to_end() {
+        let kind = ObjectKind::new(unique_name("kind")).expect("kind");
+        let object = ObjectKey::new(unique_name("object")).expect("object");
+        let bucket = BucketName::new(unique_name("bucket")).expect("bucket");
+        let buckets = BucketNameSet::new(std::iter::once(bucket.clone())).expect("buckets");
+        let object_data = Bytes::from(vec![7_u8; 4096]);
+
+        let (endpoint, request_count, server_handle) =
+            spawn_mock_s3_server(&bucket, &object, object_data, Duration::from_millis(50)).await;
+        let s3 = mock_s3_client(&endpoint);
+        let downloader =
+            Downloader::new(s3, 0.9, Arc::new(Mutex::new(SlidingThroughput::default())));
+        let cache = build_cache(CacheConfig {
+            memory_size: ByteSize::mib(16),
+            disk_cache: None,
+            metrics_registry: None,
+        })
+        .await
+        .expect("cache");
+
+        let before_access = metric_page_request_total(&kind, "access");
+        let before_success = metric_page_request_total(&kind, "success");
+        let before_download = metric_page_request_total(&kind, "download");
+        let before_coalesced = metric_page_request_total(&kind, "coalesced");
+        let before_cache_hit = metric_page_request_total(&kind, "cache_hit");
+
+        let executor = PageGetExecutor {
+            cache,
+            downloader,
+            kind: kind.clone(),
+            object: object.clone(),
+            buckets,
+            object_size: Arc::default(),
+            req_config: RequestConfig::default(),
         };
+        let (left, right) = tokio::join!(executor.clone().execute(0), executor.execute(0));
+        let left_value = left.expect("left request").1;
+        let right_value = right.expect("right request").1;
 
+        assert_eq!(request_count.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(left_value.cached_at, 0);
+        assert_eq!(right_value.cached_at, 0);
         assert_eq!(
-            cache_lookup_outcome_for_source(Source::Outer, true, &mut value),
-            CacheLookupOutcome::Miss(MissKind::Leader)
+            metric_page_request_total(&kind, "access") - before_access,
+            2
         );
-        assert_eq!(value.cached_at, 0);
-    }
-
-    #[test]
-    fn cache_lookup_outcome_for_source_marks_coalesced_as_miss() {
-        let mut value = CacheValue {
-            bucket: BucketName::new("test-bucket").expect("bucket name"),
-            mtime: 0,
-            data: Bytes::from_static(b"hello"),
-            object_size: 5,
-            cached_at: 123,
-        };
-
         assert_eq!(
-            cache_lookup_outcome_for_source(Source::Outer, false, &mut value),
-            CacheLookupOutcome::Miss(MissKind::Coalesced)
+            metric_page_request_total(&kind, "success") - before_success,
+            2
         );
-        assert_eq!(value.cached_at, 0);
-    }
-
-    #[test]
-    fn cache_lookup_outcome_for_source_keeps_cached_at_for_hits() {
-        let mut memory_value = CacheValue {
-            bucket: BucketName::new("test-bucket").expect("bucket name"),
-            mtime: 0,
-            data: Bytes::from_static(b"hello"),
-            object_size: 5,
-            cached_at: 123,
-        };
         assert_eq!(
-            cache_lookup_outcome_for_source(Source::Memory, false, &mut memory_value),
-            CacheLookupOutcome::Hit(HitKind::Memory)
+            metric_page_request_total(&kind, "download") - before_download,
+            1
         );
-        assert_eq!(memory_value.cached_at, 123);
-
-        let mut disk_value = CacheValue {
-            bucket: BucketName::new("test-bucket").expect("bucket name"),
-            mtime: 0,
-            data: Bytes::from_static(b"hello"),
-            object_size: 5,
-            cached_at: 456,
-        };
         assert_eq!(
-            cache_lookup_outcome_for_source(Source::Disk, false, &mut disk_value),
-            CacheLookupOutcome::Hit(HitKind::Disk)
+            metric_page_request_total(&kind, "coalesced") - before_coalesced,
+            1
         );
-        assert_eq!(disk_value.cached_at, 456);
+        assert_eq!(
+            metric_page_request_total(&kind, "cache_hit") - before_cache_hit,
+            0
+        );
+
+        server_handle.abort();
     }
 }
