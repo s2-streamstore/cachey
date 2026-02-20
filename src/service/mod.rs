@@ -2,7 +2,10 @@ use std::{
     net::SocketAddr,
     num::NonZeroU32,
     ops::{Range, RangeInclusive},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -239,13 +242,21 @@ fn now() -> u32 {
         .as_secs() as u32
 }
 
-fn cache_hit_for_source(source: Source, value: &mut CacheValue) -> bool {
+fn page_request_type_for_source(
+    source: Source,
+    fetched_by_current_request: bool,
+    value: &mut CacheValue,
+) -> Option<&'static str> {
     match source {
         Source::Outer => {
             value.cached_at = 0;
-            false
+            if fetched_by_current_request {
+                None
+            } else {
+                Some("coalesced")
+            }
         }
-        Source::Memory | Source::Disk => true,
+        Source::Memory | Source::Disk => Some("cache_hit"),
     }
 }
 
@@ -269,10 +280,13 @@ impl PageGetExecutor {
             object: self.object.clone(),
             page_id,
         };
+        let fetched_by_current_request = Arc::new(AtomicBool::new(false));
         match self
             .cache
             .get_or_fetch(&cache_key, {
+                let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
                 move || async move {
+                    fetched_by_current_request.store(true, Ordering::Relaxed);
                     metrics::page_request_count(&self.kind, "download");
 
                     let start = u64::from(page_id) * PAGE_SIZE;
@@ -324,8 +338,12 @@ impl PageGetExecutor {
                     }
                     Ok(Some(_)) | Err(None) => unreachable!("CAS"),
                 }
-                if cache_hit_for_source(entry.source(), &mut value) {
-                    metrics::page_request_count(&key.kind, "cache_hit");
+                if let Some(request_type) = page_request_type_for_source(
+                    entry.source(),
+                    fetched_by_current_request.load(Ordering::Relaxed),
+                    &mut value,
+                ) {
+                    metrics::page_request_count(&key.kind, request_type);
                 }
                 Ok((page_id, value))
             }
@@ -395,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_for_source_marks_outer_as_miss() {
+    fn page_request_type_for_source_marks_leader_outer_as_miss() {
         let mut value = CacheValue {
             bucket: BucketName::new("test-bucket").expect("bucket name"),
             mtime: 0,
@@ -404,12 +422,32 @@ mod tests {
             cached_at: 123,
         };
 
-        assert!(!cache_hit_for_source(Source::Outer, &mut value));
+        assert_eq!(
+            page_request_type_for_source(Source::Outer, true, &mut value),
+            None
+        );
         assert_eq!(value.cached_at, 0);
     }
 
     #[test]
-    fn cache_hit_for_source_keeps_cached_at_for_hits() {
+    fn page_request_type_for_source_marks_coalesced_as_miss() {
+        let mut value = CacheValue {
+            bucket: BucketName::new("test-bucket").expect("bucket name"),
+            mtime: 0,
+            data: Bytes::from_static(b"hello"),
+            object_size: 5,
+            cached_at: 123,
+        };
+
+        assert_eq!(
+            page_request_type_for_source(Source::Outer, false, &mut value),
+            Some("coalesced")
+        );
+        assert_eq!(value.cached_at, 0);
+    }
+
+    #[test]
+    fn page_request_type_for_source_keeps_cached_at_for_hits() {
         let mut memory_value = CacheValue {
             bucket: BucketName::new("test-bucket").expect("bucket name"),
             mtime: 0,
@@ -417,7 +455,10 @@ mod tests {
             object_size: 5,
             cached_at: 123,
         };
-        assert!(cache_hit_for_source(Source::Memory, &mut memory_value));
+        assert_eq!(
+            page_request_type_for_source(Source::Memory, false, &mut memory_value),
+            Some("cache_hit")
+        );
         assert_eq!(memory_value.cached_at, 123);
 
         let mut disk_value = CacheValue {
@@ -427,7 +468,10 @@ mod tests {
             object_size: 5,
             cached_at: 456,
         };
-        assert!(cache_hit_for_source(Source::Disk, &mut disk_value));
+        assert_eq!(
+            page_request_type_for_source(Source::Disk, false, &mut disk_value),
+            Some("cache_hit")
+        );
         assert_eq!(disk_value.cached_at, 456);
     }
 }
