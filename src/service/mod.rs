@@ -2,13 +2,14 @@ use std::{
     net::SocketAddr,
     num::NonZeroU32,
     ops::{Range, RangeInclusive},
-    sync::{Arc, atomic::AtomicBool},
+    sync::Arc,
     time::Duration,
 };
 
 use bytes::Bytes;
 use crossbeam::atomic::AtomicCell;
 use eyre::Result;
+use foyer::Source;
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
 
@@ -238,6 +239,16 @@ fn now() -> u32 {
         .as_secs() as u32
 }
 
+fn cache_hit_for_source(source: Source, value: &mut CacheValue) -> bool {
+    match source {
+        Source::Outer => {
+            value.cached_at = 0;
+            false
+        }
+        Source::Memory | Source::Disk => true,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PageGetExecutor {
     cache: foyer::HybridCache<CacheKey, CacheValue>,
@@ -258,13 +269,10 @@ impl PageGetExecutor {
             object: self.object.clone(),
             page_id,
         };
-        let hit_state = Arc::new(AtomicBool::new(true));
         match self
             .cache
             .get_or_fetch(&cache_key, {
-                let hit_state = hit_state.clone();
                 move || async move {
-                    hit_state.store(false, std::sync::atomic::Ordering::Relaxed);
                     metrics::page_request_count(&self.kind, "download");
 
                     let start = u64::from(page_id) * PAGE_SIZE;
@@ -316,13 +324,8 @@ impl PageGetExecutor {
                     }
                     Ok(Some(_)) | Err(None) => unreachable!("CAS"),
                 }
-                // It gets initialized as now() for insertion via fetch() in case of a miss,
-                // but we need this to signal whether it was a hit or miss.
-                // 0 => miss, non-zero => timestamp.
-                if hit_state.load(std::sync::atomic::Ordering::Relaxed) {
+                if cache_hit_for_source(entry.source(), &mut value) {
                     metrics::page_request_count(&key.kind, "cache_hit");
-                } else {
-                    value.cached_at = 0;
                 }
                 Ok((page_id, value))
             }
@@ -389,5 +392,42 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn cache_hit_for_source_marks_outer_as_miss() {
+        let mut value = CacheValue {
+            bucket: BucketName::new("test-bucket").expect("bucket name"),
+            mtime: 0,
+            data: Bytes::from_static(b"hello"),
+            object_size: 5,
+            cached_at: 123,
+        };
+
+        assert!(!cache_hit_for_source(Source::Outer, &mut value));
+        assert_eq!(value.cached_at, 0);
+    }
+
+    #[test]
+    fn cache_hit_for_source_keeps_cached_at_for_hits() {
+        let mut memory_value = CacheValue {
+            bucket: BucketName::new("test-bucket").expect("bucket name"),
+            mtime: 0,
+            data: Bytes::from_static(b"hello"),
+            object_size: 5,
+            cached_at: 123,
+        };
+        assert!(cache_hit_for_source(Source::Memory, &mut memory_value));
+        assert_eq!(memory_value.cached_at, 123);
+
+        let mut disk_value = CacheValue {
+            bucket: BucketName::new("test-bucket").expect("bucket name"),
+            mtime: 0,
+            data: Bytes::from_static(b"hello"),
+            object_size: 5,
+            cached_at: 456,
+        };
+        assert!(cache_hit_for_source(Source::Disk, &mut disk_value));
+        assert_eq!(disk_value.cached_at, 456);
     }
 }
