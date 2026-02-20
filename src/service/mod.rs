@@ -242,21 +242,33 @@ fn now() -> u32 {
         .as_secs() as u32
 }
 
-fn page_request_type_for_source(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheLookupOutcome {
+    Hit,
+    Miss(MissKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissKind {
+    Leader,
+    Coalesced,
+}
+
+fn cache_lookup_outcome_for_source(
     source: Source,
     fetched_by_current_request: bool,
     value: &mut CacheValue,
-) -> Option<&'static str> {
+) -> CacheLookupOutcome {
     match source {
         Source::Outer => {
             value.cached_at = 0;
             if fetched_by_current_request {
-                None
+                CacheLookupOutcome::Miss(MissKind::Leader)
             } else {
-                Some("coalesced")
+                CacheLookupOutcome::Miss(MissKind::Coalesced)
             }
         }
-        Source::Memory | Source::Disk => Some("cache_hit"),
+        Source::Memory | Source::Disk => CacheLookupOutcome::Hit,
     }
 }
 
@@ -273,7 +285,7 @@ struct PageGetExecutor {
 
 impl PageGetExecutor {
     async fn execute(self, page_id: PageId) -> Result<(PageId, CacheValue), ServiceError> {
-        metrics::page_request_count(&self.kind, "access");
+        metrics::page_request_count(&self.kind, metrics::PageRequestType::Access);
 
         let cache_key = CacheKey {
             kind: self.kind.clone(),
@@ -287,7 +299,7 @@ impl PageGetExecutor {
                 let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
                 move || async move {
                     fetched_by_current_request.store(true, Ordering::Relaxed);
-                    metrics::page_request_count(&self.kind, "download");
+                    metrics::page_request_count(&self.kind, metrics::PageRequestType::Download);
 
                     let start = u64::from(page_id) * PAGE_SIZE;
                     let end = start + PAGE_SIZE;
@@ -297,13 +309,16 @@ impl PageGetExecutor {
                         .await?;
                     metrics::page_download_latency(&self.kind, out.piece.latency);
                     if out.piece.hedged.is_some() {
-                        metrics::page_request_count(&self.kind, "hedged");
+                        metrics::page_request_count(&self.kind, metrics::PageRequestType::Hedged);
                     }
                     if self.buckets.first() == Some(&self.buckets[out.primary_bucket_idx]) {
-                        metrics::page_request_count(&self.kind, "client_pref");
+                        metrics::page_request_count(
+                            &self.kind,
+                            metrics::PageRequestType::ClientPref,
+                        );
                     }
                     if out.used_bucket_idx != out.primary_bucket_idx {
-                        metrics::page_request_count(&self.kind, "fallback");
+                        metrics::page_request_count(&self.kind, metrics::PageRequestType::Fallback);
                     }
                     Ok::<_, DownloadError>(CacheValue {
                         bucket: self.buckets[out.used_bucket_idx].clone(),
@@ -318,7 +333,7 @@ impl PageGetExecutor {
         {
             Ok(entry) => {
                 let key = entry.key();
-                metrics::page_request_count(&key.kind, "success");
+                metrics::page_request_count(&key.kind, metrics::PageRequestType::Success);
 
                 let mut value = entry.value().clone();
                 match self
@@ -338,12 +353,18 @@ impl PageGetExecutor {
                     }
                     Ok(Some(_)) | Err(None) => unreachable!("CAS"),
                 }
-                if let Some(request_type) = page_request_type_for_source(
+                match cache_lookup_outcome_for_source(
                     entry.source(),
                     fetched_by_current_request.load(Ordering::Relaxed),
                     &mut value,
                 ) {
-                    metrics::page_request_count(&key.kind, request_type);
+                    CacheLookupOutcome::Hit => {
+                        metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
+                    }
+                    CacheLookupOutcome::Miss(MissKind::Coalesced) => {
+                        metrics::page_request_count(&key.kind, metrics::PageRequestType::Coalesced);
+                    }
+                    CacheLookupOutcome::Miss(MissKind::Leader) => {}
                 }
                 Ok((page_id, value))
             }
@@ -413,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn page_request_type_for_source_marks_leader_outer_as_miss() {
+    fn cache_lookup_outcome_for_source_marks_leader_outer_as_miss() {
         let mut value = CacheValue {
             bucket: BucketName::new("test-bucket").expect("bucket name"),
             mtime: 0,
@@ -423,14 +444,14 @@ mod tests {
         };
 
         assert_eq!(
-            page_request_type_for_source(Source::Outer, true, &mut value),
-            None
+            cache_lookup_outcome_for_source(Source::Outer, true, &mut value),
+            CacheLookupOutcome::Miss(MissKind::Leader)
         );
         assert_eq!(value.cached_at, 0);
     }
 
     #[test]
-    fn page_request_type_for_source_marks_coalesced_as_miss() {
+    fn cache_lookup_outcome_for_source_marks_coalesced_as_miss() {
         let mut value = CacheValue {
             bucket: BucketName::new("test-bucket").expect("bucket name"),
             mtime: 0,
@@ -440,14 +461,14 @@ mod tests {
         };
 
         assert_eq!(
-            page_request_type_for_source(Source::Outer, false, &mut value),
-            Some("coalesced")
+            cache_lookup_outcome_for_source(Source::Outer, false, &mut value),
+            CacheLookupOutcome::Miss(MissKind::Coalesced)
         );
         assert_eq!(value.cached_at, 0);
     }
 
     #[test]
-    fn page_request_type_for_source_keeps_cached_at_for_hits() {
+    fn cache_lookup_outcome_for_source_keeps_cached_at_for_hits() {
         let mut memory_value = CacheValue {
             bucket: BucketName::new("test-bucket").expect("bucket name"),
             mtime: 0,
@@ -456,8 +477,8 @@ mod tests {
             cached_at: 123,
         };
         assert_eq!(
-            page_request_type_for_source(Source::Memory, false, &mut memory_value),
-            Some("cache_hit")
+            cache_lookup_outcome_for_source(Source::Memory, false, &mut memory_value),
+            CacheLookupOutcome::Hit
         );
         assert_eq!(memory_value.cached_at, 123);
 
@@ -469,8 +490,8 @@ mod tests {
             cached_at: 456,
         };
         assert_eq!(
-            page_request_type_for_source(Source::Disk, false, &mut disk_value),
-            Some("cache_hit")
+            cache_lookup_outcome_for_source(Source::Disk, false, &mut disk_value),
+            CacheLookupOutcome::Hit
         );
         assert_eq!(disk_value.cached_at, 456);
     }

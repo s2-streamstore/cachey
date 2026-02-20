@@ -129,7 +129,34 @@ pub fn fetch_request_pages(kind: &ObjectKind, pages: u16) {
         .observe(f64::from(pages));
 }
 
-pub fn page_request_count(kind: &ObjectKind, typ: &str) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PageRequestType {
+    Access,
+    Download,
+    Hedged,
+    ClientPref,
+    Fallback,
+    Success,
+    CacheHit,
+    Coalesced,
+}
+
+impl PageRequestType {
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::Access => "access",
+            Self::Download => "download",
+            Self::Hedged => "hedged",
+            Self::ClientPref => "client_pref",
+            Self::Fallback => "fallback",
+            Self::Success => "success",
+            Self::CacheHit => "cache_hit",
+            Self::Coalesced => "coalesced",
+        }
+    }
+}
+
+pub fn page_request_count(kind: &ObjectKind, typ: PageRequestType) {
     static COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
         register_int_counter_vec!(
             "cachey_page_request_total",
@@ -139,7 +166,7 @@ pub fn page_request_count(kind: &ObjectKind, typ: &str) {
         .unwrap()
     });
 
-    COUNTER.with_label_values(&[&**kind, typ]).inc();
+    COUNTER.with_label_values(&[&**kind, typ.as_label()]).inc();
 }
 
 pub fn page_download_latency(kind: &ObjectKind, latency: std::time::Duration) {
