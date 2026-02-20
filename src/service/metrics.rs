@@ -131,25 +131,25 @@ pub fn fetch_request_pages(kind: &ObjectKind, pages: u16) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageRequestType {
-    /// Any page request received by `PageGetExecutor`.
+    /// Total page requests observed by the service.
     Access,
-    /// A request that performed the upstream object-store download.
+    /// Page requests that fetched bytes from object storage.
     Download,
-    /// A request where hedging was used during object-store download.
+    /// Object-storage fetches where a hedged request was issued.
     Hedged,
-    /// A download that used the client's preferred bucket as the primary choice.
+    /// Fetches whose primary attempt used the client-preferred bucket.
     ClientPref,
-    /// A download that succeeded from a fallback bucket instead of the primary bucket.
+    /// Fetches that succeeded via a fallback bucket after the primary path failed.
     Fallback,
-    /// A page request that completed successfully (hit or miss path).
+    /// Page requests that completed successfully, regardless of hit/miss path.
     Success,
-    /// Aggregate cache hit count (includes both memory and disk hits).
+    /// Aggregate cache-hit count (includes both memory and disk hits).
     CacheHit,
-    /// Cache hit served directly from the in-memory cache.
+    /// Cache hits served from in-memory cache.
     CacheHitMemory,
-    /// Cache hit served from disk cache.
+    /// Cache hits served from disk cache.
     CacheHitDisk,
-    /// Coalesced miss waiter that received an outer-fetched entry without running fetch itself.
+    /// Requests that waited on another in-flight miss for the same page instead of downloading.
     Coalesced,
 }
 
