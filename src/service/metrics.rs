@@ -130,7 +130,7 @@ pub fn fetch_request_pages(kind: &ObjectKind, pages: u16) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PageRequestType {
+pub enum PageRequestType {
     /// Any page request received by `PageGetExecutor`.
     Access,
     /// A request that performed the upstream object-store download.

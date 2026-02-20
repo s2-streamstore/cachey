@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 
 mod metrics;
 mod throughput;
+pub use metrics::PageRequestType;
 pub use throughput::SlidingThroughput;
 mod routes;
 
