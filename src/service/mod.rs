@@ -264,11 +264,9 @@ enum MissKind {
 fn cache_lookup_outcome_for_source(
     source: Source,
     fetched_by_current_request: bool,
-    value: &mut CacheValue,
 ) -> CacheLookupOutcome {
     match source {
         Source::Outer => {
-            value.cached_at = 0;
             if fetched_by_current_request {
                 CacheLookupOutcome::Miss(MissKind::Leader)
             } else {
@@ -361,11 +359,14 @@ impl PageGetExecutor {
                     }
                     Ok(Some(_)) | Err(None) => unreachable!("CAS"),
                 }
-                match cache_lookup_outcome_for_source(
+                let cache_lookup_outcome = cache_lookup_outcome_for_source(
                     entry.source(),
                     fetched_by_current_request.load(Ordering::Relaxed),
-                    &mut value,
-                ) {
+                );
+                if matches!(cache_lookup_outcome, CacheLookupOutcome::Miss(_)) {
+                    value.cached_at = 0;
+                }
+                match cache_lookup_outcome {
                     CacheLookupOutcome::Hit(HitKind::Memory) => {
                         metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
                         metrics::page_request_count(
