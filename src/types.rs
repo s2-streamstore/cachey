@@ -6,6 +6,25 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
 pub type PageId = u16;
 
+fn validate_bucket_or_kind_name(
+    value: &str,
+    max_len: usize,
+    empty_error: &'static str,
+    too_long_error: &'static str,
+    control_chars_error: &'static str,
+) -> Result<(), &'static str> {
+    if value.is_empty() {
+        return Err(empty_error);
+    }
+    if value.len() > max_len {
+        return Err(too_long_error);
+    }
+    if value.chars().any(char::is_control) {
+        return Err(control_chars_error);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BucketName(CompactString);
 
@@ -20,15 +39,13 @@ impl BucketName {
 
     pub fn new(name: impl Into<CompactString>) -> Result<Self, &'static str> {
         let name = name.into();
-        if name.is_empty() {
-            return Err("Bucket name cannot be empty");
-        }
-        if name.len() > Self::MAX_LEN {
-            return Err("Bucket name too long");
-        }
-        if name.chars().any(char::is_control) {
-            return Err("Bucket name cannot contain control characters");
-        }
+        validate_bucket_or_kind_name(
+            name.as_str(),
+            Self::MAX_LEN,
+            "Bucket name cannot be empty",
+            "Bucket name too long",
+            "Bucket name cannot contain control characters",
+        )?;
         Ok(Self(name))
     }
 }
@@ -61,15 +78,13 @@ impl ObjectKind {
 
     pub fn new(key: impl Into<CompactString>) -> Result<Self, &'static str> {
         let key = key.into();
-        if key.is_empty() {
-            return Err("Object kind cannot be empty");
-        }
-        if key.len() > Self::MAX_LEN {
-            return Err("Object kind too long");
-        }
-        if key.chars().any(char::is_control) {
-            return Err("Object kind cannot contain control characters");
-        }
+        validate_bucket_or_kind_name(
+            key.as_str(),
+            Self::MAX_LEN,
+            "Object kind cannot be empty",
+            "Object kind too long",
+            "Object kind cannot contain control characters",
+        )?;
         Ok(Self(key))
     }
 }
