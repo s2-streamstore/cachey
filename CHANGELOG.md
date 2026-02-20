@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3](https://github.com/s2-streamstore/cachey/compare/0.10.2...0.10.3) - 2026-02-20
+
+### Fixed
+
+- *(types)* reject control characters in bucket names ([#84](https://github.com/s2-streamstore/cachey/pull/84))
+- *(object_store)* merge per-request timeout and retry overrides ([#85](https://github.com/s2-streamstore/cachey/pull/85))
+- classify coalesced cache misses in PageGetExecutor ([#82](https://github.com/s2-streamstore/cachey/pull/82))
+
 ## [0.10.2](https://github.com/s2-streamstore/cachey/compare/0.10.1...0.10.2) - 2026-02-19
 
 ### Fixed
