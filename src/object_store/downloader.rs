@@ -145,14 +145,12 @@ impl Downloader {
             }
         };
         let start_time = Instant::now();
-        let primary_attempt = attempt_full(start_time, None);
-        tokio::pin!(primary_attempt);
+        let mut primary_attempt = Box::pin(attempt_full(start_time, None));
         select! {
             primary_result = &mut primary_attempt => primary_result,
             hedge_threshold = self.hedge_trigger(bucket, start_time) => {
                 let hedge_start_time = Instant::now();
-                let hedge_attempt = attempt_full(hedge_start_time, hedge_threshold);
-                tokio::pin!(hedge_attempt);
+                let mut hedge_attempt = Box::pin(attempt_full(hedge_start_time, hedge_threshold));
                 select! {
                     primary_result = &mut primary_attempt => primary_result,
                     hedge_result = &mut hedge_attempt => hedge_result,
