@@ -125,18 +125,17 @@ impl BucketedStats {
         let entry = self.by_bucket.entry(bucket).or_default();
         let mut stats = entry.lock();
 
-        stats.error_rate = stats.error_rate(now);
-        if let Ok(lat) = outcome {
-            // Success: update error rate and reset failures
+        let decayed_error_rate = stats.error_rate(now);
+        if let Ok(latency) = outcome {
+            stats.error_rate = decayed_error_rate * (1.0 - ALPHA);
             stats.consecutive_failures = 0;
             stats
                 .latency_micros_histogram
-                .update_at(now.into_std(), lat.as_micros() as i64);
+                .update_at(now.into_std(), latency.as_micros() as i64);
         } else {
-            // Failure: update error rate and increment failures
+            stats.error_rate = (decayed_error_rate * (1.0 - ALPHA) + ALPHA).min(ERROR_RATE_MAX);
             stats.consecutive_failures += 1;
             stats.last_failure_time = now;
-            stats.error_rate = (stats.error_rate + ALPHA).min(ERROR_RATE_MAX);
         }
         stats.last_update = now;
     }
@@ -355,7 +354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_success_without_elapsed_time_preserves_error_penalty() {
+    async fn test_success_without_elapsed_time_reduces_error_penalty() {
         tokio::time::pause();
 
         let stats = make_test_stats();
@@ -369,9 +368,43 @@ mod tests {
         stats.observe(bucket.clone(), Ok(Duration::ZERO));
         let score_after = stats.score(Instant::now(), &bucket, 0);
 
-        assert_eq!(
-            score_after, score_before,
-            "Error penalty should not decay without elapsed time"
+        assert!(
+            score_after < score_before,
+            "Success should reduce error penalty even without elapsed time: {score_before} -> {score_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_success_traffic_drives_error_rate_down() {
+        tokio::time::pause();
+
+        let stats = make_test_stats();
+        let bucket = BucketName::new("success-traffic-reduces-errors").unwrap();
+
+        stats.observe(bucket.clone(), Err(()));
+
+        let mut initial_error_rate = 0.0;
+        stats.export_bucket_metrics(|name, metrics| {
+            if name == &bucket {
+                initial_error_rate = metrics.error_rate;
+            }
+        });
+        assert!(initial_error_rate > 0.0);
+
+        for _ in 0..1_000 {
+            stats.observe(bucket.clone(), Ok(Duration::from_millis(1)));
+        }
+
+        let mut error_rate_after_successes = 0.0;
+        stats.export_bucket_metrics(|name, metrics| {
+            if name == &bucket {
+                error_rate_after_successes = metrics.error_rate;
+            }
+        });
+
+        assert!(
+            error_rate_after_successes < initial_error_rate * 0.05,
+            "Expected success traffic to suppress error rate, got {initial_error_rate} -> {error_rate_after_successes}"
         );
     }
 
