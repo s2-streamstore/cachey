@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.4](https://github.com/s2-streamstore/cachey/compare/0.10.3...0.10.4) - 2026-02-28
+
+### Fixed
+
+- *(object-store)* make bucket error-rate respond to successes ([#89](https://github.com/s2-streamstore/cachey/pull/89))
+
+### Other
+
+- dep updates + future size fix for clippy ([#91](https://github.com/s2-streamstore/cachey/pull/91))
+
 ## [0.10.3](https://github.com/s2-streamstore/cachey/compare/0.10.2...0.10.3) - 2026-02-20
 
 ### Fixed
