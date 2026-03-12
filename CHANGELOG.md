@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.5](https://github.com/s2-streamstore/cachey/compare/0.10.4...0.10.5) - 2026-03-12
+
+### Fixed
+
+- record fetch success metrics for ranged GETs ([#93](https://github.com/s2-streamstore/cachey/pull/93))
+
+### Other
+
+- dep updates
+- update license file
+
 ## [0.10.4](https://github.com/s2-streamstore/cachey/compare/0.10.3...0.10.4) - 2026-02-28
 
 ### Fixed
