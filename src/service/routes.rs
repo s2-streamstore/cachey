@@ -239,8 +239,6 @@ pub async fn fetch(
         let mut trailers_tx = Some(trailers_tx);
         let mut trailers = HeaderMap::new();
         let mut chunk_idx = 0;
-        let mut errored = false;
-        let mut success_recorded = false;
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(chunk) => {
@@ -250,7 +248,6 @@ pub async fn fetch(
                     let is_last_chunk = chunk.range.end == byterange.end.min(chunk.object_size);
                     if is_last_chunk {
                         metrics::fetch_request_count(&kind, &method, "success");
-                        success_recorded = true;
                         if let Some(trailers_tx) = trailers_tx.take() {
                             let _ = trailers_tx.send(std::mem::take(&mut trailers));
                         }
@@ -264,13 +261,11 @@ pub async fn fetch(
                     assert!(chunk_idx > 0, "first chunk cannot be an error since we peeked");
                     on_chunk_error(&kind, &method, chunk_idx, &err);
                     yield Err(err);
-                    errored = true;
                     break;
                 },
             }
             chunk_idx += 1;
         }
-        debug_assert!(errored || success_recorded);
     })
     .with_trailers(async {
         let Ok(trailers) = trailers_rx.await else {
