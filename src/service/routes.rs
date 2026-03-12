@@ -270,12 +270,7 @@ pub async fn fetch(
             }
             chunk_idx += 1;
         }
-        if !errored
-            && !success_recorded
-            && let Some(trailers_tx) = trailers_tx.take()
-        {
-            let _ = trailers_tx.send(trailers);
-        }
+        debug_assert!(errored || success_recorded);
     })
     .with_trailers(async {
         let Ok(trailers) = trailers_rx.await else {
