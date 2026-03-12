@@ -102,6 +102,19 @@ async fn upload_test_object(client: &aws_sdk_s3::Client, bucket: &str, key: &str
         .expect("Failed to upload object");
 }
 
+async fn scrape_metrics(client: &reqwest::Client, server_url: &str) -> String {
+    client
+        .get(format!("{server_url}/metrics"))
+        .send()
+        .await
+        .expect("Failed to scrape metrics")
+        .error_for_status()
+        .expect("Metrics endpoint returned an error status")
+        .text()
+        .await
+        .expect("Failed to read metrics body")
+}
+
 #[tokio::test]
 async fn test_fetch_endpoint_full_object() {
     let ctx = setup_test_server().await;
@@ -328,24 +341,62 @@ async fn test_metrics_endpoint() {
     let ctx = setup_test_server().await;
 
     let client = reqwest::Client::new();
-    let response = client
-        .get(format!("{}/metrics", ctx.server_url))
-        .send()
-        .await
-        .expect("Failed to send request");
+    let body = scrape_metrics(&client, &ctx.server_url).await;
 
-    assert_eq!(response.status(), 200);
-
-    let body = response.text().await.expect("Failed to read response body");
-
-    // The metrics endpoint returns prometheus format metrics
-    // Even empty, it should return something (at least an empty string from prometheus)
-    // Let's just check that the endpoint responds successfully
-    // The body might be empty if no metrics have been registered yet
     println!("Metrics body length: {}", body.len());
     if !body.is_empty() {
         println!("Metrics body preview: {}", &body[..body.len().min(200)]);
     }
+}
+
+#[tokio::test]
+async fn test_fetch_metrics_record_success_for_ranged_get() {
+    let ctx = setup_test_server().await;
+
+    let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize + 1024);
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
+    let test_data = test_data.freeze();
+    let object_key = "metrics-success-object.bin";
+    upload_test_object(
+        &ctx.s3_client,
+        &ctx.bucket_name,
+        object_key,
+        test_data.clone(),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let metric_kind = "metrics-success-kind";
+    let response = client
+        .get(format!(
+            "{}/fetch/{}/{}",
+            ctx.server_url, metric_kind, object_key
+        ))
+        .header("Range", "bytes=0-4095")
+        .header("c0-bucket", &ctx.bucket_name)
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 206);
+    let body = response
+        .bytes()
+        .await
+        .expect("Failed to read response body");
+    assert_eq!(body, test_data.slice(0..4096));
+
+    let metrics = scrape_metrics(&client, &ctx.server_url).await;
+    let expected_metric = format!(
+        "cachey_fetch_request_total{{kind=\"{metric_kind}\",method=\"GET\",status=\"success\"}} "
+    );
+    assert!(
+        metrics
+            .lines()
+            .any(|line| line.starts_with(&expected_metric)),
+        "Missing success metric line. Metrics body:\n{metrics}"
+    );
 }
 
 #[tokio::test]

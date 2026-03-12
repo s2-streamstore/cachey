@@ -236,17 +236,28 @@ pub async fn fetch(
     let (trailers_tx, trailers_rx) = tokio::sync::oneshot::channel::<HeaderMap>();
 
     let body = StreamBody::new(async_stream::stream! {
+        let mut trailers_tx = Some(trailers_tx);
         let mut trailers = HeaderMap::new();
         let mut chunk_idx = 0;
-        let mut errored = false;
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(chunk) => {
                     if chunk_idx > 0 {
                         trailers.append("c0-status", c0_status(&chunk));
                     }
+                    let is_last_chunk = chunk.range.end == byterange.end.min(chunk.object_size);
+                    if is_last_chunk {
+                        metrics::fetch_request_count(&kind, &method, "success");
+                        let trailers_tx = trailers_tx
+                            .take()
+                            .expect("final chunk should send trailers exactly once");
+                        let _ = trailers_tx.send(std::mem::take(&mut trailers));
+                    }
                     yield Ok(Frame::data(chunk.data));
-                    if chunk.range.end == chunk.object_size {
+                    if is_last_chunk {
+                        // `service.get` can already have later requested pages in flight before
+                        // we learn the true object size. Once we've emitted the full valid
+                        // response range, ignore any speculative beyond-EOF page results.
                         break;
                     }
                 },
@@ -254,15 +265,10 @@ pub async fn fetch(
                     assert!(chunk_idx > 0, "first chunk cannot be an error since we peeked");
                     on_chunk_error(&kind, &method, chunk_idx, &err);
                     yield Err(err);
-                    errored = true;
                     break;
                 },
             }
             chunk_idx += 1;
-        }
-        if !errored {
-            metrics::fetch_request_count(&kind, &method, "success");
-            let _ = trailers_tx.send(trailers);
         }
     })
     .with_trailers(async {
