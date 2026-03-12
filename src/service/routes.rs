@@ -248,9 +248,10 @@ pub async fn fetch(
                     let is_last_chunk = chunk.range.end == byterange.end.min(chunk.object_size);
                     if is_last_chunk {
                         metrics::fetch_request_count(&kind, &method, "success");
-                        if let Some(trailers_tx) = trailers_tx.take() {
-                            let _ = trailers_tx.send(std::mem::take(&mut trailers));
-                        }
+                        let trailers_tx = trailers_tx
+                            .take()
+                            .expect("final chunk should send trailers exactly once");
+                        let _ = trailers_tx.send(std::mem::take(&mut trailers));
                     }
                     yield Ok(Frame::data(chunk.data));
                     if is_last_chunk {
