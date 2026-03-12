@@ -255,6 +255,9 @@ pub async fn fetch(
                     }
                     yield Ok(Frame::data(chunk.data));
                     if is_last_chunk {
+                        // `service.get` can already have later requested pages in flight before
+                        // we learn the true object size. Once we've emitted the full valid
+                        // response range, ignore any speculative beyond-EOF page results.
                         break;
                     }
                 },
