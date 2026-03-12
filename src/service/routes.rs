@@ -236,17 +236,27 @@ pub async fn fetch(
     let (trailers_tx, trailers_rx) = tokio::sync::oneshot::channel::<HeaderMap>();
 
     let body = StreamBody::new(async_stream::stream! {
+        let mut trailers_tx = Some(trailers_tx);
         let mut trailers = HeaderMap::new();
         let mut chunk_idx = 0;
         let mut errored = false;
+        let mut success_recorded = false;
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(chunk) => {
                     if chunk_idx > 0 {
                         trailers.append("c0-status", c0_status(&chunk));
                     }
+                    let is_last_chunk = chunk.range.end == byterange.end.min(chunk.object_size);
+                    if is_last_chunk {
+                        metrics::fetch_request_count(&kind, &method, "success");
+                        success_recorded = true;
+                        if let Some(trailers_tx) = trailers_tx.take() {
+                            let _ = trailers_tx.send(std::mem::take(&mut trailers));
+                        }
+                    }
                     yield Ok(Frame::data(chunk.data));
-                    if chunk.range.end == chunk.object_size {
+                    if is_last_chunk {
                         break;
                     }
                 },
@@ -260,8 +270,10 @@ pub async fn fetch(
             }
             chunk_idx += 1;
         }
-        if !errored {
-            metrics::fetch_request_count(&kind, &method, "success");
+        if !errored
+            && !success_recorded
+            && let Some(trailers_tx) = trailers_tx.take()
+        {
             let _ = trailers_tx.send(trailers);
         }
     })
