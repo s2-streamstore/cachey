@@ -53,9 +53,17 @@ impl BucketStats {
         self.error_rate * (-ALPHA * elapsed).exp()
     }
 
-    fn is_circuit_open(&self, now: Instant) -> bool {
-        self.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD
-            && now.duration_since(self.last_failure_time) < RECOVERY_TIME
+    fn is_circuit_open(&mut self, now: Instant) -> bool {
+        if self.consecutive_failures < CONSECUTIVE_FAILURE_THRESHOLD {
+            return false;
+        }
+
+        if now.duration_since(self.last_failure_time) < RECOVERY_TIME {
+            return true;
+        }
+
+        self.consecutive_failures = 0;
+        false
     }
 
     fn latency_micros_snapshot(
@@ -500,6 +508,51 @@ mod tests {
         }
         let now = Instant::now();
         assert_eq!(stats.score(now, &bucket, 0), CIRCUIT_OPEN_SCORE_PENALTY);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_single_failure_after_recovery_requires_full_threshold() {
+        tokio::time::pause();
+        let stats = make_test_stats();
+        let bucket = BucketName::new("recovery-threshold-bucket").unwrap();
+
+        for _ in 0..CONSECUTIVE_FAILURE_THRESHOLD {
+            stats.observe(bucket.clone(), Err(()));
+        }
+
+        tokio::time::advance(RECOVERY_TIME + Duration::from_secs(1)).await;
+
+        let recovered_score = stats.score(Instant::now(), &bucket, 0);
+        assert!(
+            recovered_score < CIRCUIT_OPEN_SCORE_PENALTY,
+            "Circuit should close after recovery time"
+        );
+
+        let mut recovered_failures = None;
+        stats.export_bucket_metrics(|name, metrics| {
+            if name == &bucket {
+                recovered_failures = Some(metrics.consecutive_failures);
+            }
+        });
+        assert_eq!(
+            recovered_failures,
+            Some(0),
+            "Recovery should clear stale consecutive failures"
+        );
+
+        stats.observe(bucket.clone(), Err(()));
+        let one_failure_score = stats.score(Instant::now(), &bucket, 0);
+        assert!(
+            one_failure_score < CIRCUIT_OPEN_SCORE_PENALTY,
+            "A single post-recovery failure should not reopen the circuit"
+        );
+
+        for _ in 1..CONSECUTIVE_FAILURE_THRESHOLD {
+            stats.observe(bucket.clone(), Err(()));
+        }
+
+        let reopened_score = stats.score(Instant::now(), &bucket, 0);
+        assert_eq!(reopened_score, CIRCUIT_OPEN_SCORE_PENALTY);
     }
 
     #[test]
