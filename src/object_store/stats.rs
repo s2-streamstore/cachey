@@ -63,7 +63,7 @@ impl BucketStats {
         now: Instant,
         hedge_quantile: f64,
     ) -> LatencyMicrosSnapshot {
-        if now.duration_since(self.latency_micros_snapshot_at) > LATENCY_SNAPSHOT_THRESHOLD {
+        if now.duration_since(self.latency_micros_snapshot_at) >= LATENCY_SNAPSHOT_THRESHOLD {
             let new_snapshot = self.latency_micros_histogram.snapshot();
             let mean = new_snapshot.mean() as u64;
             let hedge = new_snapshot.value(hedge_quantile) as u64;
