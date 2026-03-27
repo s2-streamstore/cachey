@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.6](https://github.com/s2-streamstore/cachey/compare/0.10.5...0.10.6) - 2026-03-27
+
+### Fixed
+
+- refresh latency snapshot at threshold boundary ([#99](https://github.com/s2-streamstore/cachey/pull/99))
+
 ## [0.10.5](https://github.com/s2-streamstore/cachey/compare/0.10.4...0.10.5) - 2026-03-12
 
 ### Fixed
