@@ -63,7 +63,7 @@ impl BucketStats {
         now: Instant,
         hedge_quantile: f64,
     ) -> LatencyMicrosSnapshot {
-        if now.duration_since(self.latency_micros_snapshot_at) > LATENCY_SNAPSHOT_THRESHOLD {
+        if now.duration_since(self.latency_micros_snapshot_at) >= LATENCY_SNAPSHOT_THRESHOLD {
             let new_snapshot = self.latency_micros_histogram.snapshot();
             let mean = new_snapshot.mean() as u64;
             let hedge = new_snapshot.value(hedge_quantile) as u64;
@@ -462,6 +462,28 @@ mod tests {
         assert!(
             threshold3 > threshold2,
             "Snapshot should be updated: {threshold2:?} -> {threshold3:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_latency_snapshot_refreshes_at_exact_threshold() {
+        tokio::time::pause();
+
+        let stats = make_test_stats();
+        let bucket = BucketName::new("exact-threshold-bucket").unwrap();
+
+        stats.observe(bucket.clone(), Ok(Duration::from_millis(10)));
+        tokio::time::advance(LATENCY_SNAPSHOT_THRESHOLD + Duration::from_nanos(1)).await;
+
+        let threshold_before = stats.hedging_threshold(&bucket, Instant::now());
+
+        stats.observe(bucket.clone(), Ok(Duration::from_millis(1000)));
+        tokio::time::advance(LATENCY_SNAPSHOT_THRESHOLD).await;
+
+        let threshold_after = stats.hedging_threshold(&bucket, Instant::now());
+        assert!(
+            threshold_after > threshold_before,
+            "Snapshot should refresh at the exact threshold: {threshold_before:?} -> {threshold_after:?}",
         );
     }
 
