@@ -627,6 +627,30 @@ async fn test_small_object_partial_range() {
 }
 
 #[tokio::test]
+async fn test_small_object_range_start_beyond_end_returns_416() {
+    let ctx = setup_test_server().await;
+
+    let test_data = Bytes::from(vec![42u8; 100 * 1024]);
+    let object_key = "small-object-range-beyond-end.bin";
+    upload_test_object(&ctx.s3_client, &ctx.bucket_name, object_key, test_data).await;
+
+    let start = PAGE_SIZE;
+    let end = PAGE_SIZE + 1000;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "{}/fetch/{}/{}",
+            ctx.server_url, &ctx.bucket_name, object_key
+        ))
+        .header("Range", format!("bytes={start}-{end}"))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 416);
+}
+
+#[tokio::test]
 async fn test_1kb_object() {
     let ctx = setup_test_server().await;
 
