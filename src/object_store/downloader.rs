@@ -44,7 +44,22 @@ impl DownloadError {
     }
 }
 
-fn map_get_object_error(req_range: &Range<u64>, error: GetObjectError) -> DownloadError {
+fn invalid_range_object_size(error: &aws_sdk_s3::error::SdkError<GetObjectError>) -> Option<u64> {
+    error
+        .raw_response()
+        .and_then(|response| response.headers().get("content-range"))
+        .and_then(ContentRange::parse)
+        .and_then(|content_range| match content_range {
+            ContentRange::Unsatisfied(range) => Some(range.complete_length),
+            ContentRange::Bytes(_) | ContentRange::UnboundBytes(_) => None,
+        })
+}
+
+fn map_get_object_error(
+    req_range: &Range<u64>,
+    object_size: Option<u64>,
+    error: GetObjectError,
+) -> DownloadError {
     match error {
         GetObjectError::InvalidObjectState(invalid_object_state) => {
             DownloadError::InvalidObjectState(invalid_object_state.message.unwrap_or_default())
@@ -53,7 +68,7 @@ fn map_get_object_error(req_range: &Range<u64>, error: GetObjectError) -> Downlo
         service_error if service_error.code() == Some("InvalidRange") => {
             DownloadError::RangeNotSatisfied {
                 requested: req_range.clone(),
-                object_size: None,
+                object_size,
             }
         }
         other => DownloadError::Unknown(format!("{other:?}")),
@@ -294,7 +309,14 @@ impl Downloader {
                 }
                 .await
             }
-            Err(e) => Err(map_get_object_error(req_range, e.into_service_error())),
+            Err(e) => {
+                let object_size = invalid_range_object_size(&e);
+                Err(map_get_object_error(
+                    req_range,
+                    object_size,
+                    e.into_service_error(),
+                ))
+            }
         };
 
         let observed_outcome = final_result.as_ref().map(|_| latency).map_err(|_| ());
@@ -497,10 +519,11 @@ mod tests {
                 .message("The requested range is not satisfiable")
                 .build(),
         );
-        let sdk_error = aws_sdk_s3::error::SdkError::service_error(
-            service_error,
-            HttpResponse::new(StatusCode::try_from(416).unwrap(), SdkBody::empty()),
-        );
+        let mut response = HttpResponse::new(StatusCode::try_from(416).unwrap(), SdkBody::empty());
+        response
+            .headers_mut()
+            .insert("content-range", "bytes */512");
+        let sdk_error = aws_sdk_s3::error::SdkError::service_error(service_error, response);
 
         let result = downloader
             .handle_result(
@@ -518,7 +541,7 @@ mod tests {
                 object_size,
             }) => {
                 assert_eq!(requested, req_range);
-                assert_eq!(object_size, None);
+                assert_eq!(object_size, Some(512));
             }
             other => panic!("Expected RangeNotSatisfied error, got {other:?}"),
         }
