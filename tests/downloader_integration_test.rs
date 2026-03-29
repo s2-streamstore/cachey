@@ -1,10 +1,10 @@
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
 use bytes::{Bytes, BytesMut};
 use cachey::{
-    object_store::{DownloadError, Downloader, RequestConfig},
+    object_store::{BucketMetrics, DownloadError, Downloader, RequestConfig},
     service::{PAGE_SIZE, SlidingThroughput},
     types::{BucketName, BucketNameSet, ObjectKey},
 };
@@ -72,6 +72,16 @@ async fn upload_test_object(client: &aws_sdk_s3::Client, bucket: &str, key: &str
 fn make_downloader(client: aws_sdk_s3::Client, hedge_quantile: f64) -> Downloader {
     let throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
     Downloader::new(client, hedge_quantile, throughput)
+}
+
+fn bucket_metrics(downloader: &Downloader, bucket: &BucketName) -> BucketMetrics {
+    let mut found = None;
+    downloader.observe_bucket_metrics(|name, metrics| {
+        if name == bucket {
+            found = Some(metrics.clone());
+        }
+    });
+    found.expect("bucket metrics should be recorded")
 }
 
 #[tokio::test]
@@ -282,6 +292,88 @@ async fn test_download_with_fallback_bucket() {
 
     assert_eq!(out.piece.data, test_data);
     assert_eq!(out.used_bucket_idx, 1);
+}
+
+#[tokio::test]
+async fn test_fallback_bucket_circuit_breaker_recovers_for_new_primary_failures() {
+    let ctx = setup_minio().await;
+    let downloader = make_downloader(ctx.client.clone(), 0.9);
+
+    let fallback_bucket_name = "recovery-fallback-bucket";
+    ctx.client
+        .create_bucket()
+        .bucket(fallback_bucket_name)
+        .send()
+        .await
+        .expect("Failed to create fallback bucket");
+
+    let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize + 200);
+    test_data.fill(17u8);
+    let test_data = test_data.freeze();
+    let object_key = "recovery-fallback-object.txt";
+    upload_test_object(
+        &ctx.client,
+        fallback_bucket_name,
+        object_key,
+        test_data.clone(),
+    )
+    .await;
+
+    let primary_bucket = BucketName::new(&ctx.bucket_name).unwrap();
+    let fallback_bucket = BucketName::new(fallback_bucket_name).unwrap();
+    let all_buckets =
+        BucketNameSet::new([primary_bucket.clone(), fallback_bucket.clone()].into_iter()).unwrap();
+    let primary_only = BucketNameSet::new(std::iter::once(primary_bucket.clone())).unwrap();
+    let key = ObjectKey::new(object_key).unwrap();
+    let range = Range {
+        start: 0,
+        end: test_data.len() as u64,
+    };
+
+    let mut circuit_breaker_open = false;
+    for _ in 0..10 {
+        let result = downloader
+            .download(
+                &primary_only,
+                key.clone(),
+                &range,
+                &RequestConfig::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(DownloadError::NoSuchKey)));
+        if bucket_metrics(&downloader, &primary_bucket).circuit_breaker_open {
+            circuit_breaker_open = true;
+            break;
+        }
+    }
+    assert!(
+        circuit_breaker_open,
+        "primary bucket circuit breaker should open after repeated failures"
+    );
+
+    let open_order = downloader
+        .download(&all_buckets, key.clone(), &range, &RequestConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(open_order.primary_bucket_idx, 1);
+    assert_eq!(open_order.secondary_bucket_idx, Some(0));
+    assert_eq!(open_order.used_bucket_idx, 1);
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    let recovered_metrics = bucket_metrics(&downloader, &primary_bucket);
+    assert!(!recovered_metrics.circuit_breaker_open);
+    assert_eq!(recovered_metrics.consecutive_failures, 0);
+
+    let primary_only_result = downloader
+        .download(&primary_only, key, &range, &RequestConfig::default())
+        .await;
+    assert!(matches!(primary_only_result, Err(DownloadError::NoSuchKey)));
+
+    let post_recovery_metrics = bucket_metrics(&downloader, &primary_bucket);
+    assert_eq!(post_recovery_metrics.consecutive_failures, 1);
+    assert!(!post_recovery_metrics.circuit_breaker_open);
 }
 
 #[tokio::test]

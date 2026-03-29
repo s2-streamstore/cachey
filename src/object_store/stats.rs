@@ -53,9 +53,12 @@ impl BucketStats {
         self.error_rate * (-ALPHA * elapsed).exp()
     }
 
-    fn is_circuit_open(&self, now: Instant) -> bool {
-        self.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD
-            && now.duration_since(self.last_failure_time) < RECOVERY_TIME
+    fn effective_consecutive_failures(&self, now: Instant) -> u32 {
+        if now.duration_since(self.last_failure_time) >= RECOVERY_TIME {
+            0
+        } else {
+            self.consecutive_failures
+        }
     }
 
     fn latency_micros_snapshot(
@@ -75,8 +78,8 @@ impl BucketStats {
 
     fn metrics(&mut self, now: Instant, hedge_quantile: f64) -> BucketMetrics {
         let error_rate = self.error_rate(now);
-        let circuit_breaker_open = self.is_circuit_open(now);
-        let consecutive_failures = self.consecutive_failures;
+        let consecutive_failures = self.effective_consecutive_failures(now);
+        let circuit_breaker_open = consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD;
         let latency_micros_snapshot = self.latency_micros_snapshot(now, hedge_quantile);
         let latency_mean = Duration::from_micros(latency_micros_snapshot.mean);
         let latency_hedge = Duration::from_micros(latency_micros_snapshot.hedge);
@@ -125,6 +128,7 @@ impl BucketedStats {
         let entry = self.by_bucket.entry(bucket).or_default();
         let mut stats = entry.lock();
 
+        stats.consecutive_failures = stats.effective_consecutive_failures(now);
         let decayed_error_rate = stats.error_rate(now);
         if let Ok(latency) = outcome {
             stats.error_rate = decayed_error_rate * (1.0 - ALPHA);
@@ -183,11 +187,12 @@ impl BucketedStats {
                     / 100;
 
                 // Calculate error component based on circuit breaker state
-                let err = if guard.is_circuit_open(now) {
-                    CIRCUIT_OPEN_SCORE_PENALTY
-                } else {
-                    (guard.error_rate(now) * ERROR_RATE_SCORE_MULTIPLIER).round() as u64
-                };
+                let err =
+                    if guard.effective_consecutive_failures(now) >= CONSECUTIVE_FAILURE_THRESHOLD {
+                        CIRCUIT_OPEN_SCORE_PENALTY
+                    } else {
+                        (guard.error_rate(now) * ERROR_RATE_SCORE_MULTIPLIER).round() as u64
+                    };
 
                 base + err + lat
             })
@@ -500,6 +505,94 @@ mod tests {
         }
         let now = Instant::now();
         assert_eq!(stats.score(now, &bucket, 0), CIRCUIT_OPEN_SCORE_PENALTY);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_single_failure_after_recovery_requires_full_threshold() {
+        tokio::time::pause();
+        let stats = make_test_stats();
+        let bucket = BucketName::new("recovery-threshold-bucket").unwrap();
+
+        for _ in 0..CONSECUTIVE_FAILURE_THRESHOLD {
+            stats.observe(bucket.clone(), Err(()));
+        }
+
+        tokio::time::advance(RECOVERY_TIME + Duration::from_secs(1)).await;
+
+        assert!(
+            stats.score(Instant::now(), &bucket, 0) < CIRCUIT_OPEN_SCORE_PENALTY,
+            "Circuit should close after recovery time"
+        );
+
+        let mut recovered_failures = None;
+        stats.export_bucket_metrics(|name, metrics| {
+            if name == &bucket {
+                recovered_failures = Some(metrics.consecutive_failures);
+            }
+        });
+        assert_eq!(
+            recovered_failures,
+            Some(0),
+            "Recovered buckets should expose a cleared failure streak"
+        );
+
+        stats.observe(bucket.clone(), Err(()));
+        assert!(
+            stats.score(Instant::now(), &bucket, 0) < CIRCUIT_OPEN_SCORE_PENALTY,
+            "A single post-recovery failure should not reopen the circuit"
+        );
+
+        let mut post_recovery_failures = None;
+        stats.export_bucket_metrics(|name, metrics| {
+            if name == &bucket {
+                post_recovery_failures = Some(metrics.consecutive_failures);
+            }
+        });
+        assert_eq!(
+            post_recovery_failures,
+            Some(1),
+            "A post-recovery failure should start a new failure streak"
+        );
+
+        for _ in 1..CONSECUTIVE_FAILURE_THRESHOLD {
+            stats.observe(bucket.clone(), Err(()));
+        }
+
+        assert_eq!(
+            stats.score(Instant::now(), &bucket, 0),
+            CIRCUIT_OPEN_SCORE_PENALTY
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_subthreshold_failures_expire_before_new_failure() {
+        tokio::time::pause();
+        let stats = make_test_stats();
+        let bucket = BucketName::new("stale-subthreshold-bucket").unwrap();
+
+        for _ in 0..(CONSECUTIVE_FAILURE_THRESHOLD - 1) {
+            stats.observe(bucket.clone(), Err(()));
+        }
+
+        tokio::time::advance(RECOVERY_TIME + Duration::from_secs(1)).await;
+
+        stats.observe(bucket.clone(), Err(()));
+        assert!(
+            stats.score(Instant::now(), &bucket, 0) < CIRCUIT_OPEN_SCORE_PENALTY,
+            "A stale sub-threshold streak should not contribute to a new circuit opening"
+        );
+
+        let mut effective_failures = None;
+        stats.export_bucket_metrics(|name, metrics| {
+            if name == &bucket {
+                effective_failures = Some(metrics.consecutive_failures);
+            }
+        });
+        assert_eq!(
+            effective_failures,
+            Some(1),
+            "A new failure after recovery should start a fresh streak"
+        );
     }
 
     #[test]
