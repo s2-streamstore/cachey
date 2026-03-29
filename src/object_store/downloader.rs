@@ -331,28 +331,51 @@ mod tests {
         Downloader::new(client, 0.9, throughput)
     }
 
+    fn make_get_object_output(
+        content_range: &str,
+        body: Vec<u8>,
+        last_modified: Option<DateTime>,
+    ) -> GetObjectOutput {
+        let mut builder = GetObjectOutput::builder()
+            .content_range(content_range)
+            .body(aws_sdk_s3::primitives::ByteStream::from(body));
+        if let Some(last_modified) = last_modified {
+            builder = builder.last_modified(last_modified);
+        }
+        builder.build()
+    }
+
+    async fn handle_test_result(
+        downloader: &Downloader,
+        bucket: BucketName,
+        req_range: &Range<u64>,
+        output: GetObjectOutput,
+    ) -> Result<ObjectPiece, DownloadError> {
+        downloader
+            .handle_result(
+                bucket,
+                req_range,
+                Ok(output),
+                Duration::from_millis(100),
+                None,
+            )
+            .await
+    }
+
     #[tokio::test]
     async fn test_handle_result_success() {
         let downloader = make_test_downloader();
         let bucket = BucketName::new("test-bucket").unwrap();
         let req_range = Range { start: 0, end: 10 };
 
-        // Create a mock successful response
         let test_data = b"0123456789";
-        let output = GetObjectOutput::builder()
-            .content_range("bytes 0-9/100")
-            .last_modified(DateTime::from_secs(1_234_567_890))
-            .body(aws_sdk_s3::primitives::ByteStream::from(test_data.to_vec()))
-            .build();
+        let output = make_get_object_output(
+            "bytes 0-9/100",
+            test_data.to_vec(),
+            Some(DateTime::from_secs(1_234_567_890)),
+        );
 
-        let result = downloader
-            .handle_result(
-                bucket.clone(),
-                &req_range,
-                Ok(output),
-                Duration::from_millis(100),
-                None,
-            )
+        let result = handle_test_result(&downloader, bucket.clone(), &req_range, output)
             .await
             .unwrap();
 
@@ -367,21 +390,9 @@ mod tests {
         let bucket = BucketName::new("test-bucket").unwrap();
         let req_range = Range { start: 10, end: 20 };
 
-        // Response with mismatched start byte
-        let output = GetObjectOutput::builder()
-            .content_range("bytes 0-9/100")
-            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 10]))
-            .build();
+        let output = make_get_object_output("bytes 0-9/100", vec![0; 10], None);
 
-        let result = downloader
-            .handle_result(
-                bucket.clone(),
-                &req_range,
-                Ok(output),
-                Duration::from_millis(100),
-                None,
-            )
-            .await;
+        let result = handle_test_result(&downloader, bucket.clone(), &req_range, output).await;
 
         match result {
             Err(DownloadError::RangeNotSatisfied {
@@ -409,20 +420,9 @@ mod tests {
         let bucket = BucketName::new("test-bucket").unwrap();
         let req_range = Range { start: 0, end: 10 };
 
-        let output = GetObjectOutput::builder()
-            .content_range("bytes 0-99/100")
-            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 100]))
-            .build();
+        let output = make_get_object_output("bytes 0-99/100", vec![0; 100], None);
 
-        let result = downloader
-            .handle_result(
-                bucket,
-                &req_range,
-                Ok(output),
-                Duration::from_millis(100),
-                None,
-            )
-            .await;
+        let result = handle_test_result(&downloader, bucket, &req_range, output).await;
 
         match result {
             Err(DownloadError::RangeNotSatisfied {
@@ -442,20 +442,13 @@ mod tests {
         let bucket = BucketName::new("test-bucket").unwrap();
         let req_range = Range { start: 0, end: 10 };
 
-        let output = GetObjectOutput::builder()
-            .content_range("bytes 0-4/5")
-            .last_modified(DateTime::from_secs(1_234_567_890))
-            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 5]))
-            .build();
+        let output = make_get_object_output(
+            "bytes 0-4/5",
+            vec![0; 5],
+            Some(DateTime::from_secs(1_234_567_890)),
+        );
 
-        let piece = downloader
-            .handle_result(
-                bucket,
-                &req_range,
-                Ok(output),
-                Duration::from_millis(100),
-                None,
-            )
+        let piece = handle_test_result(&downloader, bucket, &req_range, output)
             .await
             .expect("valid EOF truncation should be accepted");
 
