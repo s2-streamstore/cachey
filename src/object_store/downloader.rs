@@ -1,6 +1,9 @@
 use std::{ops::Range, sync::Arc, time::Duration};
 
-use aws_sdk_s3::operation::get_object::GetObjectOutput;
+use aws_sdk_s3::{
+    error::ProvideErrorMetadata,
+    operation::get_object::{GetObjectError, GetObjectOutput},
+};
 use bytes::Bytes;
 use http_content_range::ContentRange;
 use parking_lot::Mutex;
@@ -38,6 +41,37 @@ impl DownloadError {
             | Self::BodyStreaming(_)
             | Self::Unknown { .. } => true,
         }
+    }
+}
+
+fn invalid_range_object_size(error: &aws_sdk_s3::error::SdkError<GetObjectError>) -> Option<u64> {
+    error
+        .raw_response()
+        .and_then(|response| response.headers().get("content-range"))
+        .and_then(ContentRange::parse)
+        .and_then(|content_range| match content_range {
+            ContentRange::Unsatisfied(range) => Some(range.complete_length),
+            ContentRange::Bytes(_) | ContentRange::UnboundBytes(_) => None,
+        })
+}
+
+fn map_get_object_error(
+    req_range: &Range<u64>,
+    object_size: Option<u64>,
+    error: GetObjectError,
+) -> DownloadError {
+    match error {
+        GetObjectError::InvalidObjectState(invalid_object_state) => {
+            DownloadError::InvalidObjectState(invalid_object_state.message.unwrap_or_default())
+        }
+        GetObjectError::NoSuchKey(_) => DownloadError::NoSuchKey,
+        service_error if service_error.code() == Some("InvalidRange") => {
+            DownloadError::RangeNotSatisfied {
+                requested: req_range.clone(),
+                object_size,
+            }
+        }
+        other => DownloadError::Unknown(format!("{other:?}")),
     }
 }
 
@@ -278,15 +312,14 @@ impl Downloader {
                 }
                 .await
             }
-            Err(e) => Err(match e.into_service_error() {
-                aws_sdk_s3::operation::get_object::GetObjectError::InvalidObjectState(ios) => {
-                    DownloadError::InvalidObjectState(ios.message.unwrap_or_default())
-                }
-                aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(_) => {
-                    DownloadError::NoSuchKey
-                }
-                err => DownloadError::Unknown(format!("{err:?}")),
-            }),
+            Err(e) => {
+                let object_size = invalid_range_object_size(&e);
+                Err(map_get_object_error(
+                    req_range,
+                    object_size,
+                    e.into_service_error(),
+                ))
+            }
         };
 
         let observed_outcome = final_result.as_ref().map(|_| latency).map_err(|_| ());
@@ -312,7 +345,12 @@ impl Downloader {
 
 #[cfg(test)]
 mod tests {
-    use aws_sdk_s3::{operation::get_object::GetObjectOutput, primitives::DateTime};
+    use aws_sdk_s3::{
+        error::ErrorMetadata,
+        operation::get_object::{GetObjectError, GetObjectOutput},
+        primitives::{DateTime, SdkBody},
+    };
+    use aws_smithy_runtime_api::{client::orchestrator::HttpResponse, http::StatusCode};
     use bytes::Bytes;
 
     use super::*;
@@ -527,6 +565,49 @@ mod tests {
                 assert!(msg.contains("Expected 10 bytes, got 5"));
             }
             _ => panic!("Expected BodyStreaming error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_result_invalid_range_service_error() {
+        let downloader = make_test_downloader();
+        let bucket = BucketName::new("test-bucket").unwrap();
+        let req_range = Range {
+            start: 1024,
+            end: 2048,
+        };
+
+        let service_error = GetObjectError::generic(
+            ErrorMetadata::builder()
+                .code("InvalidRange")
+                .message("The requested range is not satisfiable")
+                .build(),
+        );
+        let mut response = HttpResponse::new(StatusCode::try_from(416).unwrap(), SdkBody::empty());
+        response
+            .headers_mut()
+            .insert("content-range", "bytes */512");
+        let sdk_error = aws_sdk_s3::error::SdkError::service_error(service_error, response);
+
+        let result = downloader
+            .handle_result(
+                bucket,
+                &req_range,
+                Err(sdk_error),
+                Duration::from_millis(100),
+                None,
+            )
+            .await;
+
+        match result {
+            Err(DownloadError::RangeNotSatisfied {
+                requested,
+                object_size,
+            }) => {
+                assert_eq!(requested, req_range);
+                assert_eq!(object_size, Some(512));
+            }
+            other => panic!("Expected RangeNotSatisfied error, got {other:?}"),
         }
     }
 

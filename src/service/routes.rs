@@ -27,6 +27,80 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 static C0_BUCKET_HEADER: HeaderName = HeaderName::from_static("c0-bucket");
 static C0_CONFIG_HEADER: HeaderName = HeaderName::from_static("c0-config");
 
+struct ChunkErrorResponse {
+    status_code: StatusCode,
+    metric_code: &'static str,
+    headers: HeaderMap,
+}
+
+impl ChunkErrorResponse {
+    fn from_error(chunk_idx: usize, error: &ServiceError) -> Self {
+        match error {
+            ServiceError::Download(DownloadError::NoSuchKey) => Self {
+                status_code: StatusCode::NOT_FOUND,
+                metric_code: "not_found",
+                headers: HeaderMap::new(),
+            },
+            ServiceError::Download(DownloadError::RangeNotSatisfied { object_size, .. }) => Self {
+                status_code: StatusCode::RANGE_NOT_SATISFIABLE,
+                metric_code: "range_not_satisfiable",
+                headers: range_not_satisfied_headers(*object_size),
+            },
+            ServiceError::ObjectSizeInconsistency { .. } => Self {
+                status_code: StatusCode::CONFLICT,
+                metric_code: "object_size_inconsistency",
+                headers: HeaderMap::new(),
+            },
+            err => {
+                warn!(?err, ?chunk_idx, "chunk failed");
+                Self {
+                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                    metric_code: "internal",
+                    headers: HeaderMap::new(),
+                }
+            }
+        }
+    }
+
+    fn observe_metrics(&self, kind: &ObjectKind, method: &axum::http::Method, chunk_idx: usize) {
+        metrics::fetch_request_count(
+            kind,
+            method,
+            &format!(
+                "failed:{}:{}",
+                if chunk_idx == 0 { "init" } else { "later" },
+                self.metric_code
+            ),
+        );
+    }
+
+    fn into_response(self, body: String) -> Response {
+        (self.status_code, self.headers, body).into_response()
+    }
+}
+
+fn range_not_satisfied_headers(object_size: Option<u64>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(object_size) = object_size {
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes */{object_size}")).expect("valid content-range"),
+        );
+    }
+    headers
+}
+
+fn on_chunk_error(
+    kind: &ObjectKind,
+    method: &axum::http::Method,
+    chunk_idx: usize,
+    error: &ServiceError,
+) -> ChunkErrorResponse {
+    let response = ChunkErrorResponse::from_error(chunk_idx, error);
+    response.observe_metrics(kind, method, chunk_idx);
+    response
+}
+
 #[derive(Debug)]
 pub struct RangeHeader(pub Range<u64>);
 
@@ -223,8 +297,8 @@ pub async fn fetch(
             headers.insert("c0-status", c0_status(chunk));
         }
         Err(e) => {
-            let code = on_chunk_error(&kind, &method, 0, e);
-            return (code, e.to_string()).into_response();
+            let error_response = on_chunk_error(&kind, &method, 0, e);
+            return error_response.into_response(e.to_string());
         }
     }
 
@@ -263,7 +337,7 @@ pub async fn fetch(
                 },
                 Err(err) => {
                     assert!(chunk_idx > 0, "first chunk cannot be an error since we peeked");
-                    on_chunk_error(&kind, &method, chunk_idx, &err);
+                    let _ = on_chunk_error(&kind, &method, chunk_idx, &err);
                     yield Err(err);
                     break;
                 },
@@ -386,41 +460,11 @@ pub async fn heap_flamegraph() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "jemalloc profiling not enabled")
 }
 
-fn on_chunk_error(
-    kind: &ObjectKind,
-    method: &axum::http::Method,
-    chunk_idx: usize,
-    e: &ServiceError,
-) -> StatusCode {
-    let (status_code, metric_code) = match e {
-        ServiceError::Download(DownloadError::NoSuchKey) => (StatusCode::NOT_FOUND, "not_found"),
-        ServiceError::Download(DownloadError::RangeNotSatisfied { .. }) => {
-            (StatusCode::RANGE_NOT_SATISFIABLE, "range_not_satisfiable")
-        }
-        ServiceError::ObjectSizeInconsistency { .. } => {
-            (StatusCode::CONFLICT, "object_size_inconsistency")
-        }
-        err => {
-            warn!(?err, ?chunk_idx, "chunk failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal")
-        }
-    };
-    metrics::fetch_request_count(
-        kind,
-        method,
-        &format!(
-            "failed:{}:{metric_code}",
-            if chunk_idx == 0 { "init" } else { "later" }
-        ),
-    );
-    status_code
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use axum::http::{HeaderValue, Method, Request};
+    use axum::http::{HeaderValue, Method, Request, header};
 
     use super::*;
 
@@ -458,6 +502,22 @@ mod tests {
         let config = parse_c0_config("ct=1000").await.unwrap();
         assert_eq!(config.connect_timeout, Some(Duration::from_millis(1000)));
         assert_eq!(config.read_timeout, None);
+    }
+
+    #[test]
+    fn test_chunk_error_response_includes_content_range_for_unsatisfied_range() {
+        let error = ServiceError::Download(DownloadError::RangeNotSatisfied {
+            requested: 128..256,
+            object_size: Some(512),
+        });
+
+        let response = ChunkErrorResponse::from_error(0, &error);
+
+        assert_eq!(response.status_code, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers.get(header::CONTENT_RANGE).unwrap(),
+            "bytes */512"
+        );
     }
 
     #[tokio::test]
