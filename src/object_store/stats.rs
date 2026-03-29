@@ -63,14 +63,6 @@ impl BucketStats {
         }
     }
 
-    fn reset_recovered_failures(&mut self, now: Instant) {
-        self.consecutive_failures = self.effective_consecutive_failures(now);
-    }
-
-    fn is_circuit_open(&self, now: Instant) -> bool {
-        self.effective_consecutive_failures(now) >= CONSECUTIVE_FAILURE_THRESHOLD
-    }
-
     fn latency_micros_snapshot(
         &mut self,
         now: Instant,
@@ -89,7 +81,7 @@ impl BucketStats {
     fn metrics(&mut self, now: Instant, hedge_quantile: f64) -> BucketMetrics {
         let error_rate = self.error_rate(now);
         let consecutive_failures = self.effective_consecutive_failures(now);
-        let circuit_breaker_open = self.is_circuit_open(now);
+        let circuit_breaker_open = consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD;
         let latency_micros_snapshot = self.latency_micros_snapshot(now, hedge_quantile);
         let latency_mean = Duration::from_micros(latency_micros_snapshot.mean);
         let latency_hedge = Duration::from_micros(latency_micros_snapshot.hedge);
@@ -138,7 +130,7 @@ impl BucketedStats {
         let entry = self.by_bucket.entry(bucket).or_default();
         let mut stats = entry.lock();
 
-        stats.reset_recovered_failures(now);
+        stats.consecutive_failures = stats.effective_consecutive_failures(now);
         let decayed_error_rate = stats.error_rate(now);
         if let Ok(latency) = outcome {
             stats.error_rate = decayed_error_rate * (1.0 - ALPHA);
@@ -185,6 +177,8 @@ impl BucketedStats {
             .get(bucket)
             .map_or(base + UNKNOWN_BUCKET_PENALTY, |s| {
                 let mut guard = s.lock();
+                let circuit_breaker_open =
+                    guard.effective_consecutive_failures(now) >= CONSECUTIVE_FAILURE_THRESHOLD;
 
                 // Calculate latency component: 1 point per 100 µs = 0.1 ms
                 // - S3 Express same-AZ: ~4ms → 40 points
@@ -197,7 +191,7 @@ impl BucketedStats {
                     / 100;
 
                 // Calculate error component based on circuit breaker state
-                let err = if guard.is_circuit_open(now) {
+                let err = if circuit_breaker_open {
                     CIRCUIT_OPEN_SCORE_PENALTY
                 } else {
                     (guard.error_rate(now) * ERROR_RATE_SCORE_MULTIPLIER).round() as u64
