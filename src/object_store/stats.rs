@@ -81,12 +81,13 @@ impl BucketStats {
     fn metrics(&mut self, now: Instant, hedge_quantile: f64) -> BucketMetrics {
         let error_rate = self.error_rate(now);
         let consecutive_failures = self.effective_consecutive_failures(now);
+        let circuit_breaker_open = consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD;
         let latency_micros_snapshot = self.latency_micros_snapshot(now, hedge_quantile);
         let latency_mean = Duration::from_micros(latency_micros_snapshot.mean);
         let latency_hedge = Duration::from_micros(latency_micros_snapshot.hedge);
         BucketMetrics {
             error_rate,
-            circuit_breaker_open: consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD,
+            circuit_breaker_open,
             consecutive_failures,
             latency_mean,
             latency_hedge,
