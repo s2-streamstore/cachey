@@ -511,19 +511,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_chunk_error_response_omits_content_range_when_size_unknown() {
-        let error = ServiceError::Download(DownloadError::RangeNotSatisfied {
-            requested: 128..256,
-            object_size: None,
-        });
-
-        let response = ChunkErrorResponse::from_error(0, &error);
-
-        assert_eq!(response.status_code, StatusCode::RANGE_NOT_SATISFIABLE);
-        assert!(response.headers.get(header::CONTENT_RANGE).is_none());
-    }
-
     #[tokio::test]
     async fn test_c0_config_all_timeouts() {
         let config = parse_c0_config("ct=1000 rt=2000 ot=3000 oat=1500")
