@@ -437,6 +437,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_result_accepts_truncated_at_eof() {
+        let downloader = make_test_downloader();
+        let bucket = BucketName::new("test-bucket").unwrap();
+        let req_range = Range { start: 0, end: 10 };
+
+        let output = GetObjectOutput::builder()
+            .content_range("bytes 0-4/5")
+            .last_modified(DateTime::from_secs(1_234_567_890))
+            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 5]))
+            .build();
+
+        let piece = downloader
+            .handle_result(
+                bucket,
+                &req_range,
+                Ok(output),
+                Duration::from_millis(100),
+                None,
+            )
+            .await
+            .expect("valid EOF truncation should be accepted");
+
+        assert_eq!(piece.data, Bytes::from(vec![0; 5]));
+        assert_eq!(piece.object_size, 5);
+        assert_eq!(piece.mtime, 1_234_567_890);
+    }
+
+    #[tokio::test]
     async fn test_handle_result_no_such_key() {
         let downloader = make_test_downloader();
         let bucket = BucketName::new("test-bucket").unwrap();
