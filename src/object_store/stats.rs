@@ -54,9 +54,9 @@ impl BucketStats {
     }
 
     fn effective_consecutive_failures(&self, now: Instant) -> u32 {
-        let recovery_elapsed = self.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD
-            && now.duration_since(self.last_failure_time) >= RECOVERY_TIME;
-        if recovery_elapsed {
+        if self.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD
+            && now.duration_since(self.last_failure_time) >= RECOVERY_TIME
+        {
             0
         } else {
             self.consecutive_failures
@@ -81,13 +81,12 @@ impl BucketStats {
     fn metrics(&mut self, now: Instant, hedge_quantile: f64) -> BucketMetrics {
         let error_rate = self.error_rate(now);
         let consecutive_failures = self.effective_consecutive_failures(now);
-        let circuit_breaker_open = consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD;
         let latency_micros_snapshot = self.latency_micros_snapshot(now, hedge_quantile);
         let latency_mean = Duration::from_micros(latency_micros_snapshot.mean);
         let latency_hedge = Duration::from_micros(latency_micros_snapshot.hedge);
         BucketMetrics {
             error_rate,
-            circuit_breaker_open,
+            circuit_breaker_open: consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD,
             consecutive_failures,
             latency_mean,
             latency_hedge,
@@ -177,8 +176,6 @@ impl BucketedStats {
             .get(bucket)
             .map_or(base + UNKNOWN_BUCKET_PENALTY, |s| {
                 let mut guard = s.lock();
-                let circuit_breaker_open =
-                    guard.effective_consecutive_failures(now) >= CONSECUTIVE_FAILURE_THRESHOLD;
 
                 // Calculate latency component: 1 point per 100 µs = 0.1 ms
                 // - S3 Express same-AZ: ~4ms → 40 points
@@ -191,11 +188,12 @@ impl BucketedStats {
                     / 100;
 
                 // Calculate error component based on circuit breaker state
-                let err = if circuit_breaker_open {
-                    CIRCUIT_OPEN_SCORE_PENALTY
-                } else {
-                    (guard.error_rate(now) * ERROR_RATE_SCORE_MULTIPLIER).round() as u64
-                };
+                let err =
+                    if guard.effective_consecutive_failures(now) >= CONSECUTIVE_FAILURE_THRESHOLD {
+                        CIRCUIT_OPEN_SCORE_PENALTY
+                    } else {
+                        (guard.error_rate(now) * ERROR_RATE_SCORE_MULTIPLIER).round() as u64
+                    };
 
                 base + err + lat
             })
@@ -522,9 +520,8 @@ mod tests {
 
         tokio::time::advance(RECOVERY_TIME + Duration::from_secs(1)).await;
 
-        let recovered_score = stats.score(Instant::now(), &bucket, 0);
         assert!(
-            recovered_score < CIRCUIT_OPEN_SCORE_PENALTY,
+            stats.score(Instant::now(), &bucket, 0) < CIRCUIT_OPEN_SCORE_PENALTY,
             "Circuit should close after recovery time"
         );
 
@@ -541,9 +538,8 @@ mod tests {
         );
 
         stats.observe(bucket.clone(), Err(()));
-        let one_failure_score = stats.score(Instant::now(), &bucket, 0);
         assert!(
-            one_failure_score < CIRCUIT_OPEN_SCORE_PENALTY,
+            stats.score(Instant::now(), &bucket, 0) < CIRCUIT_OPEN_SCORE_PENALTY,
             "A single post-recovery failure should not reopen the circuit"
         );
 
@@ -563,8 +559,10 @@ mod tests {
             stats.observe(bucket.clone(), Err(()));
         }
 
-        let reopened_score = stats.score(Instant::now(), &bucket, 0);
-        assert_eq!(reopened_score, CIRCUIT_OPEN_SCORE_PENALTY);
+        assert_eq!(
+            stats.score(Instant::now(), &bucket, 0),
+            CIRCUIT_OPEN_SCORE_PENALTY
+        );
     }
 
     #[test]
