@@ -419,12 +419,29 @@ mod tests {
         if requested_start >= object_size {
             let mut headers = HeaderMap::new();
             headers.insert(
+                http::header::CONTENT_TYPE,
+                "application/xml".parse().expect("content-type"),
+            );
+            headers.insert(
                 http::header::CONTENT_RANGE,
                 format!("bytes */{object_size}")
                     .parse()
                     .expect("content-range"),
             );
-            return (StatusCode::RANGE_NOT_SATISFIABLE, headers, Bytes::new());
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                headers,
+                Bytes::from_static(
+                    concat!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                        "<Error>",
+                        "<Code>InvalidRange</Code>",
+                        "<Message>The requested range is not satisfiable</Message>",
+                        "</Error>",
+                    )
+                    .as_bytes(),
+                ),
+            );
         }
 
         let response_end = requested_end.min(object_size.saturating_sub(1));
@@ -472,6 +489,33 @@ mod tests {
             axum::serve(listener, app).await.expect("serve mock s3");
         });
         (endpoint, request_count, handle)
+    }
+
+    async fn spawn_cachey_server(s3: aws_sdk_s3::Client) -> (String, tokio::task::JoinHandle<()>) {
+        let cachey = CacheyService::new(
+            ServiceConfig {
+                cache: CacheConfig {
+                    memory_size: ByteSize::mib(16),
+                    disk_cache: None,
+                    metrics_registry: None,
+                },
+                hedge_quantile: 0.99,
+            },
+            s3,
+            axum_server::Handle::new(),
+        )
+        .await
+        .expect("cachey service");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cachey");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, cachey.into_router())
+                .await
+                .expect("serve cachey");
+        });
+        (endpoint, handle)
     }
 
     fn mock_s3_client(endpoint: &str) -> aws_sdk_s3::Client {
@@ -633,5 +677,39 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_content_range_for_unsatisfied_range_when_size_is_known() {
+        let object = ObjectKey::new(unique_name("object")).expect("object");
+        let bucket = BucketName::new(unique_name("bucket")).expect("bucket");
+        let object_data = Bytes::from(vec![7_u8; 4096]);
+
+        let (s3_endpoint, _, mock_s3_handle) =
+            spawn_mock_s3_server(&bucket, &object, object_data.clone(), Duration::ZERO).await;
+        let (cachey_endpoint, cachey_handle) =
+            spawn_cachey_server(mock_s3_client(&s3_endpoint)).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{cachey_endpoint}/fetch/{bucket}/{object}"))
+            .header("Range", format!("bytes={}-{}", PAGE_SIZE, PAGE_SIZE + 1023))
+            .send()
+            .await
+            .expect("fetch request");
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .unwrap(),
+            &format!("bytes */{}", object_data.len())
+        );
+
+        cachey_handle.abort();
+        mock_s3_handle.abort();
     }
 }
