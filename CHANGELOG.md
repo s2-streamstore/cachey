@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.6](https://github.com/s2-streamstore/cachey/compare/0.10.5...0.10.6) - 2026-03-29
+
+### Fixed
+
+- return 416 for invalid S3 ranges ([#102](https://github.com/s2-streamstore/cachey/pull/102))
+- reject oversized Content-Range responses ([#101](https://github.com/s2-streamstore/cachey/pull/101))
+- reset circuit breaker failures after recovery ([#100](https://github.com/s2-streamstore/cachey/pull/100))
+- refresh latency snapshot at threshold boundary ([#99](https://github.com/s2-streamstore/cachey/pull/99))
+
 ## [0.10.5](https://github.com/s2-streamstore/cachey/compare/0.10.4...0.10.5) - 2026-03-12
 
 ### Fixed
