@@ -90,6 +90,17 @@ fn range_not_satisfied_headers(object_size: Option<u64>) -> HeaderMap {
     headers
 }
 
+fn on_chunk_error(
+    kind: &ObjectKind,
+    method: &axum::http::Method,
+    chunk_idx: usize,
+    error: &ServiceError,
+) -> ChunkErrorResponse {
+    let response = ChunkErrorResponse::from_error(chunk_idx, error);
+    response.observe_metrics(kind, method, chunk_idx);
+    response
+}
+
 #[derive(Debug)]
 pub struct RangeHeader(pub Range<u64>);
 
@@ -286,8 +297,7 @@ pub async fn fetch(
             headers.insert("c0-status", c0_status(chunk));
         }
         Err(e) => {
-            let error_response = ChunkErrorResponse::from_error(0, e);
-            error_response.observe_metrics(&kind, &method, 0);
+            let error_response = on_chunk_error(&kind, &method, 0, e);
             return error_response.into_response(e.to_string());
         }
     }
@@ -327,8 +337,7 @@ pub async fn fetch(
                 },
                 Err(err) => {
                     assert!(chunk_idx > 0, "first chunk cannot be an error since we peeked");
-                    let error_response = ChunkErrorResponse::from_error(chunk_idx, &err);
-                    error_response.observe_metrics(&kind, &method, chunk_idx);
+                    let _ = on_chunk_error(&kind, &method, chunk_idx, &err);
                     yield Err(err);
                     break;
                 },
