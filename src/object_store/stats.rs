@@ -54,9 +54,7 @@ impl BucketStats {
     }
 
     fn effective_consecutive_failures(&self, now: Instant) -> u32 {
-        if self.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD
-            && now.duration_since(self.last_failure_time) >= RECOVERY_TIME
-        {
+        if now.duration_since(self.last_failure_time) >= RECOVERY_TIME {
             0
         } else {
             self.consecutive_failures
@@ -563,6 +561,37 @@ mod tests {
         assert_eq!(
             stats.score(Instant::now(), &bucket, 0),
             CIRCUIT_OPEN_SCORE_PENALTY
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_subthreshold_failures_expire_before_new_failure() {
+        tokio::time::pause();
+        let stats = make_test_stats();
+        let bucket = BucketName::new("stale-subthreshold-bucket").unwrap();
+
+        for _ in 0..(CONSECUTIVE_FAILURE_THRESHOLD - 1) {
+            stats.observe(bucket.clone(), Err(()));
+        }
+
+        tokio::time::advance(RECOVERY_TIME + Duration::from_secs(1)).await;
+
+        stats.observe(bucket.clone(), Err(()));
+        assert!(
+            stats.score(Instant::now(), &bucket, 0) < CIRCUIT_OPEN_SCORE_PENALTY,
+            "A stale sub-threshold streak should not contribute to a new circuit opening"
+        );
+
+        let mut effective_failures = None;
+        stats.export_bucket_metrics(|name, metrics| {
+            if name == &bucket {
+                effective_failures = Some(metrics.consecutive_failures);
+            }
+        });
+        assert_eq!(
+            effective_failures,
+            Some(1),
+            "A new failure after recovery should start a fresh streak"
         );
     }
 
