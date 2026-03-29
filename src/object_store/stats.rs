@@ -53,17 +53,22 @@ impl BucketStats {
         self.error_rate * (-ALPHA * elapsed).exp()
     }
 
-    fn reset_recovered_failures(&mut self, now: Instant) {
+    fn effective_consecutive_failures(&self, now: Instant) -> u32 {
         let recovery_elapsed = self.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD
             && now.duration_since(self.last_failure_time) >= RECOVERY_TIME;
         if recovery_elapsed {
-            self.consecutive_failures = 0;
+            0
+        } else {
+            self.consecutive_failures
         }
     }
 
+    fn reset_recovered_failures(&mut self, now: Instant) {
+        self.consecutive_failures = self.effective_consecutive_failures(now);
+    }
+
     fn is_circuit_open(&self, now: Instant) -> bool {
-        self.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD
-            && now.duration_since(self.last_failure_time) < RECOVERY_TIME
+        self.effective_consecutive_failures(now) >= CONSECUTIVE_FAILURE_THRESHOLD
     }
 
     fn latency_micros_snapshot(
@@ -82,10 +87,9 @@ impl BucketStats {
     }
 
     fn metrics(&mut self, now: Instant, hedge_quantile: f64) -> BucketMetrics {
-        self.reset_recovered_failures(now);
         let error_rate = self.error_rate(now);
+        let consecutive_failures = self.effective_consecutive_failures(now);
         let circuit_breaker_open = self.is_circuit_open(now);
-        let consecutive_failures = self.consecutive_failures;
         let latency_micros_snapshot = self.latency_micros_snapshot(now, hedge_quantile);
         let latency_mean = Duration::from_micros(latency_micros_snapshot.mean);
         let latency_hedge = Duration::from_micros(latency_micros_snapshot.hedge);
@@ -181,7 +185,6 @@ impl BucketedStats {
             .get(bucket)
             .map_or(base + UNKNOWN_BUCKET_PENALTY, |s| {
                 let mut guard = s.lock();
-                guard.reset_recovered_failures(now);
 
                 // Calculate latency component: 1 point per 100 µs = 0.1 ms
                 // - S3 Express same-AZ: ~4ms → 40 points
@@ -525,11 +528,10 @@ mod tests {
 
         tokio::time::advance(RECOVERY_TIME + Duration::from_secs(1)).await;
 
-        stats.observe(bucket.clone(), Err(()));
-        let one_failure_score = stats.score(Instant::now(), &bucket, 0);
+        let recovered_score = stats.score(Instant::now(), &bucket, 0);
         assert!(
-            one_failure_score < CIRCUIT_OPEN_SCORE_PENALTY,
-            "A single post-recovery failure should not reopen the circuit"
+            recovered_score < CIRCUIT_OPEN_SCORE_PENALTY,
+            "Circuit should close after recovery time"
         );
 
         let mut recovered_failures = None;
@@ -540,6 +542,25 @@ mod tests {
         });
         assert_eq!(
             recovered_failures,
+            Some(0),
+            "Recovered buckets should expose a cleared failure streak"
+        );
+
+        stats.observe(bucket.clone(), Err(()));
+        let one_failure_score = stats.score(Instant::now(), &bucket, 0);
+        assert!(
+            one_failure_score < CIRCUIT_OPEN_SCORE_PENALTY,
+            "A single post-recovery failure should not reopen the circuit"
+        );
+
+        let mut post_recovery_failures = None;
+        stats.export_bucket_metrics(|name, metrics| {
+            if name == &bucket {
+                post_recovery_failures = Some(metrics.consecutive_failures);
+            }
+        });
+        assert_eq!(
+            post_recovery_failures,
             Some(1),
             "A post-recovery failure should start a new failure streak"
         );
