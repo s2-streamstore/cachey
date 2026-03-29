@@ -216,15 +216,18 @@ impl Downloader {
                 async {
                     let content_range = match output.content_range().and_then(ContentRange::parse) {
                         Some(ContentRange::Bytes(rsp_range)) => {
+                            let requested_last_byte = req_range.end - 1;
                             if rsp_range.first_byte != req_range.start {
                                 return Err(DownloadError::RangeNotSatisfied {
                                     requested: req_range.clone(),
                                     object_size: Some(rsp_range.complete_length),
                                 });
                             }
-                            if rsp_range.last_byte != (req_range.end - 1)
-                                && rsp_range.last_byte != (rsp_range.complete_length - 1)
-                            {
+                            let is_exact_range_match = rsp_range.last_byte == requested_last_byte;
+                            let is_truncated_at_eof = rsp_range.last_byte < requested_last_byte
+                                && rsp_range.last_byte
+                                    == rsp_range.complete_length.saturating_sub(1);
+                            if !is_exact_range_match && !is_truncated_at_eof {
                                 return Err(DownloadError::RangeNotSatisfied {
                                     requested: req_range.clone(),
                                     object_size: Some(rsp_range.complete_length),
@@ -398,6 +401,67 @@ mod tests {
             }
         });
         assert!(metrics_checked);
+    }
+
+    #[tokio::test]
+    async fn test_handle_result_rejects_oversized_response_ending_at_object_eof() {
+        let downloader = make_test_downloader();
+        let bucket = BucketName::new("test-bucket").unwrap();
+        let req_range = Range { start: 0, end: 10 };
+
+        let output = GetObjectOutput::builder()
+            .content_range("bytes 0-99/100")
+            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 100]))
+            .build();
+
+        let result = downloader
+            .handle_result(
+                bucket,
+                &req_range,
+                Ok(output),
+                Duration::from_millis(100),
+                None,
+            )
+            .await;
+
+        match result {
+            Err(DownloadError::RangeNotSatisfied {
+                requested,
+                object_size,
+            }) => {
+                assert_eq!(requested, req_range);
+                assert_eq!(object_size, Some(100));
+            }
+            other => panic!("Expected RangeNotSatisfied error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_result_accepts_truncated_at_eof() {
+        let downloader = make_test_downloader();
+        let bucket = BucketName::new("test-bucket").unwrap();
+        let req_range = Range { start: 0, end: 10 };
+
+        let output = GetObjectOutput::builder()
+            .content_range("bytes 0-4/5")
+            .last_modified(DateTime::from_secs(1_234_567_890))
+            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 5]))
+            .build();
+
+        let piece = downloader
+            .handle_result(
+                bucket,
+                &req_range,
+                Ok(output),
+                Duration::from_millis(100),
+                None,
+            )
+            .await
+            .expect("valid EOF truncation should be accepted");
+
+        assert_eq!(piece.data, Bytes::from(vec![0; 5]));
+        assert_eq!(piece.object_size, 5);
+        assert_eq!(piece.mtime, 1_234_567_890);
     }
 
     #[tokio::test]
