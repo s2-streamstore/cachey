@@ -1,58 +1,28 @@
+mod common;
+
 use std::time::Duration;
 
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::Credentials;
 use bytes::{Bytes, BytesMut};
 use bytesize::ByteSize;
 use cachey::{
     cache::CacheConfig,
     service::{CacheyService, PAGE_SIZE, ServiceConfig},
 };
+use common::RustfsTestContext;
 use http_body_util::BodyExt;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
-use testcontainers_modules::minio::MinIO;
 use tokio::net::TcpListener;
 
 struct TestContext {
-    _container: ContainerAsync<MinIO>,
+    _rustfs: RustfsTestContext,
     s3_client: aws_sdk_s3::Client,
     bucket_name: String,
     server_url: String,
 }
 
 async fn setup_test_server() -> TestContext {
-    let container = MinIO::default()
-        .start()
-        .await
-        .expect("Failed to start MinIO container");
-
-    let host_port = container
-        .get_host_port_ipv4(9000)
-        .await
-        .expect("Failed to get host port");
-
-    let endpoint = format!("http://127.0.0.1:{host_port}");
-
-    let creds = Credentials::new("minioadmin", "minioadmin", None, None, "test");
-
-    let s3_config = aws_sdk_s3::Config::builder()
-        .behavior_version(BehaviorVersion::latest())
-        .credentials_provider(creds)
-        .endpoint_url(&endpoint)
-        .force_path_style(true)
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .build();
-
-    let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-
-    let bucket_name = "test-bucket";
-    s3_client
-        .create_bucket()
-        .bucket(bucket_name)
-        .send()
-        .await
-        .expect("Failed to create bucket");
-
+    let rustfs = common::setup_rustfs().await;
+    let s3_client = rustfs.client.clone();
+    let bucket_name = rustfs.bucket_name.clone();
     let service_config = ServiceConfig {
         cache: CacheConfig {
             memory_size: ByteSize::mib(256),
@@ -84,7 +54,7 @@ async fn setup_test_server() -> TestContext {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     TestContext {
-        _container: container,
+        _rustfs: rustfs,
         s3_client,
         bucket_name: bucket_name.to_string(),
         server_url,
