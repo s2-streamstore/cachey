@@ -1,62 +1,15 @@
+mod common;
+
 use std::{ops::Range, sync::Arc, time::Duration};
 
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::Credentials;
 use bytes::{Bytes, BytesMut};
 use cachey::{
     object_store::{BucketMetrics, DownloadError, Downloader, RequestConfig},
     service::{PAGE_SIZE, SlidingThroughput},
     types::{BucketName, BucketNameSet, ObjectKey},
 };
+use common::setup_rustfs;
 use parking_lot::Mutex;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
-use testcontainers_modules::minio::MinIO;
-
-struct MinioTestContext {
-    _container: ContainerAsync<MinIO>,
-    client: aws_sdk_s3::Client,
-    bucket_name: String,
-}
-
-async fn setup_minio() -> MinioTestContext {
-    let container = MinIO::default()
-        .start()
-        .await
-        .expect("Failed to start MinIO container");
-
-    let host_port = container
-        .get_host_port_ipv4(9000)
-        .await
-        .expect("Failed to get host port");
-
-    let endpoint = format!("http://127.0.0.1:{host_port}");
-
-    let creds = Credentials::new("minioadmin", "minioadmin", None, None, "test");
-
-    let config = aws_sdk_s3::Config::builder()
-        .behavior_version(BehaviorVersion::latest())
-        .credentials_provider(creds)
-        .endpoint_url(&endpoint)
-        .force_path_style(true)
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .build();
-
-    let client = aws_sdk_s3::Client::from_conf(config);
-
-    let bucket_name = "test-bucket";
-    client
-        .create_bucket()
-        .bucket(bucket_name)
-        .send()
-        .await
-        .expect("Failed to create bucket");
-
-    MinioTestContext {
-        _container: container,
-        client,
-        bucket_name: bucket_name.to_string(),
-    }
-}
 
 async fn upload_test_object(client: &aws_sdk_s3::Client, bucket: &str, key: &str, data: Bytes) {
     client
@@ -86,7 +39,7 @@ fn bucket_metrics(downloader: &Downloader, bucket: &BucketName) -> BucketMetrics
 
 #[tokio::test]
 async fn test_download_full_object() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize + 100);
@@ -118,7 +71,7 @@ async fn test_download_full_object() {
 
 #[tokio::test]
 async fn test_download_partial_range() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     // Create a large object to work with PAGE_SIZE
@@ -154,7 +107,7 @@ async fn test_download_partial_range() {
 
 #[tokio::test]
 async fn test_download_no_such_key() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     let bucket = BucketName::new(&ctx.bucket_name).unwrap();
@@ -178,7 +131,7 @@ async fn test_download_no_such_key() {
 
 #[tokio::test]
 async fn test_download_range_not_satisfied() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     // Create a small object
@@ -212,7 +165,7 @@ async fn test_download_range_not_satisfied() {
 
 #[tokio::test]
 async fn test_download_page_sized_range_from_small_object() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     // Create a small object (100 bytes)
@@ -244,7 +197,7 @@ async fn test_download_page_sized_range_from_small_object() {
 
 #[tokio::test]
 async fn test_download_with_fallback_bucket() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     // Create a second bucket for fallback
@@ -296,7 +249,7 @@ async fn test_download_with_fallback_bucket() {
 
 #[tokio::test]
 async fn test_fallback_bucket_circuit_breaker_recovers_for_new_primary_failures() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     let fallback_bucket_name = "recovery-fallback-bucket";
@@ -378,7 +331,7 @@ async fn test_fallback_bucket_circuit_breaker_recovers_for_new_primary_failures(
 
 #[tokio::test]
 async fn test_download_multiple_ranges_same_object() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize);
@@ -418,7 +371,7 @@ async fn test_download_multiple_ranges_same_object() {
 
 #[tokio::test]
 async fn test_download_with_hedged_requests() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
 
     // Lower quantile for more aggressive hedging
     let downloader = make_downloader(ctx.client.clone(), 0.5);
@@ -455,7 +408,7 @@ async fn test_download_with_hedged_requests() {
 #[tokio::test]
 #[should_panic(expected = "assertion failed")]
 async fn test_download_empty_range() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     let bucket = BucketName::new(&ctx.bucket_name).unwrap();
@@ -474,7 +427,7 @@ async fn test_download_empty_range() {
 
 #[tokio::test]
 async fn test_download_last_byte() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     let mut test_data = BytesMut::zeroed(1024);
@@ -507,7 +460,7 @@ async fn test_download_last_byte() {
 
 #[tokio::test]
 async fn test_small_object_full_range() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     let test_data = b"Hello, this is a small test object!";
@@ -543,7 +496,7 @@ async fn test_small_object_full_range() {
 
 #[tokio::test]
 async fn test_small_object_partial_range() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     let test_data = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -576,7 +529,7 @@ async fn test_small_object_partial_range() {
 
 #[tokio::test]
 async fn test_1kb_object() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     let mut test_data = BytesMut::zeroed(1024);
@@ -609,7 +562,7 @@ async fn test_1kb_object() {
 
 #[tokio::test]
 async fn test_100kb_object_partial_range() {
-    let ctx = setup_minio().await;
+    let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
     let mut test_data = BytesMut::zeroed(100 * 1024);

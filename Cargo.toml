@@ -59,8 +59,7 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http2", 
 proptest = "1.10"
 reqwest = { version = "0.13", features = ["json"] }
 serde_json = "1.0"
-testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["minio"] }
+testcontainers = { version = "0.27", features = ["http_wait"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
