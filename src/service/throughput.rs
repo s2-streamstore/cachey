@@ -103,7 +103,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bps_is_zero_initially() {
         let mut t = SlidingThroughput::<60>::default();
-        assert_close(t.bps(Duration::from_secs(60)), 0.0);
+        assert_close(t.bps(Duration::from_mins(1)), 0.0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -112,17 +112,17 @@ mod tests {
 
         // t = 0ms
         t.record(1_000);
-        assert_close(t.bps(Duration::from_secs(60)), 0.0);
+        assert_close(t.bps(Duration::from_mins(1)), 0.0);
 
-        tokio::time::advance(Duration::from_millis(1_000)).await;
-        assert_close(t.bps(Duration::from_secs(60)), 1_000.0 / 60.0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_close(t.bps(Duration::from_mins(1)), 1_000.0 / 60.0);
 
         tokio::time::advance(Duration::from_millis(400)).await;
         t.record(500);
-        assert_close(t.bps(Duration::from_secs(60)), 1_000.0 / 60.0);
+        assert_close(t.bps(Duration::from_mins(1)), 1_000.0 / 60.0);
 
         tokio::time::advance(Duration::from_millis(600)).await;
-        assert_close(t.bps(Duration::from_secs(60)), 1_500.0 / 60.0);
+        assert_close(t.bps(Duration::from_mins(1)), 1_500.0 / 60.0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -133,34 +133,34 @@ mod tests {
         t.record(1_000);
 
         // Move to bucket 1 and add more
-        tokio::time::advance(Duration::from_millis(1_000)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         t.record(500);
-        tokio::time::advance(Duration::from_millis(1_000)).await;
-        assert_close(t.bps(Duration::from_secs(60)), 1_500.0 / 60.0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_close(t.bps(Duration::from_mins(1)), 1_500.0 / 60.0);
 
         // After exactly 60s from start, bucket 0 is still within the window
-        tokio::time::advance(Duration::from_millis(58_000)).await; // total 60_000ms
-        assert_close(t.bps(Duration::from_secs(60)), 1_500.0 / 60.0);
+        tokio::time::advance(Duration::from_secs(58)).await; // total 60_000ms
+        assert_close(t.bps(Duration::from_mins(1)), 1_500.0 / 60.0);
 
         // After 61s from start, bucket 0 falls out but bucket 1 remains
-        tokio::time::advance(Duration::from_millis(1_000)).await;
-        assert_close(t.bps(Duration::from_secs(60)), 500.0 / 60.0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_close(t.bps(Duration::from_mins(1)), 500.0 / 60.0);
 
         // After another 1s, bucket 1 also evicted -> zero
-        tokio::time::advance(Duration::from_millis(1_000)).await;
-        assert_close(t.bps(Duration::from_secs(60)), 0.0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_close(t.bps(Duration::from_mins(1)), 0.0);
     }
 
     #[tokio::test(start_paused = true)]
     async fn long_gap_clears_all_buckets() {
         let mut t = SlidingThroughput::<60>::default();
         t.record(42_000);
-        tokio::time::advance(Duration::from_millis(1_000)).await;
-        assert_close(t.bps(Duration::from_secs(60)), 42_000.0 / 60.0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_close(t.bps(Duration::from_mins(1)), 42_000.0 / 60.0);
 
         // Advance by more than the full window (61s), which should clear everything
-        tokio::time::advance(Duration::from_millis(61_000)).await;
-        assert_close(t.bps(Duration::from_secs(60)), 0.0);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert_close(t.bps(Duration::from_mins(1)), 0.0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -168,14 +168,14 @@ mod tests {
         // Test with 10 buckets
         let mut t10 = SlidingThroughput::<10>::default();
         t10.record(1_000);
-        tokio::time::advance(Duration::from_millis(1_000)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         assert_close(t10.bps(Duration::from_secs(10)), 1_000.0 / 10.0);
 
         // Test with 120 buckets
         let mut t120 = SlidingThroughput::<120>::default();
         t120.record(2_000);
-        tokio::time::advance(Duration::from_millis(1_000)).await;
-        assert_close(t120.bps(Duration::from_secs(120)), 2_000.0 / 120.0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_close(t120.bps(Duration::from_mins(2)), 2_000.0 / 120.0);
 
         // Verify window clamping works correctly with different sizes
         assert_close(t10.bps(Duration::from_secs(20)), 1_000.0 / 20.0);
@@ -197,7 +197,7 @@ mod tests {
     async fn sub_second_lookback_clamps_to_one_second() {
         let mut t = SlidingThroughput::<60>::default();
         t.record(1_000);
-        tokio::time::advance(Duration::from_millis(1_000)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
 
         assert_close(t.bps(Duration::from_millis(500)), 1_000.0);
         assert_close(t.bps(Duration::from_secs(1)), 1_000.0);

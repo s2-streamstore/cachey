@@ -77,13 +77,13 @@ struct Args {
 
 fn parse_bytes(s: &str) -> Result<ByteSize, String> {
     s.parse::<ByteSize>().map_err(|e| {
-        format!("Invalid memory size: {e}. Use formats like '512MiB', '2GB', '1.5GiB'",)
+        format!("Invalid memory size: {e}. Use formats like '512MiB', '2GB', '1.5GiB'")
     })
 }
 
 fn parse_hedge_quantile(s: &str) -> Result<f64, String> {
     let value = s.parse::<f64>().map_err(|e| {
-        format!("Invalid hedge quantile: {e}. Must be a number between 0.0 and 1.0",)
+        format!("Invalid hedge quantile: {e}. Must be a number between 0.0 and 1.0")
     })?;
 
     if !(0.0..=1.0).contains(&value) {
