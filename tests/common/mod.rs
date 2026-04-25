@@ -22,7 +22,6 @@ pub async fn setup_rustfs() -> RustfsTestContext {
         .with_env_var("RUSTFS_ADDRESS", ":9000")
         .with_env_var("RUSTFS_ACCESS_KEY", "rustfsadmin")
         .with_env_var("RUSTFS_SECRET_KEY", "rustfsadmin")
-        .with_env_var("RUSTFS_CONSOLE_ENABLE", "true")
         .with_cmd(["/data"])
         .start()
         .await
