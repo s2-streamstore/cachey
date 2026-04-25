@@ -56,7 +56,7 @@ async fn setup_test_server() -> TestContext {
     TestContext {
         _rustfs: rustfs,
         s3_client,
-        bucket_name: bucket_name.to_string(),
+        bucket_name,
         server_url,
     }
 }
