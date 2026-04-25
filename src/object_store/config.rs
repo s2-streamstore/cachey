@@ -95,7 +95,7 @@ mod tests {
         let base = TimeoutConfig::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(30))
-            .operation_timeout(Duration::from_secs(60))
+            .operation_timeout(Duration::from_mins(1))
             .operation_attempt_timeout(Duration::from_secs(20))
             .build();
         let request = RequestConfig {
@@ -109,7 +109,7 @@ mod tests {
 
         assert_eq!(merged.connect_timeout(), Some(Duration::from_secs(5)));
         assert_eq!(merged.read_timeout(), Some(Duration::from_secs(30)));
-        assert_eq!(merged.operation_timeout(), Some(Duration::from_secs(60)));
+        assert_eq!(merged.operation_timeout(), Some(Duration::from_mins(1)));
         assert_eq!(
             merged.operation_attempt_timeout(),
             Some(Duration::from_secs(20))
@@ -131,7 +131,7 @@ mod tests {
         let base = RetryConfig::standard()
             .with_max_attempts(7)
             .with_initial_backoff(Duration::from_millis(250))
-            .with_max_backoff(Duration::from_secs(60));
+            .with_max_backoff(Duration::from_mins(1));
         let request = RequestConfig {
             max_attempts: Some(5),
             ..RequestConfig::default()
@@ -143,7 +143,7 @@ mod tests {
 
         assert_eq!(merged.max_attempts(), 5);
         assert_eq!(merged.initial_backoff(), Duration::from_millis(250));
-        assert_eq!(merged.max_backoff(), Duration::from_secs(60));
+        assert_eq!(merged.max_backoff(), Duration::from_mins(1));
     }
 
     #[test]

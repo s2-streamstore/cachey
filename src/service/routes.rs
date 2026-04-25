@@ -284,7 +284,7 @@ pub async fn fetch(
             );
             headers.insert(
                 header::CONTENT_RANGE,
-                HeaderValue::from_str(&format!("bytes {first_byte}-{last_byte}/{object_size}",))
+                HeaderValue::from_str(&format!("bytes {first_byte}-{last_byte}/{object_size}"))
                     .unwrap(),
             );
             headers.insert(
@@ -500,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn test_c0_config_single_timeout() {
         let config = parse_c0_config("ct=1000").await.unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_millis(1000)));
+        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
         assert_eq!(config.read_timeout, None);
     }
 
@@ -525,9 +525,9 @@ mod tests {
         let config = parse_c0_config("ct=1000 rt=2000 ot=3000 oat=1500")
             .await
             .unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_millis(1000)));
-        assert_eq!(config.read_timeout, Some(Duration::from_millis(2000)));
-        assert_eq!(config.operation_timeout, Some(Duration::from_millis(3000)));
+        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
+        assert_eq!(config.read_timeout, Some(Duration::from_secs(2)));
+        assert_eq!(config.operation_timeout, Some(Duration::from_secs(3)));
         assert_eq!(
             config.operation_attempt_timeout,
             Some(Duration::from_millis(1500))
@@ -538,7 +538,7 @@ mod tests {
     async fn test_c0_config_backoff_settings() {
         let config = parse_c0_config("ib=100 mb=5000 ma=3").await.unwrap();
         assert_eq!(config.initial_backoff, Some(Duration::from_millis(100)));
-        assert_eq!(config.max_backoff, Some(Duration::from_millis(5000)));
+        assert_eq!(config.max_backoff, Some(Duration::from_secs(5)));
         assert_eq!(config.max_attempts, Some(3));
     }
 
@@ -547,7 +547,7 @@ mod tests {
         let config = parse_c0_config("ct=1000 ma=5 ib=10 oat=1500")
             .await
             .unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_millis(1000)));
+        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
         assert_eq!(config.max_attempts, Some(5));
         assert_eq!(config.initial_backoff, Some(Duration::from_millis(10)));
         assert_eq!(
@@ -561,8 +561,8 @@ mod tests {
         let config = parse_c0_config("ct=1000 unknown=123 rt=2000")
             .await
             .unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_millis(1000)));
-        assert_eq!(config.read_timeout, Some(Duration::from_millis(2000)));
+        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
+        assert_eq!(config.read_timeout, Some(Duration::from_secs(2)));
     }
 
     #[tokio::test]

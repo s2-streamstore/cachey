@@ -141,7 +141,7 @@ impl CacheyService {
             &[
                 ("10s", egress_throughput.bps(Duration::from_secs(10))),
                 ("30s", egress_throughput.bps(Duration::from_secs(30))),
-                ("1m", egress_throughput.bps(Duration::from_secs(60))),
+                ("1m", egress_throughput.bps(Duration::from_mins(1))),
             ],
         );
 
@@ -151,7 +151,7 @@ impl CacheyService {
             &[
                 ("10s", ingress_throughput.bps(Duration::from_secs(10))),
                 ("30s", ingress_throughput.bps(Duration::from_secs(30))),
-                ("1m", ingress_throughput.bps(Duration::from_secs(60))),
+                ("1m", ingress_throughput.bps(Duration::from_mins(1))),
             ],
         );
 
