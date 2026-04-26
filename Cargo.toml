@@ -16,12 +16,12 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",
     "default-https-client",
 ] }
-aws-smithy-runtime-api = "1.11"
+aws-smithy-runtime-api = "1.12"
 axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 bytes = "1.11"
 bytesize = "2.3"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 compact_str = { version = "0.9", features = ["serde"] }
 crossbeam = "0.8"
 dashmap = "6.1"
@@ -56,7 +56,7 @@ jemalloc = ["dep:tikv-jemallocator", "dep:jemalloc_pprof", "dep:tikv-jemalloc-ct
 [dev-dependencies]
 hyper = "1"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http2", "tokio"] }
-proptest = "1.10"
+proptest = "1.11"
 reqwest = { version = "0.13", features = ["json"] }
 serde_json = "1.0"
 testcontainers = { version = "0.27", features = ["http_wait"] }
