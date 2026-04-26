@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.7](https://github.com/s2-streamstore/cachey/compare/0.10.6...0.10.7) - 2026-04-26
+
+### Other
+
+- dep updates ([#108](https://github.com/s2-streamstore/cachey/pull/108))
+- replace `MinIO` w/ `RustFS` ([#106](https://github.com/s2-streamstore/cachey/pull/106))
+- address clippy lints ([#107](https://github.com/s2-streamstore/cachey/pull/107))
+- upgrade and SHA-pin GitHub Actions dependencies ([#104](https://github.com/s2-streamstore/cachey/pull/104))
+
 ## [0.10.6](https://github.com/s2-streamstore/cachey/compare/0.10.5...0.10.6) - 2026-03-29
 
 ### Fixed
