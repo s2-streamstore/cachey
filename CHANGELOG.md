@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.8](https://github.com/s2-streamstore/cachey/compare/0.10.7...0.10.8) - 2026-05-10
+
+### Fixed
+
+- wait for hedged streaming peer ([#110](https://github.com/s2-streamstore/cachey/pull/110))
+
+### Other
+
+- dep updates ([#112](https://github.com/s2-streamstore/cachey/pull/112))
+
 ## [0.10.7](https://github.com/s2-streamstore/cachey/compare/0.10.6...0.10.7) - 2026-04-26
 
 ### Other
