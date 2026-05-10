@@ -39,7 +39,14 @@ impl DownloadError {
             Self::InvalidObjectState(_)
             | Self::NoSuchKey
             | Self::BodyStreaming(_)
-            | Self::Unknown { .. } => true,
+            | Self::Unknown(_) => true,
+        }
+    }
+
+    fn should_wait_for_hedged_peer(&self) -> bool {
+        match self {
+            Self::BodyStreaming(_) | Self::Unknown(_) => true,
+            Self::InvalidObjectState(_) | Self::NoSuchKey | Self::RangeNotSatisfied { .. } => false,
         }
     }
 }
@@ -186,8 +193,16 @@ impl Downloader {
                 let hedge_start_time = Instant::now();
                 let mut hedge_attempt = Box::pin(attempt_full(hedge_start_time, hedge_threshold));
                 select! {
-                    primary_result = &mut primary_attempt => primary_result,
-                    hedge_result = &mut hedge_attempt => hedge_result,
+                    primary_result = &mut primary_attempt => match primary_result {
+                        Ok(piece) => Ok(piece),
+                        Err(error) if error.should_wait_for_hedged_peer() => hedge_attempt.await,
+                        Err(error) => Err(error),
+                    },
+                    hedge_result = &mut hedge_attempt => match hedge_result {
+                        Ok(piece) => Ok(piece),
+                        Err(error) if error.should_wait_for_hedged_peer() => primary_attempt.await,
+                        Err(error) => Err(error),
+                    },
                 }
             }
         }
