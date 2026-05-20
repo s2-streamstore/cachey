@@ -10,6 +10,14 @@ build:
 clippy:
     cargo clippy --workspace --all-features --all-targets -- -D warnings --allow deprecated
 
+# Ensure cargo-deny is installed
+_ensure-deny:
+    @cargo deny --version > /dev/null 2>&1 || cargo install cargo-deny
+
+# Run cargo-deny checks
+deny *args: _ensure-deny
+    cargo deny check {{args}}
+
 # Format code with rustfmt
 fmt:
     cargo +nightly fmt
