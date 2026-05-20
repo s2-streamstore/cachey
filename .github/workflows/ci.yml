@@ -45,6 +45,22 @@ jobs:
       - name: Verify Cargo.lock is up-to-date
         run: cargo metadata --locked --format-version 1 >/dev/null
 
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Run cargo-deny
+        run: cargo deny check
+
   test:
     name: tests
     runs-on: ubuntu-latest
