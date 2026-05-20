@@ -10,6 +10,7 @@ cachey is a read-through cache for S3-compatible object storage
 - Use custom error types using `thiserror` for domain-specific errors
 - Format: `cargo +nightly fmt`
 - Lint: `cargo clippy --all-features --all-targets -- -D warnings --allow deprecated`
+- Dependency policy: `cargo deny check` (the `ring` crate is banned; use `aws-lc-rs` instead)
 - Place unit tests in the same file using `#[cfg(test)]` modules
 - Integration tests go in the `tests/` directory
 - Run tests with: `cargo nextest run`
