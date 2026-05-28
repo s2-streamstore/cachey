@@ -42,8 +42,8 @@ prometheus = { version = "0.14", features = ["process"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 serde = "1.0"
 thiserror = "2.0"
-tikv-jemallocator = { version = "0.6", optional = true, features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
-tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
+tikv-jemallocator = { version = "0.7", optional = true, features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.7", optional = true, features = ["stats"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
