@@ -240,6 +240,9 @@ impl Downloader {
             {
                 config_override = config_override.retry_config(retry_config);
             }
+            if let Some(force_path_style) = req_config.force_path_style {
+                config_override = config_override.force_path_style(force_path_style);
+            }
 
             request
                 .customize()

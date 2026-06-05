@@ -11,6 +11,7 @@ pub struct RequestConfig {
     pub max_attempts: Option<u32>,
     pub initial_backoff: Option<Duration>,
     pub max_backoff: Option<Duration>,
+    pub force_path_style: Option<bool>,
 }
 
 impl RequestConfig {
@@ -23,6 +24,7 @@ impl RequestConfig {
             && self.max_attempts.is_none()
             && self.initial_backoff.is_none()
             && self.max_backoff.is_none()
+            && self.force_path_style.is_none()
     }
 
     fn has_timeout_overrides(&self) -> bool {
