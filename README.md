@@ -47,6 +47,7 @@ Space-separated key-value pairs to override S3 request configuration per page mi
 - `ma=<num>` Maximum attempts
 - `ib=<ms>` Initial backoff duration
 - `mb=<ms>` Maximum backoff duration
+- `fps=<bool>` Force path-style addressing
 
 #### Example Request
 

@@ -157,21 +157,21 @@ where
 
         let mut config = Self::default();
 
+        let parse_duration = |v: &str| -> Result<Duration, Self::Rejection> {
+            v.parse::<u64>().map(Duration::from_millis).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid duration value in C0-Config header",
+                )
+            })
+        };
+
         for pair in header_str.split_whitespace() {
             let Some((key, value)) = pair.split_once('=') else {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "Malformed C0-Config header: missing '=' in key-value pair",
                 ));
-            };
-
-            let parse_duration = |v: &str| -> Result<Duration, Self::Rejection> {
-                v.parse::<u64>().map(Duration::from_millis).map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "Invalid duration value in C0-Config header",
-                    )
-                })
             };
 
             match key {
@@ -183,12 +183,20 @@ where
                     config.max_attempts = Some(value.parse().map_err(|_| {
                         (
                             StatusCode::BAD_REQUEST,
-                            "Invalid max_attempts value in C0-Config hheader",
+                            "Invalid value for ma in C0-Config header",
                         )
                     })?);
                 }
                 "ib" => config.initial_backoff = Some(parse_duration(value)?),
                 "mb" => config.max_backoff = Some(parse_duration(value)?),
+                "fps" => {
+                    config.force_path_style = Some(value.parse().map_err(|_| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            "Invalid value for fps in C0-Config header",
+                        )
+                    })?);
+                }
                 _ => {} // Ignore unrecognized keys
             }
         }
@@ -543,6 +551,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_c0_config_force_path_style() {
+        let config = parse_c0_config("fps=true").await.unwrap();
+        assert_eq!(config.force_path_style, Some(true));
+    }
+
+    #[tokio::test]
     async fn test_c0_config_mixed_settings() {
         let config = parse_c0_config("ct=1000 ma=5 ib=10 oat=1500")
             .await
@@ -591,7 +605,17 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().1,
-            "Invalid max_attempts value in C0-Config hheader"
+            "Invalid value for ma in C0-Config header"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_c0_config_invalid_force_path_style() {
+        let result = parse_c0_config("fps=1").await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().1,
+            "Invalid value for fps in C0-Config header"
         );
     }
 
