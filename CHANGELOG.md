@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.11](https://github.com/s2-streamstore/cachey/compare/0.10.10...0.10.11) - 2026-06-10
+
+### Fixed
+
+- rank unknown buckets by client position ([#121](https://github.com/s2-streamstore/cachey/pull/121))
+
 ## [0.10.10](https://github.com/s2-streamstore/cachey/compare/0.10.9...0.10.10) - 2026-06-05
 
 ### Added
