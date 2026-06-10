@@ -13,7 +13,6 @@ const LATENCY_SNAPSHOT_THRESHOLD: Duration = Duration::from_secs(1);
 const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 5;
 const RECOVERY_TIME: Duration = Duration::from_secs(30);
 const POSITION_PENALTY: u64 = 2_000;
-const UNKNOWN_BUCKET_PENALTY: u64 = 5000;
 const ERROR_RATE_SCORE_MULTIPLIER: f64 = 100_000.0;
 const ERROR_RATE_MAX: f64 = 1.0;
 const CIRCUIT_OPEN_SCORE_PENALTY: u64 = 1_000_000;
@@ -162,40 +161,37 @@ impl BucketedStats {
     /// 2. **Latency penalty** (µs / 100): Based on observed performance
     /// 3. **Error penalty**: Based on error rate or circuit breaker state
     ///
-    /// For unknown buckets, we assume 500ms latency (5000 points) to ensure:
-    /// - Known good buckets are preferred over unknown ones
-    /// - Client ordering is preserved even with typical S3 latencies (~200ms same-region)
-    /// - The system still explores unknown buckets when known ones fail
+    /// Buckets without observations use only their position penalty. This preserves
+    /// client order while allowing preferred unknown buckets to gather stats before
+    /// later buckets with known latency.
     ///
     /// Error penalties are intentionally weighted orders of magnitude above latency so
     /// healthy buckets are preferred over slightly faster but failing ones.
     fn score(&self, now: Instant, bucket: &BucketName, idx: usize) -> u64 {
         let base = (idx as u64) * POSITION_PENALTY;
-        self.by_bucket
-            .get(bucket)
-            .map_or(base + UNKNOWN_BUCKET_PENALTY, |s| {
-                let mut guard = s.lock();
+        self.by_bucket.get(bucket).map_or(base, |s| {
+            let mut guard = s.lock();
 
-                // Calculate latency component: 1 point per 100 µs = 0.1 ms
-                // - S3 Express same-AZ: ~4ms → 40 points
-                // - S3 Express cross-AZ: ~8ms → 80 points
-                // - Standard S3 same-region: ~200ms → 2000 points
-                // - Standard S3 cross-region: 300-1000ms → 3000-10000 points
-                let lat = guard
-                    .latency_micros_snapshot(now, self.hedge_latency_quantile)
-                    .mean
-                    / 100;
+            // Calculate latency component: 1 point per 100 µs = 0.1 ms
+            // - S3 Express same-AZ: ~4ms → 40 points
+            // - S3 Express cross-AZ: ~8ms → 80 points
+            // - Standard S3 same-region: ~200ms → 2000 points
+            // - Standard S3 cross-region: 300-1000ms → 3000-10000 points
+            let lat = guard
+                .latency_micros_snapshot(now, self.hedge_latency_quantile)
+                .mean
+                / 100;
 
-                // Calculate error component based on circuit breaker state
-                let err =
-                    if guard.effective_consecutive_failures(now) >= CONSECUTIVE_FAILURE_THRESHOLD {
-                        CIRCUIT_OPEN_SCORE_PENALTY
-                    } else {
-                        (guard.error_rate(now) * ERROR_RATE_SCORE_MULTIPLIER).round() as u64
-                    };
+            // Calculate error component based on circuit breaker state
+            let err = if guard.effective_consecutive_failures(now) >= CONSECUTIVE_FAILURE_THRESHOLD
+            {
+                CIRCUIT_OPEN_SCORE_PENALTY
+            } else {
+                (guard.error_rate(now) * ERROR_RATE_SCORE_MULTIPLIER).round() as u64
+            };
 
-                base + err + lat
-            })
+            base + err + lat
+        })
     }
 
     /// Returns `Duration::ZERO` if hedging is disabled or no latency datapoints are available.
@@ -250,16 +246,9 @@ mod tests {
 
         let now = Instant::now();
 
-        // Test base scoring without any data (includes 5000 point penalty for unknown)
-        assert_eq!(stats.score(now, &bucket1, 0), UNKNOWN_BUCKET_PENALTY);
-        assert_eq!(
-            stats.score(now, &bucket2, 1),
-            UNKNOWN_BUCKET_PENALTY + POSITION_PENALTY
-        );
-        assert_eq!(
-            stats.score(now, &bucket3, 2),
-            UNKNOWN_BUCKET_PENALTY + 2 * POSITION_PENALTY
-        );
+        assert_eq!(stats.score(now, &bucket1, 0), 0);
+        assert_eq!(stats.score(now, &bucket2, 1), POSITION_PENALTY);
+        assert_eq!(stats.score(now, &bucket3, 2), 2 * POSITION_PENALTY);
     }
 
     #[test]
@@ -757,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_bucket_penalty() {
+    fn test_unknown_buckets_use_position_only() {
         let stats = make_test_stats();
         let local_bucket = BucketName::new("local").unwrap();
         let remote_bucket = BucketName::new("remote").unwrap();
@@ -766,8 +755,6 @@ mod tests {
         for _ in 0..5 {
             stats.observe(local_bucket.clone(), Ok(Duration::from_millis(5)));
         }
-
-        // Remote bucket has no data
 
         let now = Instant::now();
 
@@ -778,15 +765,19 @@ mod tests {
             "Local score was {local_score}",
         );
 
-        // Remote bucket: base(POSITION_PENALTY) + default_penalty(UNKNOWN_BUCKET_PENALTY)
         let remote_score = stats.score(now, &remote_bucket, 1);
-        assert_eq!(remote_score, UNKNOWN_BUCKET_PENALTY + POSITION_PENALTY);
+        assert_eq!(remote_score, POSITION_PENALTY);
 
         // Verify ordering - local should come first
         let buckets = vec![local_bucket.clone(), remote_bucket.clone()];
         let ordered = get_attempt_order(&stats, &buckets);
         assert_eq!(ordered[0], local_bucket);
         assert_eq!(ordered[1], remote_bucket);
+
+        let buckets = vec![remote_bucket.clone(), local_bucket.clone()];
+        let ordered = get_attempt_order(&stats, &buckets);
+        assert_eq!(ordered[0], remote_bucket);
+        assert_eq!(ordered[1], local_bucket);
     }
 
     #[test]
@@ -808,8 +799,8 @@ mod tests {
         let buckets = vec![us_east.clone(), eu_west.clone(), ap_south.clone()];
         let ordered = get_attempt_order(&stats, &buckets);
 
-        // Should preserve client ordering - not prefer unknown eu-west over known us-east
-        // even though us-east has 200ms latency (2000 points) vs unknown default (5000 points)
+        // Should preserve client ordering on the score tie between us-east's 200ms
+        // latency and eu-west's position penalty.
         assert_eq!(
             ordered[0], us_east,
             "Should keep us-east-1 first despite 200ms latency"
@@ -858,10 +849,13 @@ mod tests {
 
         assert_eq!(ordered[0], primary, "Primary (200ms avg) should stay first");
         assert_eq!(
-            ordered[1], secondary,
-            "Secondary (395ms avg) should stay second"
+            ordered[1], tertiary,
+            "Unknown tertiary should be sampled before the slower secondary"
         );
-        assert_eq!(ordered[2], tertiary, "Unknown tertiary should stay third");
+        assert_eq!(
+            ordered[2], secondary,
+            "Secondary (395ms avg) should move behind the unknown tertiary"
+        );
 
         // Even with some errors on primary, it should still be preferred if error rate is low
         stats.observe(primary.clone(), Err(())); // One observed error adds a 1.5% penalty weight
@@ -871,7 +865,7 @@ mod tests {
 
         // Primary: base(0) + err(1500) + lat(2000) = 3500
         // Secondary: base(2000) + err(0) + lat(3950) = 5950
-        // Tertiary: base(4000) + unknown(5000) = 9000
+        // Tertiary: base(4000) = 4000
         assert_eq!(
             ordered[0], primary,
             "Primary with a single error should still beat the much slower secondary"
@@ -910,7 +904,7 @@ mod tests {
         // Scores:
         // - primary: base(0) + lat(2000) = 2000
         // - secondary: base(2000) + err(1_000_000) + lat(4000) = 1_006_000
-        // - tertiary: base(4000) + unknown(5000) = 9000
+        // - tertiary: base(4000) = 4000
         assert_eq!(ordered[0], primary, "Healthy primary should be first");
         assert_eq!(ordered[1], tertiary, "Unknown tertiary should be second");
         assert_eq!(ordered[2], secondary, "Failed secondary should be last");
