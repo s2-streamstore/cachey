@@ -18,8 +18,8 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 aws-smithy-runtime-api = "1.12"
 axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
-bytes = "1.11"
-bytesize = "2.3"
+bytes = "1.12"
+bytesize = "2.4"
 clap = { version = "4.6", features = ["derive"] }
 compact_str = { version = "0.9", features = ["serde"] }
 crossbeam = "0.8"
@@ -34,7 +34,7 @@ http-body-util = "0.1"
 http-content-range = "0.2"
 http-range-header = "0.4.2"
 httpdate = "1.0"
-itertools = "0.14"
+itertools = "0.15"
 jemalloc_pprof = { version = "0.8", optional = true, features = ["flamegraph"] }
 mixtrics = { version = "0.2", features = ["prometheus_0_14"] }
 parking_lot = "0.12"
