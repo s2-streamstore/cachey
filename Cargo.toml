@@ -9,13 +9,13 @@ description = "Read-through cache for object storage"
 
 [dependencies]
 async-stream = "0.3"
-aws-config = "1.8"
+aws-config = "1.9"
 aws-sdk-s3 = { version = "1", default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
     "default-https-client",
 ] }
-aws-smithy-runtime-api = "1.12"
+aws-smithy-runtime-api = "1.13"
 axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 bytes = "1.12"
@@ -35,15 +35,15 @@ http-content-range = "0.2"
 http-range-header = "0.4.2"
 httpdate = "1.0"
 itertools = "0.15"
-jemalloc_pprof = { version = "0.8", optional = true, features = ["flamegraph"] }
+jemalloc_pprof = { version = "0.9", optional = true, features = ["flamegraph"] }
 mixtrics = { version = "0.2", features = ["prometheus_0_14"] }
 parking_lot = "0.12"
 prometheus = { version = "0.14", features = ["process"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 serde = "1.0"
 thiserror = "2.0"
-tikv-jemallocator = { version = "0.6", optional = true, features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
-tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
+tikv-jemallocator = { version = "0.7", optional = true, features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.7", optional = true, features = ["stats"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
