@@ -110,7 +110,7 @@ async fn test_fetch_endpoint_full_object() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", "bytes=0-99")
         .send()
@@ -155,7 +155,7 @@ async fn test_fetch_endpoint_partial_range() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", "bytes=1000-1999")
         .send()
@@ -192,7 +192,7 @@ async fn test_fetch_endpoint_head_request() {
     let response = client
         .head(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", "bytes=0-499")
         .send()
@@ -258,7 +258,7 @@ async fn test_fetch_endpoint_not_found() {
     let response = client
         .get(format!(
             "{}/fetch/{}/non-existent-object",
-            ctx.server_url, &ctx.bucket_name
+            ctx.server_url, ctx.bucket_name
         ))
         .header("Range", "bytes=0-100")
         .send()
@@ -392,7 +392,7 @@ async fn test_fetch_endpoint_cache_hit() {
     let response1 = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", "bytes=0-999")
         .send()
@@ -413,7 +413,7 @@ async fn test_fetch_endpoint_cache_hit() {
     let response2 = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", "bytes=500-1499")
         .send()
@@ -450,7 +450,7 @@ async fn test_fetch_endpoint_range_ending_at_page_boundary() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", format!("bytes=0-{}", PAGE_SIZE - 1))
         .send()
@@ -543,7 +543,7 @@ async fn test_small_object_full_range() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", format!("bytes=0-{}", test_data.len() - 1))
         .send()
@@ -580,7 +580,7 @@ async fn test_small_object_partial_range() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", "bytes=10-19")
         .send()
@@ -610,7 +610,7 @@ async fn test_small_object_range_start_beyond_end_returns_416() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", format!("bytes={start}-{end}"))
         .send()
@@ -643,7 +643,7 @@ async fn test_1kb_object() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", format!("bytes=0-{}", test_data.len() - 1))
         .send()
@@ -683,7 +683,7 @@ async fn test_100kb_object_partial_range() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", "bytes=50000-59999")
         .send()
@@ -730,7 +730,7 @@ async fn test_fetch_endpoint_multi_page_range() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", format!("bytes={}-{}", start, end - 1))
         .send()
@@ -755,7 +755,7 @@ async fn test_fetch_endpoint_multi_page_range() {
     let response2 = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, &ctx.bucket_name, object_key
+            ctx.server_url, ctx.bucket_name, object_key
         ))
         .header("Range", format!("bytes={}-{}", start2, end2 - 1))
         .send()
@@ -794,7 +794,7 @@ async fn test_fetch_endpoint_multi_page_trailers() {
 
     let uri = format!(
         "{}/fetch/{}/{}",
-        ctx.server_url, &ctx.bucket_name, object_key
+        ctx.server_url, ctx.bucket_name, object_key
     )
     .parse::<hyper::Uri>()
     .expect("Failed to parse URI");
