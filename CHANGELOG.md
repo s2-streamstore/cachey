@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.14](https://github.com/s2-streamstore/cachey/compare/0.10.13...0.10.14) - 2026-07-29
+
+### Fixed
+
+- clippy useless_borrows_in_formatting warnings ([#129](https://github.com/s2-streamstore/cachey/pull/129))
+
+### Other
+
+- use Minimus Rust builder ([#128](https://github.com/s2-streamstore/cachey/pull/128))
+
 ## [0.10.13](https://github.com/s2-streamstore/cachey/compare/0.10.12...0.10.13) - 2026-07-09
 
 ### Other
