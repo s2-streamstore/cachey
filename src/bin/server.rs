@@ -1,3 +1,6 @@
+#[cfg(feature = "antithesis")]
+use antithesis_instrumentation as _;
+
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

@@ -105,6 +105,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "antithesis-instrumentation"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb6b548668212c6d3a942a4ac7be13bc4fc25715bf661328438f30e3fd342cf0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -983,6 +992,7 @@ checksum = "3d7c8918969267b2932ffd5655509bbbea0833823058c378876953217f5fc50e"
 name = "cachey"
 version = "0.10.14"
 dependencies = [
+ "antithesis-instrumentation",
  "async-stream",
  "aws-config",
  "aws-sdk-s3",

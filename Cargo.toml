@@ -8,6 +8,7 @@ repository = "https://github.com/s2-streamstore/cachey"
 description = "Read-through cache for object storage"
 
 [dependencies]
+antithesis-instrumentation = { version = "0.1.0", optional = true }
 async-stream = "0.3"
 aws-config = "1.9"
 aws-sdk-s3 = { version = "1", default-features = false, features = [
@@ -49,6 +50,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 [features]
+antithesis = ["dep:antithesis-instrumentation"]
 jemalloc = ["dep:tikv-jemallocator", "dep:jemalloc_pprof", "dep:tikv-jemalloc-ctl"]
 
 [dev-dependencies]
