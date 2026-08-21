@@ -110,6 +110,7 @@ where
 {
     type Rejection = (StatusCode, &'static str);
 
+    #[expect(clippy::unused_async_trait_impl, reason = "synchronous extractor")]
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let range_header = parts
             .headers
@@ -146,6 +147,7 @@ where
 {
     type Rejection = (StatusCode, &'static str);
 
+    #[expect(clippy::unused_async_trait_impl, reason = "synchronous extractor")]
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let Some(header_value) = parts.headers.get(&C0_CONFIG_HEADER) else {
             return Ok(Self::default());
@@ -214,6 +216,7 @@ where
 {
     type Rejection = (StatusCode, &'static str);
 
+    #[expect(clippy::unused_async_trait_impl, reason = "synchronous extractor")]
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let mut names = Vec::with_capacity(3);
         for value in parts.headers.get_all(&C0_BUCKET_HEADER) {
