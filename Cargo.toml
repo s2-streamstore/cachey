@@ -9,27 +9,27 @@ description = "Read-through cache for object storage"
 
 [dependencies]
 async-stream = "0.3"
-aws-config = "1.9"
+aws-config = "1.11"
 aws-sdk-s3 = { version = "1", default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
     "default-https-client",
 ] }
-aws-smithy-runtime-api = "1.13"
+aws-smithy-runtime-api = "1.15"
 axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 bytes = "1.12"
-bytesize = "2.4"
+bytesize = "2.7"
 clap = { version = "4.6", features = ["derive"] }
-compact_str = { version = "0.9", features = ["serde"] }
+compact_str = { version = "0.10", features = ["serde"] }
 crossbeam = "0.8"
 dashmap = "6.2"
 exponential-decay-histogram = "0.1"
 eyre = "0.6"
 foyer = "0.22"
 futures = "0.3"
-http = "1.4"
-http-body = "1.0"
+http = "1.5"
+http-body = "1.1"
 http-body-util = "0.1"
 http-content-range = "0.2"
 http-range-header = "0.4.2"
@@ -57,7 +57,7 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http2", 
 proptest = "1.11"
 reqwest = { version = "0.13", features = ["json"] }
 serde_json = "1.0"
-testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http_wait"] }
+testcontainers = { version = "0.28", default-features = false, features = ["aws-lc-rs", "http_wait"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
