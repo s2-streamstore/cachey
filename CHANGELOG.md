@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.15](https://github.com/s2-streamstore/cachey/compare/0.10.14...0.10.15) - 2026-08-22
+
+### Other
+
+- dep upgrades ([#134](https://github.com/s2-streamstore/cachey/pull/134))
+- pin GitHub Actions ([#131](https://github.com/s2-streamstore/cachey/pull/131))
+
 ## [0.10.14](https://github.com/s2-streamstore/cachey/compare/0.10.13...0.10.14) - 2026-07-29
 
 ### Fixed
