@@ -51,6 +51,8 @@ impl DownloadError {
     }
 }
 
+type GetObjectResult = Result<GetObjectOutput, Box<aws_sdk_s3::error::SdkError<GetObjectError>>>;
+
 fn invalid_range_object_size(error: &aws_sdk_s3::error::SdkError<GetObjectError>) -> Option<u64> {
     error
         .raw_response()
@@ -214,10 +216,7 @@ impl Downloader {
         key: &ObjectKey,
         byterange: &Range<u64>,
         req_config: &RequestConfig,
-    ) -> Result<
-        GetObjectOutput,
-        Box<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>>,
-    > {
+    ) -> GetObjectResult {
         let request = self
             .s3
             .get_object()
@@ -257,10 +256,7 @@ impl Downloader {
         &self,
         bucket: BucketName,
         req_range: &Range<u64>,
-        result: Result<
-            GetObjectOutput,
-            Box<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>>,
-        >,
+        result: GetObjectResult,
         latency: Duration,
         hedged: Option<Duration>,
     ) -> Result<ObjectPiece, DownloadError> {
