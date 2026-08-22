@@ -216,7 +216,7 @@ impl Downloader {
         req_config: &RequestConfig,
     ) -> Result<
         GetObjectOutput,
-        aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+        Box<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>>,
     > {
         let request = self
             .s3
@@ -227,7 +227,7 @@ impl Downloader {
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
 
         if req_config.is_noop() {
-            request.send().await
+            request.send().await.map_err(Box::new)
         } else {
             let client_config = self.s3.config();
             let mut config_override = client_config.to_builder();
@@ -249,6 +249,7 @@ impl Downloader {
                 .config_override(config_override)
                 .send()
                 .await
+                .map_err(Box::new)
         }
     }
 
@@ -258,7 +259,7 @@ impl Downloader {
         req_range: &Range<u64>,
         result: Result<
             GetObjectOutput,
-            aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+            Box<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>>,
         >,
         latency: Duration,
         hedged: Option<Duration>,
@@ -544,7 +545,7 @@ mod tests {
             .handle_result(
                 bucket,
                 &req_range,
-                Err(sdk_error),
+                Err(Box::new(sdk_error)),
                 Duration::from_millis(100),
                 None,
             )
@@ -611,7 +612,7 @@ mod tests {
             .handle_result(
                 bucket,
                 &req_range,
-                Err(sdk_error),
+                Err(Box::new(sdk_error)),
                 Duration::from_millis(100),
                 None,
             )
