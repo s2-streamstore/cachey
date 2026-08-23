@@ -22,6 +22,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rust-dependency-cooldown:
+    name: Rust dependency cooldown gate
+    permissions:
+      contents: read
+    uses: s2-streamstore/s2/.github/workflows/rust-dependency-cooldown.yml@97411e90049539d264ea9eda0efd2802548dae6b
+
   conventional-commit:
     name: conventional commit
     if: github.event_name == 'pull_request'
@@ -63,6 +69,7 @@ jobs:
 
   test:
     name: tests
+    needs: rust-dependency-cooldown
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -80,7 +87,7 @@ jobs:
         uses: taiki-e/install-action@d5f9268ff7620505a81ada10ddf18cdd72240185 # nextest
 
       - name: Run tests
-        run: cargo nextest run --all-features
+        run: cargo nextest run --locked --all-features
 
   rustfmt:
     name: rustfmt
@@ -102,6 +109,7 @@ jobs:
 
   clippy:
     name: clippy
+    needs: rust-dependency-cooldown
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

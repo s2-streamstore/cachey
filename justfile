@@ -8,11 +8,11 @@ build:
 
 # Run clippy linter
 clippy:
-    cargo clippy --workspace --all-features --all-targets -- -D warnings --allow deprecated
+    cargo clippy --locked --workspace --all-features --all-targets -- -D warnings --allow deprecated
 
 # Ensure cargo-deny is installed
 _ensure-deny:
-    @cargo deny --version > /dev/null 2>&1 || cargo install cargo-deny
+    @cargo deny --version > /dev/null 2>&1 || (echo "cargo-deny is required; run: brew install cargo-deny" && exit 1)
 
 # Run cargo-deny checks
 deny *args: _ensure-deny
@@ -24,7 +24,7 @@ fmt:
 
 # Run tests with nextest
 test:
-    cargo nextest run --all-features
+    cargo nextest run --locked --all-features
 
 # Run the server locally
 run:

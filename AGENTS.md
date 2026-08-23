@@ -9,12 +9,16 @@ cachey is a read-through cache for S3-compatible object storage
 - Use `eyre::Report` when the specific error is not as important
 - Use custom error types using `thiserror` for domain-specific errors
 - Format: `cargo +nightly fmt`
-- Lint: `cargo clippy --all-features --all-targets -- -D warnings --allow deprecated`
+- Lint: `cargo clippy --locked --all-features --all-targets -- -D warnings --allow deprecated`
 - Dependency policy: `cargo deny check`
 - Place unit tests in the same file using `#[cfg(test)]` modules
 - Integration tests go in the `tests/` directory
-- Run tests with: `cargo nextest run`
-- Add dependencies to `Cargo.toml`
+- Run tests with: `cargo nextest run --locked`
+- Use `--locked` for Cargo commands that build, check, test, run, document, fetch, or read metadata
+- Use `cargo +nightly add`, `cargo +nightly update`, `cargo +nightly remove`, or `cargo +nightly generate-lockfile` for dependency changes
+- Do not use the stable forms of these dependency commands
+- Do not edit dependency declarations or `Cargo.lock` directly
+- Do not run `cargo install` as part of a coding task
 - Prefer well-maintained crates from crates.io
 - Be mindful of allocations in hot paths
 - Prefer structured logging
