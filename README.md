@@ -132,3 +132,15 @@ Options:
 
 - [justfile](./justfile) contains commands for [just](https://just.systems/man/en/) doing things
 - [AGENTS.md](./AGENTS.md) and symlinks for your favorite coding buddies
+
+Use the nightly Cargo dependency commands so that the seven-day publication cooldown applies:
+
+```bash
+cargo +nightly add <crate>
+cargo +nightly update
+cargo +nightly update -p <crate>
+cargo +nightly remove <crate>
+cargo +nightly generate-lockfile
+```
+
+Use `--locked` with normal build, check, test, run, document, fetch, and metadata commands. The pull request dependency gate verifies each proposed lockfile change before Rust build jobs start.
