@@ -192,8 +192,10 @@ impl Downloader {
         select! {
             primary_result = &mut primary_attempt => primary_result,
             hedge_threshold = self.hedge_trigger(bucket, start_time) => {
-                let hedge_start_time = Instant::now();
-                let mut hedge_attempt = Box::pin(attempt_full(hedge_start_time, hedge_threshold));
+                // Use the original request `start_time` (not a hedge-local instant) so a
+                // hedge win records total client-observed latency; without this, the
+                // dropped primary sample biases the histogram fast.
+                let mut hedge_attempt = Box::pin(attempt_full(start_time, hedge_threshold));
                 select! {
                     primary_result = &mut primary_attempt => match primary_result {
                         Ok(piece) => Ok(piece),
@@ -658,6 +660,285 @@ mod tests {
             _ = hedge_future => panic!("hedge_trigger should not complete when there's no data"),
             () = timeout_future => {} // Expected: timeout completes first
         }
+    }
+
+    mod hedge_mock {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{Router, extract::State, http::HeaderMap, routing::get};
+        use bytes::Bytes;
+
+        struct InFlightGuard(std::sync::Arc<AtomicUsize>);
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        struct MockState {
+            object: Bytes,
+            primary_delay: std::time::Duration,
+            in_flight: std::sync::Arc<AtomicUsize>,
+        }
+
+        /// Serves ranged GETs where the first concurrent request (the primary) is
+        /// delayed by `primary_delay`, and the second (the hedge) returns
+        /// immediately. This forces a hedge win with a slow, dropped primary.
+        async fn mock_get_object(
+            State(state): State<std::sync::Arc<MockState>>,
+            headers: HeaderMap,
+        ) -> (axum::http::StatusCode, HeaderMap, Bytes) {
+            let (start, end) = headers
+                .get(http::header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|r| r.strip_prefix("bytes="))
+                .and_then(|r| r.split_once('-'))
+                .map_or((0, 0), |(s, e)| {
+                    (s.parse::<u64>().unwrap_or(0), e.parse::<u64>().unwrap_or(0))
+                });
+
+            let is_primary = state.in_flight.fetch_add(1, Ordering::SeqCst) == 0;
+            let _guard = InFlightGuard(std::sync::Arc::clone(&state.in_flight));
+            if is_primary {
+                tokio::time::sleep(state.primary_delay).await;
+            }
+
+            let object_size = state.object.len() as u64;
+            let response_end = end.min(object_size.saturating_sub(1));
+            let data = state
+                .object
+                .slice((start as usize)..=(response_end as usize));
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_RANGE,
+                format!("bytes {start}-{response_end}/{object_size}")
+                    .parse()
+                    .expect("content-range"),
+            );
+            headers.insert(
+                http::header::LAST_MODIFIED,
+                "Tue, 15 Nov 1994 08:12:31 GMT"
+                    .parse()
+                    .expect("last-modified"),
+            );
+            (axum::http::StatusCode::PARTIAL_CONTENT, headers, data)
+        }
+
+        pub(super) async fn spawn(
+            object: Bytes,
+            primary_delay: std::time::Duration,
+        ) -> (String, std::sync::Arc<AtomicUsize>) {
+            let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+            let state = std::sync::Arc::new(MockState {
+                object,
+                primary_delay,
+                in_flight: std::sync::Arc::clone(&in_flight),
+            });
+            let app = Router::new()
+                .route("/{bucket}/{*key}", get(mock_get_object))
+                .with_state(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock server");
+            let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve mock s3");
+            });
+            (endpoint, in_flight)
+        }
+    }
+
+    /// Regression test for underreported bucket latency on hedge wins.
+    ///
+    /// A slow primary (delayed by the mock) loses the race to a fast hedge. The
+    /// slow primary future is dropped before it can record its latency, so the
+    /// only sample that reaches `handle_result` is the hedge's. The fix records
+    /// total client-observed latency (measured from the original request start)
+    /// for the hedge, not just the hedge attempt's own short duration.
+    #[tokio::test]
+    async fn test_hedge_win_records_total_client_latency() {
+        use aws_config::BehaviorVersion;
+        use aws_sdk_s3::config::{Credentials, Region};
+
+        let object = Bytes::from_static(b"data");
+        let (endpoint, _in_flight) =
+            hedge_mock::spawn(object.clone(), Duration::from_millis(500)).await;
+
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .region(Region::new("us-east-1"))
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(config);
+        let throughput = Arc::new(Mutex::new(crate::service::SlidingThroughput::default()));
+        let downloader = Downloader::new(client, 0.9, throughput);
+
+        let bucket = BucketName::new("test-bucket").unwrap();
+        let object_key = ObjectKey::new("test-key").unwrap();
+
+        // Seed bucket latency stats so the hedge threshold settles near 100ms.
+        // The hedge then fires ~100ms after the request starts (well before the
+        // 500ms primary completes), guaranteeing a hedge win. A hedge win must
+        // record total client-observed latency (>= the threshold it waited for),
+        // not just the hedge attempt's own (sub-threshold) duration.
+        for _ in 0..100 {
+            downloader
+                .bucketed_stats
+                .observe(bucket.clone(), Ok(Duration::from_millis(100)));
+        }
+
+        let threshold_before = downloader
+            .bucketed_stats
+            .hedging_threshold(&bucket, Instant::now());
+        assert!(
+            threshold_before >= Duration::from_millis(50),
+            "seeded threshold {threshold_before:?} must enable hedging"
+        );
+
+        let buckets = BucketNameSet::new(std::iter::once(bucket.clone())).unwrap();
+        let out = downloader
+            .download(
+                &buckets,
+                object_key,
+                &Range { start: 0, end: 4 },
+                &RequestConfig::default(),
+            )
+            .await
+            .expect("hedge should win and return data");
+
+        assert_eq!(out.piece.data, object);
+        let threshold = out
+            .piece
+            .hedged
+            .expect("hedge must have fired and won the race");
+        assert!(
+            out.piece.latency >= threshold,
+            "hedge-win latency {:?} must reflect total client-observed time (>= hedge threshold {:?}); \
+             recording only the hedge attempt duration biases the histogram fast",
+            out.piece.latency,
+            threshold,
+        );
+
+        let mut metrics_checked = false;
+        downloader.observe_bucket_metrics(|name, metrics| {
+            if name == &bucket {
+                metrics_checked = true;
+                assert_eq!(metrics.consecutive_failures, 0);
+                assert!(!metrics.circuit_breaker_open);
+            }
+        });
+        assert!(metrics_checked, "bucket metrics must be recorded");
+    }
+
+    /// G3: a hedge-win `attempt()` records exactly ONE latency observation
+    /// (the hedge's total client-observed latency). The dropped primary never
+    /// reaches `handle_result`, so it must not double-count, and the hedge must
+    /// not be skipped either.
+    #[tokio::test]
+    async fn test_hedge_win_records_exactly_one_observation() {
+        use aws_config::BehaviorVersion;
+        use aws_sdk_s3::config::{Credentials, Region};
+
+        let object = Bytes::from_static(b"data");
+        let (endpoint, _in_flight) =
+            hedge_mock::spawn(object.clone(), Duration::from_millis(500)).await;
+
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .region(Region::new("us-east-1"))
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(config);
+        let throughput = Arc::new(Mutex::new(crate::service::SlidingThroughput::default()));
+        let downloader = Downloader::new(client, 0.9, throughput);
+
+        let bucket = BucketName::new("test-bucket").unwrap();
+        let object_key = ObjectKey::new("test-key").unwrap();
+
+        for _ in 0..100 {
+            downloader
+                .bucketed_stats
+                .observe(bucket.clone(), Ok(Duration::from_millis(100)));
+        }
+        let count_before = downloader.bucketed_stats.latency_observation_count(&bucket);
+
+        let buckets = BucketNameSet::new(std::iter::once(bucket.clone())).unwrap();
+        let out = downloader
+            .download(
+                &buckets,
+                object_key,
+                &Range { start: 0, end: 4 },
+                &RequestConfig::default(),
+            )
+            .await
+            .expect("hedge should win");
+
+        let count_after = downloader.bucketed_stats.latency_observation_count(&bucket);
+        assert_eq!(
+            count_after - count_before,
+            1u64,
+            "a hedge-win attempt must record exactly one observation (got {count_before} -> {count_after}); \
+             the dropped primary must not double-count and the hedge must be recorded",
+        );
+        assert!(out.piece.hedged.is_some(), "hedge must have fired");
+    }
+
+    /// G5/G6: when the primary completes before `hedge_trigger` fires (no
+    /// hedging triggered), `hedged == None` and the recorded latency reflects
+    /// the primary's own duration — the fix must not inflate non-hedge latency.
+    #[tokio::test]
+    async fn test_primary_win_before_hedge_records_own_latency() {
+        use aws_config::BehaviorVersion;
+        use aws_sdk_s3::config::{Credentials, Region};
+
+        let object = Bytes::from_static(b"data");
+        // No primary delay: both responses return immediately. With no seeded
+        // stats the hedge threshold is zero, so `hedge_trigger` never completes
+        // and the primary always wins the outer `select!`.
+        let (endpoint, _in_flight) = hedge_mock::spawn(object.clone(), Duration::ZERO).await;
+
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .region(Region::new("us-east-1"))
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(config);
+        let throughput = Arc::new(Mutex::new(crate::service::SlidingThroughput::default()));
+        let downloader = Downloader::new(client, 0.9, throughput);
+
+        let bucket = BucketName::new("test-bucket").unwrap();
+        let buckets = BucketNameSet::new(std::iter::once(bucket.clone())).unwrap();
+        let key = ObjectKey::new("test-key").unwrap();
+
+        let out = downloader
+            .download(
+                &buckets,
+                key,
+                &Range { start: 0, end: 4 },
+                &RequestConfig::default(),
+            )
+            .await
+            .expect("primary should succeed");
+
+        assert_eq!(out.piece.data, object);
+        assert!(
+            out.piece.hedged.is_none(),
+            "no hedge should have fired when the primary wins outright"
+        );
+        assert!(
+            out.piece.latency < Duration::from_millis(250),
+            "primary-win latency {:?} should be the primary's own (fast) duration",
+            out.piece.latency,
+        );
+
+        let count = downloader.bucketed_stats.latency_observation_count(&bucket);
+        assert_eq!(count, 1u64, "exactly one observation for the primary");
     }
 
     #[tokio::test]

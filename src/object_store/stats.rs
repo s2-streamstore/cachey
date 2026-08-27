@@ -209,6 +209,16 @@ impl BucketedStats {
         })
     }
 
+    /// Number of latency observations recorded for a bucket. Test-only: used to
+    /// assert that hedge-win `attempt()` calls record exactly one observation
+    /// (no double-counting, no dropped samples reaching `observe`).
+    #[cfg(test)]
+    pub fn latency_observation_count(&self, bucket: &BucketName) -> u64 {
+        self.by_bucket
+            .get(bucket)
+            .map_or(0, |s| s.lock().latency_micros_histogram.snapshot().count())
+    }
+
     pub fn export_bucket_metrics(&self, mut f: impl FnMut(&BucketName, &BucketMetrics)) {
         let now = Instant::now();
         for entry in self.by_bucket.iter() {
