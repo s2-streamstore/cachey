@@ -96,6 +96,24 @@ C0-Status: 16777216-18874367; us-west-videos; 0
 
 `GET /metrics` returns a more comprehensive set of metrics in Prometheus text format.
 
+### Latency and hedging
+
+A bucket fetch starts with its primary SDK operation and ends when the primary/hedge race produces validated page data or a terminal error. Its duration includes SDK retries and backoff, the wait before starting a hedge, body transfer, and validation. Each completed bucket fetch contributes one outcome to bucket stats: a successful fetch adds one latency sample; a failed fetch updates the error rate and consecutive-failure count. A failed peer rescued by its sibling is one successful bucket fetch. Canceled peers and canceled bucket fetches add no observations.
+
+The hedge timer uses the configured quantile of these successful bucket-fetch durations. A winning hedge is measured from the original primary start, so it cannot contribute a sample shorter than the time spent waiting to launch it. These samples describe latency delivered with the current hedging policy; they do not estimate how long canceled primary requests would have taken. There is no hedge until the bucket has a successful latency sample, and `--hedge-quantile 0` disables hedging. Latency snapshots refresh at most once per second.
+
+| Measurement | Boundary |
+|------------|----------|
+| `cachey_bucket_latency_mean_seconds` | Mean successful bucket-fetch duration; used in bucket ranking. |
+| `cachey_bucket_latency_hedge_seconds` | Successful bucket-fetch quantile used as the hedge delay; zero when hedging is disabled. |
+| `cachey_bucket_error_rate` / `cachey_bucket_consecutive_failures` | Completed bucket-fetch outcomes after resolving any hedge. |
+| `cachey_page_download_latency_seconds` | Successful page download across both buckets, including time spent failing the first bucket. |
+| `cachey_first_chunk_latency_seconds` | Successful HTTP handler's time to its first available chunk, including cache lookup or waiting for a coalesced fill. |
+
+Bucket fallback has its own clock and stats: the fallback bucket is not charged for the failed first bucket. The Rust `DownloadOutput` carries total `latency` and a `hedged` flag for a hedge started in either bucket; `ObjectPiece` carries the returned data and object metadata. The `hedged` page counter counts successful page downloads with that flag, including a primary winner or a hedge in a failed first bucket. Failed page downloads and client response-body transmission are not included in the success latency histograms.
+
+Full body transfer increases the measured latency and therefore can increase hedge delays and change bucket rankings. It does not change request deadlines: [AWS SDK operation timeouts exclude response-body consumption](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/timeouts.html), and the latency measurements do not impose an additional timeout. Hedging, retries, and the two-bucket limit remain separate controls.
+
 ## Command line
 
 [Docker images](https://github.com/s2-streamstore/cachey/pkgs/container/cachey) are available.

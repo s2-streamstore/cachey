@@ -22,6 +22,7 @@ pub struct BucketMetrics {
     pub error_rate: f64,
     pub circuit_breaker_open: bool,
     pub consecutive_failures: u32,
+    /// Successful bucket-fetch latency, including SDK retries, hedging, and body validation.
     pub latency_mean: Duration,
     pub latency_hedge: Duration,
 }
@@ -68,7 +69,11 @@ impl BucketStats {
         if now.duration_since(self.latency_micros_snapshot_at) >= LATENCY_SNAPSHOT_THRESHOLD {
             let new_snapshot = self.latency_micros_histogram.snapshot();
             let mean = new_snapshot.mean() as u64;
-            let hedge = new_snapshot.value(hedge_quantile) as u64;
+            let hedge = if hedge_quantile == 0.0 {
+                0
+            } else {
+                new_snapshot.value(hedge_quantile) as u64
+            };
             self.latency_micros_snapshot = LatencyMicrosSnapshot { mean, hedge };
             self.latency_micros_snapshot_at = now;
         }
@@ -100,7 +105,10 @@ impl Default for BucketStats {
             error_rate: 0.0,
             consecutive_failures: 0,
             last_failure_time: now,
-            latency_micros_histogram: ExponentialDecayHistogram::builder().alpha(ALPHA).build(),
+            latency_micros_histogram: ExponentialDecayHistogram::builder()
+                .at(now.into_std())
+                .alpha(ALPHA)
+                .build(),
             latency_micros_snapshot: LatencyMicrosSnapshot { mean: 0, hedge: 0 },
             latency_micros_snapshot_at: now - LATENCY_SNAPSHOT_THRESHOLD,
         }
@@ -122,10 +130,11 @@ impl BucketedStats {
         }
     }
 
+    /// Record one completed bucket fetch, after its primary/hedge race resolves.
     pub fn observe(&self, bucket: BucketName, outcome: Result<Duration, ()>) {
-        let now = Instant::now();
         let entry = self.by_bucket.entry(bucket).or_default();
         let mut stats = entry.lock();
+        let now = Instant::now();
 
         stats.consecutive_failures = stats.effective_consecutive_failures(now);
         let decayed_error_rate = stats.error_rate(now);
@@ -158,7 +167,7 @@ impl BucketedStats {
     ///
     /// The scoring formula balances three factors:
     /// 1. **Position penalty** (idx * 2000): Strongly respects client bucket ordering preference
-    /// 2. **Latency penalty** (µs / 100): Based on observed performance
+    /// 2. **Latency penalty** (µs / 100): Mean successful bucket-fetch duration
     /// 3. **Error penalty**: Based on error rate or circuit breaker state
     ///
     /// Buckets without observations use only their position penalty. This preserves
@@ -172,11 +181,6 @@ impl BucketedStats {
         self.by_bucket.get(bucket).map_or(base, |s| {
             let mut guard = s.lock();
 
-            // Calculate latency component: 1 point per 100 µs = 0.1 ms
-            // - S3 Express same-AZ: ~4ms → 40 points
-            // - S3 Express cross-AZ: ~8ms → 80 points
-            // - Standard S3 same-region: ~200ms → 2000 points
-            // - Standard S3 cross-region: 300-1000ms → 3000-10000 points
             let lat = guard
                 .latency_micros_snapshot(now, self.hedge_latency_quantile)
                 .mean
@@ -743,6 +747,9 @@ mod tests {
             Duration::ZERO,
             "Hedging should be disabled when quantile is 0"
         );
+        let mut exported = None;
+        stats.export_bucket_metrics(|_, metrics| exported = Some(metrics.clone()));
+        assert_eq!(exported.unwrap().latency_hedge, Duration::ZERO);
     }
 
     #[test]

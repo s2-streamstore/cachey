@@ -16,7 +16,7 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     static ERROR_RATE: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_error_rate",
-            "Exponentially decayed error rate per bucket",
+            "Exponentially decayed error rate of completed bucket fetches",
             &["bucket"]
         )
         .unwrap()
@@ -25,7 +25,7 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     static LATENCY_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_latency_mean_seconds",
-            "Mean latency in seconds per bucket",
+            "Mean successful bucket fetch latency, including retries, hedging, and body validation",
             &["bucket"]
         )
         .unwrap()
@@ -34,7 +34,7 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     static LATENCY_HEDGE: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_latency_hedge_seconds",
-            "Hedge latency in seconds per bucket",
+            "Hedge delay from the successful bucket fetch latency quantile, in seconds",
             &["bucket"]
         )
         .unwrap()
@@ -135,7 +135,7 @@ pub enum PageRequestType {
     Access,
     /// Page requests that fetched bytes from object storage.
     Download,
-    /// Object storage fetches where a hedged request was issued.
+    /// Successful page downloads where a hedge was started in either bucket.
     Hedged,
     /// Fetches whose primary attempt used the client-preferred bucket.
     ClientPref,
@@ -187,7 +187,7 @@ pub fn page_download_latency(kind: &ObjectKind, latency: std::time::Duration) {
     static HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec!(
             "cachey_page_download_latency_seconds",
-            "Page download latency",
+            "Successful page download latency, including retries, hedging, and bucket fallback",
             &["kind"],
             vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
         )

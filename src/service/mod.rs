@@ -278,8 +278,8 @@ impl PageGetExecutor {
                         .downloader
                         .download(&self.buckets, self.object, &(start..end), &self.req_config)
                         .await?;
-                    metrics::page_download_latency(&self.kind, out.piece.latency);
-                    if out.piece.hedged.is_some() {
+                    metrics::page_download_latency(&self.kind, out.latency);
+                    if out.hedged {
                         metrics::page_request_count(&self.kind, metrics::PageRequestType::Hedged);
                     }
                     if self.buckets.first() == Some(&self.buckets[out.primary_bucket_idx]) {
