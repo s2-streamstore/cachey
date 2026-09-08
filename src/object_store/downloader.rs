@@ -823,6 +823,27 @@ mod latency_tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn primary_win_preserves_hedged_flag_and_cancels_pending_hedge() {
+        let downloader = downloader([
+            ("bucket", 10, 90, false),
+            ("bucket", 10, 140, false),
+            ("bucket", 10, 190, false),
+        ]);
+        fetch(&downloader, &["bucket"]).await;
+
+        let output = fetch(&downloader, &["bucket"]).await;
+        assert!(output.hedged);
+        assert_eq!(output.latency, Duration::from_millis(150));
+        assert_eq!(output.piece.data, Bytes::from_static(b"data"));
+
+        let metrics = metrics(&downloader, "bucket").await;
+        assert_eq!(metrics.latency_mean, Duration::from_millis(125));
+        assert_eq!(metrics.latency_hedge, Duration::from_millis(150));
+        assert!(metrics.error_rate.abs() < f64::EPSILON);
+        assert_eq!(metrics.consecutive_failures, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn either_peer_can_recover_a_body_failure() {
         for (primary, hedge, elapsed_ms) in [
             (("bucket", 10, 100, true), ("bucket", 10, 20, false), 130),

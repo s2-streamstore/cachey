@@ -228,7 +228,16 @@ impl BucketedStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{sync::Barrier, thread, time::Duration};
+
+    use parking_lot::Mutex;
+    use tokio::time::Instant;
+
+    use super::{
+        BucketedStats, CIRCUIT_OPEN_SCORE_PENALTY, CONSECUTIVE_FAILURE_THRESHOLD,
+        ERROR_RATE_SCORE_MULTIPLIER, LATENCY_SNAPSHOT_THRESHOLD, POSITION_PENALTY, RECOVERY_TIME,
+    };
+    use crate::types::BucketName;
 
     fn make_test_stats() -> BucketedStats {
         BucketedStats::new(0.9) // 90th percentile for hedging
@@ -289,6 +298,44 @@ mod tests {
         // With 3 errors and ALPHA=0.015: error_rate = 0.045 (minus tiny time decay)
         // Score should be 0 (base) + ~4500 (0.045 * 100_000) + 0 (no latency)
         assert!((4300..=4500).contains(&score), "Score was {score}");
+    }
+
+    #[test]
+    fn concurrent_observations_keep_decay_timestamps_monotonic() {
+        const WORKERS: usize = 8;
+        const OBSERVATIONS_PER_WORKER: u32 = 2_000;
+
+        let stats = make_test_stats();
+        let bucket = BucketName::new("concurrent-observations").unwrap();
+        let latest_observation = Mutex::new(Instant::now());
+        let start = Barrier::new(WORKERS);
+
+        thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                scope.spawn(|| {
+                    start.wait();
+                    for _ in 0..OBSERVATIONS_PER_WORKER {
+                        stats.observe(bucket.clone(), Err(()));
+                        let entry = stats.by_bucket.get(&bucket).unwrap();
+                        let bucket_stats = entry.lock();
+                        let mut latest_observation = latest_observation.lock();
+                        assert!(
+                            bucket_stats.last_update >= *latest_observation,
+                            "decay timestamp moved backward: {:?} -> {:?}",
+                            *latest_observation,
+                            bucket_stats.last_update,
+                        );
+                        *latest_observation = bucket_stats.last_update;
+                    }
+                });
+            }
+        });
+
+        let entry = stats.by_bucket.get(&bucket).unwrap();
+        assert_eq!(
+            entry.lock().consecutive_failures,
+            WORKERS as u32 * OBSERVATIONS_PER_WORKER,
+        );
     }
 
     #[test]
