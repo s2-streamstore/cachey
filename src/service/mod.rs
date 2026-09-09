@@ -3,7 +3,7 @@ use std::{
     num::NonZeroU32,
     ops::{Range, RangeInclusive},
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -194,24 +194,30 @@ impl CacheyService {
             kind,
             object,
             buckets,
-            object_size: Arc::default(),
             req_config,
         };
+        let mut object_size = None;
 
         futures::stream::iter(pagerange.map(move |page_id| executor.clone().execute(page_id)))
             .buffered(concurrency)
-            .map(move |res| {
-                res.and_then(|(page_id, value)| {
-                    let (data, range) = slice_page_data(page_id, &byterange, &value)?;
-                    self.egress_throughput.lock().record(data.len());
-                    Ok(Chunk {
-                        bucket: value.bucket,
-                        mtime: value.mtime,
-                        data,
-                        range,
-                        object_size: value.object_size,
-                        cached_at: NonZeroU32::new(value.cached_at),
-                    })
+            .map(move |result| {
+                let (page_id, value) = result?;
+                let expected_size = *object_size.get_or_insert(value.object_size);
+                if value.object_size != expected_size {
+                    return Err(ServiceError::ObjectSizeInconsistency {
+                        new: value.object_size,
+                        prev: expected_size,
+                    });
+                }
+                let (data, range) = slice_page_data(page_id, &byterange, &value)?;
+                self.egress_throughput.lock().record(data.len());
+                Ok(Chunk {
+                    bucket: value.bucket,
+                    mtime: value.mtime,
+                    data,
+                    range,
+                    object_size: value.object_size,
+                    cached_at: NonZeroU32::new(value.cached_at),
                 })
             })
     }
@@ -250,7 +256,6 @@ struct PageGetExecutor {
     kind: ObjectKind,
     object: ObjectKey,
     buckets: BucketNameSet,
-    object_size: Arc<OnceLock<u64>>,
     req_config: RequestConfig,
 }
 
@@ -309,13 +314,6 @@ impl PageGetExecutor {
         metrics::page_request_count(&key.kind, metrics::PageRequestType::Success);
 
         let mut value = entry.value().clone();
-        let object_size = *self.object_size.get_or_init(|| value.object_size);
-        if value.object_size != object_size {
-            return Err(ServiceError::ObjectSizeInconsistency {
-                new: value.object_size,
-                prev: object_size,
-            });
-        }
         match entry.source() {
             Source::Memory => {
                 metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
@@ -590,7 +588,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_pages_must_agree_on_object_size_within_a_request() {
+    async fn pages_must_agree_with_the_first_delivered_object_size() {
+        let kind = ObjectKind::new("size-consistency").unwrap();
+        let object = ObjectKey::new("object").unwrap();
+        let bucket = BucketName::new("bucket").unwrap();
+        let buckets = BucketNameSet::new(std::iter::once(bucket.clone())).unwrap();
+        let data = Bytes::from(vec![7; 2 * PAGE_SIZE as usize]);
+        let (endpoint, _, server_handle) =
+            spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
         let service = CacheyService::new(
             ServiceConfig {
                 cache: CacheConfig {
@@ -600,46 +605,46 @@ mod tests {
                 },
                 download_limits: DownloadLimits::default(),
             },
-            mock_s3_client("http://unused.invalid"),
+            mock_s3_client(&endpoint),
             axum_server::Handle::new(),
         )
         .await
         .expect("service");
-        let kind = ObjectKind::new("size-consistency").unwrap();
-        let object = ObjectKey::new("object").unwrap();
-        let bucket = BucketName::new("bucket").unwrap();
-        let buckets = BucketNameSet::new(std::iter::once(bucket.clone())).unwrap();
-        let data = Bytes::from(vec![7; PAGE_SIZE as usize]);
-        for (page_id, object_size) in [(0, 2 * PAGE_SIZE), (1, 3 * PAGE_SIZE)] {
-            service.cache.insert(
-                CacheKey {
-                    kind: kind.clone(),
-                    object: object.clone(),
-                    page_id,
-                },
-                CacheValue {
-                    bucket: bucket.clone(),
-                    mtime: 0,
-                    data: data.clone(),
-                    object_size,
-                    cached_at: 1,
-                },
-            );
-        }
+        service.cache.insert(
+            CacheKey {
+                kind: kind.clone(),
+                object: object.clone(),
+                page_id: 1,
+            },
+            CacheValue {
+                bucket,
+                mtime: 0,
+                data: data.slice(PAGE_SIZE as usize..),
+                object_size: 3 * PAGE_SIZE,
+                cached_at: 1,
+            },
+        );
         let read = |range| {
             service.clone().get(
                 kind.clone(),
                 object.clone(),
                 buckets.clone(),
                 range,
-                1,
+                2,
                 RequestConfig::default(),
             )
         };
-        let error = read(0..PAGE_SIZE + 1)
-            .try_collect::<Vec<_>>()
+        let mut chunks = std::pin::pin!(read(0..PAGE_SIZE + 1));
+        let first = chunks
+            .try_next()
             .await
-            .expect_err("inconsistent cached pages");
+            .expect("first page establishes the object size")
+            .expect("first chunk");
+        assert_eq!(first.object_size, 2 * PAGE_SIZE);
+        let error = chunks
+            .try_next()
+            .await
+            .expect_err("later cache hit disagrees with the first page");
         assert!(matches!(
             error,
             ServiceError::ObjectSizeInconsistency { prev, new }
@@ -651,6 +656,7 @@ mod tests {
             .expect("independent read of the newer page");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].object_size, 3 * PAGE_SIZE);
+        server_handle.abort();
     }
 
     #[tokio::test]
@@ -690,7 +696,6 @@ mod tests {
             kind: kind.clone(),
             object: object.clone(),
             buckets,
-            object_size: Arc::default(),
             req_config: RequestConfig::default(),
         };
         let (left, right) = tokio::join!(executor.clone().execute(0), executor.execute(0));
