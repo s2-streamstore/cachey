@@ -6,7 +6,7 @@ under errors, stalls, recovery, and limited capacity. No production traffic is u
 ## Revisions and reproduction
 
 - Before: `0d3cd24778407ed3d3f47938b7fd7e9969443c3a`.
-- After: `dc85f8e8b29029d1ad4d944c978a66d3fe05f049`, with a clean working tree.
+- After: `37d95cf3fd4d3d230f762f1d17a042f7b5ebca2d`, with a clean working tree.
 - Both use the simulation and fixtures from `d0754d6`, unchanged in the after revision.
   The baseline harness adapts the constructor and limits API and omits the new error
   variant; its routing and execution code are unchanged. The report records its dirty
