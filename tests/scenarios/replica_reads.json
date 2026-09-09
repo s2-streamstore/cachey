@@ -1,0 +1,473 @@
+[
+  {
+    "name": "healthy_zonal"
+  },
+  {
+    "name": "healthy_regional",
+    "replicas": [
+      {
+        "headers_ms": 10,
+        "body_ms": 0
+      },
+      {
+        "headers_ms": 60,
+        "body_ms": 0
+      },
+      {
+        "headers_ms": 150,
+        "body_ms": 0
+      }
+    ]
+  },
+  {
+    "name": "independent_errors",
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1,
+          2
+        ],
+        "kind": "body_error",
+        "probability_ppm": 100000,
+        "duration_ms": 1
+      }
+    ]
+  },
+  {
+    "name": "correlated_errors",
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1,
+          2
+        ],
+        "kind": "body_error",
+        "probability_ppm": 100000,
+        "duration_ms": 1,
+        "correlated": true
+      }
+    ]
+  },
+  {
+    "name": "third_after_errors",
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1
+        ],
+        "kind": "body_error",
+        "duration_ms": 1
+      }
+    ]
+  },
+  {
+    "name": "third_after_header_stalls",
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1
+        ],
+        "kind": "header_stall"
+      }
+    ]
+  },
+  {
+    "name": "third_after_body_stalls",
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1
+        ],
+        "kind": "body_stall"
+      }
+    ]
+  },
+  {
+    "name": "missing_objects",
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1
+        ],
+        "kind": "missing",
+        "probability_ppm": 100000,
+        "correlated": true,
+        "duration_ms": 1
+      }
+    ]
+  },
+  {
+    "name": "regional_deadline",
+    "page_timeout_ms": 500,
+    "bucket_timeout_ms": 500,
+    "replicas": [
+      {
+        "headers_ms": 10,
+        "body_ms": 0
+      },
+      {
+        "headers_ms": 60,
+        "body_ms": 0
+      },
+      {
+        "headers_ms": 150,
+        "body_ms": 0
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1
+        ],
+        "kind": "header_stall"
+      }
+    ]
+  },
+  {
+    "name": "distant_cannot_fit",
+    "page_timeout_ms": 100,
+    "bucket_timeout_ms": 100,
+    "replicas": [
+      {
+        "headers_ms": 10,
+        "body_ms": 0
+      },
+      {
+        "headers_ms": 60,
+        "body_ms": 0
+      },
+      {
+        "headers_ms": 150,
+        "body_ms": 0
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1
+        ],
+        "kind": "body_error",
+        "probability_ppm": 100000,
+        "duration_ms": 1
+      }
+    ]
+  },
+  {
+    "name": "guarded_recovery",
+    "duration_ms": 60000,
+    "interval_ms": 500,
+    "faults": [
+      {
+        "start_ms": 0,
+        "end_ms": 1,
+        "replicas": [
+          0
+        ],
+        "kind": "body_error",
+        "duration_ms": 1
+      }
+    ]
+  },
+  {
+    "name": "local_slowdown",
+    "faults": [
+      {
+        "kind": "slow",
+        "duration_ms": 19
+      }
+    ]
+  },
+  {
+    "name": "long_bodies",
+    "duration_ms": 6000,
+    "interval_ms": 100,
+    "body_bytes": 1048576,
+    "warmup_per_replica": 2,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 3999
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 3999
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 3999
+      }
+    ]
+  },
+  {
+    "name": "long_bodies_tight_admission",
+    "duration_ms": 6000,
+    "interval_ms": 100,
+    "body_bytes": 1048576,
+    "warmup_per_replica": 2,
+    "max_inflight_requests": 8,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 3999
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 3999
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 3999
+      }
+    ]
+  },
+  {
+    "name": "finite_capacity",
+    "interval_ms": 4,
+    "page_timeout_ms": 500,
+    "bucket_timeout_ms": 500,
+    "replicas": [
+      {
+        "slots": 1,
+        "queue": 8,
+        "headers_ms": 1,
+        "body_ms": 2
+      },
+      {
+        "slots": 1,
+        "queue": 8,
+        "headers_ms": 1,
+        "body_ms": 4
+      },
+      {
+        "slots": 1,
+        "queue": 8,
+        "headers_ms": 1,
+        "body_ms": 5
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1,
+          2
+        ],
+        "kind": "slow",
+        "duration_ms": 49
+      }
+    ]
+  },
+  {
+    "name": "finite_capacity_delayed_cancel",
+    "interval_ms": 4,
+    "page_timeout_ms": 500,
+    "bucket_timeout_ms": 500,
+    "cancellation_lag_ms": 100,
+    "replicas": [
+      {
+        "slots": 1,
+        "queue": 8,
+        "headers_ms": 1,
+        "body_ms": 2
+      },
+      {
+        "slots": 1,
+        "queue": 8,
+        "headers_ms": 1,
+        "body_ms": 4
+      },
+      {
+        "slots": 1,
+        "queue": 8,
+        "headers_ms": 1,
+        "body_ms": 5
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1,
+          2
+        ],
+        "kind": "slow",
+        "duration_ms": 49
+      }
+    ]
+  },
+  {
+    "name": "delayed_cancellation",
+    "duration_ms": 1,
+    "interval_ms": 20,
+    "hedge_percent": 5,
+    "cancellation_lag_ms": 50,
+    "faults": [
+      {
+        "start_ms": 0,
+        "end_ms": 1,
+        "kind": "body_stall"
+      }
+    ]
+  },
+  {
+    "name": "sdk_retry",
+    "duration_ms": 1000,
+    "interval_ms": 20,
+    "sdk_attempts": 3,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 2
+      }
+    ],
+    "faults": [
+      {
+        "start_ms": 0,
+        "end_ms": 1000,
+        "kind": "service_error",
+        "first_sdk_attempt_only": true,
+        "duration_ms": 1
+      }
+    ]
+  },
+  {
+    "name": "caller_cancellation",
+    "duration_ms": 200,
+    "interval_ms": 20,
+    "cancel_read_after_ms": 20,
+    "cancellation_lag_ms": 40,
+    "faults": [
+      {
+        "start_ms": 0,
+        "end_ms": 200,
+        "replicas": [
+          0,
+          1,
+          2
+        ],
+        "kind": "body_stall"
+      }
+    ]
+  },
+  {
+    "name": "recovery_during_peer_outage",
+    "duration_ms": 100000,
+    "interval_ms": 100,
+    "faults": [
+      {
+        "start_ms": 1000,
+        "end_ms": 50000,
+        "replicas": [
+          0
+        ],
+        "kind": "header_stall",
+        "clock_at_arrival": false
+      },
+      {
+        "start_ms": 50000,
+        "end_ms": 90000,
+        "replicas": [
+          1,
+          2
+        ],
+        "kind": "header_stall",
+        "clock_at_arrival": false
+      }
+    ]
+  },
+  {
+    "name": "healthy_jitter",
+    "jitter_percent": 30,
+    "hedge_percent": 5,
+    "duration_ms": 30000,
+    "interval_ms": 10
+  },
+  {
+    "name": "independent_errors_large",
+    "duration_ms": 60000,
+    "interval_ms": 2,
+    "faults": [
+      {
+        "start_ms": 0,
+        "end_ms": 60000,
+        "replicas": [
+          0,
+          1,
+          2
+        ],
+        "kind": "body_error",
+        "probability_ppm": 100000,
+        "duration_ms": 1
+      }
+    ]
+  },
+  {
+    "name": "queued_long_read",
+    "duration_ms": 2,
+    "interval_ms": 1,
+    "warmup_per_replica": 2,
+    "max_inflight_requests": 1,
+    "bucket_timeout_ms": 5000,
+    "page_timeout_ms": 10000,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 3999
+      }
+    ]
+  },
+  {
+    "name": "stalled_admission",
+    "duration_ms": 2,
+    "interval_ms": 1,
+    "max_inflight_requests": 2,
+    "bucket_timeout_ms": 100,
+    "page_timeout_ms": 100,
+    "faults": [
+      {
+        "start_ms": 0,
+        "end_ms": 2,
+        "replicas": [
+          0,
+          1
+        ],
+        "kind": "header_stall"
+      }
+    ]
+  },
+  {
+    "name": "finite_capacity_cancel_storm",
+    "duration_ms": 3000,
+    "interval_ms": 5,
+    "cancel_read_after_ms": 20,
+    "cancellation_lag_ms": 100,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 40,
+        "slots": 1,
+        "queue": 4
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 40,
+        "slots": 1,
+        "queue": 4
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 40,
+        "slots": 1,
+        "queue": 4
+      }
+    ]
+  }
+]

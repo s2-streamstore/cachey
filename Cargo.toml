@@ -52,6 +52,7 @@ tracing-subscriber = "0.3"
 jemalloc = ["dep:tikv-jemallocator", "dep:jemalloc_pprof", "dep:tikv-jemalloc-ctl"]
 
 [dev-dependencies]
+aws-smithy-types = { version = "1.6.2", features = ["test-util"] }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http2", "tokio"] }
 proptest = "1.11"

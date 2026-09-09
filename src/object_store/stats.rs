@@ -52,10 +52,15 @@ struct BucketStats {
 }
 
 fn histogram(now: Instant) -> ExponentialDecayHistogram {
-    ExponentialDecayHistogram::builder()
+    let mut builder = ExponentialDecayHistogram::builder();
+    builder
         .at(now.into_std())
-        .alpha(std::f64::consts::LN_2 / 5.0)
-        .build()
+        .alpha(std::f64::consts::LN_2 / 5.0);
+    #[cfg(test)]
+    if let Some(capacity) = super::simulation::histogram_capacity() {
+        builder.size(capacity);
+    }
+    builder.build()
 }
 
 impl Default for BucketStats {
@@ -234,8 +239,13 @@ impl Drop for BucketObservation {
 }
 
 fn recovery_delay() -> Duration {
-    // Each new hasher is randomly seeded, independently across processes.
     use std::hash::{BuildHasher, RandomState};
+
+    #[cfg(test)]
+    if let Some(delay) = super::simulation::recovery_delay() {
+        return delay;
+    }
+    // Each new hasher is randomly seeded, independently across processes.
     Duration::from_millis(24_000 + RandomState::new().hash_one(()) % 12_001)
 }
 
@@ -382,6 +392,17 @@ impl BucketedStats {
 
     pub(super) fn overloaded(&self, bucket: &BucketName) -> bool {
         Instant::now() < self.entry(bucket).lock().overload_until
+    }
+
+    #[cfg(test)]
+    pub(super) fn simulation_histograms(&self) -> Vec<(u64, usize)> {
+        self.by_bucket
+            .iter()
+            .map(|entry| {
+                let snapshot = entry.value().lock().histogram.snapshot();
+                (snapshot.count(), snapshot.exemplars().count())
+            })
+            .collect()
     }
 
     pub fn export_bucket_metrics(&self, mut f: impl FnMut(&BucketName, &BucketMetrics)) {

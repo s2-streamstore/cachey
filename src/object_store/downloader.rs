@@ -208,6 +208,11 @@ impl Downloader {
         Ok(self)
     }
 
+    #[cfg(test)]
+    pub(super) fn simulation_histograms(&self) -> Vec<(u64, usize)> {
+        self.bucketed_stats.simulation_histograms()
+    }
+
     pub fn observe_bucket_metrics(&self, f: impl FnMut(&BucketName, &BucketMetrics)) {
         self.bucketed_stats.export_bucket_metrics(f);
     }
@@ -354,6 +359,8 @@ impl Downloader {
         byterange: &Range<u64>,
         req_config: &RequestConfig,
     ) -> Result<ObjectPiece, DownloadError> {
+        #[cfg(test)]
+        let _simulation_copy = crate::object_store::simulation::record_copy(object, bucket);
         let result = self
             .attempt_inner(bucket, object, byterange, req_config)
             .await;

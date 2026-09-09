@@ -995,6 +995,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "axum",
  "axum-server",
  "bytes",
