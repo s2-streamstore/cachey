@@ -3,7 +3,7 @@
 ## Reproduction
 
 - Before: `0d3cd24778407ed3d3f47938b7fd7e9969443c3a`.
-- After: `4a50aa2503c1f8f861681daaf127911154efe06c`, clean working tree.
+- After: `c61231ea5fe961d44e1fd0cb06160e58d8455ce7`, clean working tree.
 - Harness and fixtures: `d0754d6`. The baseline adapter changes only harness API
   compatibility; its patch digest is recorded in [reference.json](reference.json).
 
