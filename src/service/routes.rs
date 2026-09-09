@@ -45,7 +45,7 @@ fn on_chunk_error(
             if let Some(object_size) = object_size {
                 headers.insert(
                     header::CONTENT_RANGE,
-                    HeaderValue::from_str(&format!("bytes */{object_size}"))
+                    HeaderValue::try_from(format!("bytes */{object_size}"))
                         .expect("valid content-range"),
                 );
             }
@@ -264,16 +264,16 @@ pub async fn fetch(
             headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
             headers.insert(
                 header::CONTENT_LENGTH,
-                HeaderValue::from_str(&(last_byte - first_byte + 1).to_string()).unwrap(),
+                HeaderValue::from(last_byte - first_byte + 1),
             );
             headers.insert(
                 header::CONTENT_RANGE,
-                HeaderValue::from_str(&format!("bytes {first_byte}-{last_byte}/{object_size}"))
+                HeaderValue::try_from(format!("bytes {first_byte}-{last_byte}/{object_size}"))
                     .unwrap(),
             );
             headers.insert(
                 header::LAST_MODIFIED,
-                HeaderValue::from_str(&httpdate::fmt_http_date(
+                HeaderValue::try_from(httpdate::fmt_http_date(
                     SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(chunk.mtime)),
                 ))
                 .unwrap(),
