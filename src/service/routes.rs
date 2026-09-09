@@ -46,6 +46,11 @@ impl ChunkErrorResponse {
                 metric_code: "range_not_satisfiable",
                 headers: range_not_satisfied_headers(*object_size),
             },
+            ServiceError::Download(DownloadError::Timeout { .. }) => Self {
+                status_code: StatusCode::GATEWAY_TIMEOUT,
+                metric_code: "timeout",
+                headers: HeaderMap::new(),
+            },
             ServiceError::ObjectSizeInconsistency { .. } => Self {
                 status_code: StatusCode::CONFLICT,
                 metric_code: "object_size_inconsistency",
@@ -549,6 +554,20 @@ mod tests {
         assert_eq!(
             response.headers.get(header::CONTENT_RANGE).unwrap(),
             "bytes */512"
+        );
+    }
+
+    #[test]
+    fn download_timeout_returns_gateway_timeout() {
+        let error = ServiceError::Download(DownloadError::Timeout {
+            bucket: BucketName::new("bucket").unwrap(),
+            timeout: Duration::from_secs(5),
+        });
+        let response = ChunkErrorResponse::from_error(0, &error);
+        assert_eq!(response.metric_code, "timeout");
+        assert_eq!(
+            response.into_response(error.to_string()).status(),
+            StatusCode::GATEWAY_TIMEOUT
         );
     }
 

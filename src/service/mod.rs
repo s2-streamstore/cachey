@@ -24,7 +24,7 @@ mod routes;
 
 use crate::{
     cache::{CacheConfig, CacheKey, CacheValue, build_cache},
-    object_store::{DownloadError, Downloader, RequestConfig},
+    object_store::{DownloadError, DownloadLimits, Downloader, RequestConfig},
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind, PageId},
 };
 
@@ -76,6 +76,7 @@ fn slice_page_data(
 pub struct ServiceConfig {
     pub cache: CacheConfig,
     pub hedge_quantile: f64,
+    pub download_limits: DownloadLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +94,7 @@ pub enum ServiceError {
     /// 500
     #[error("Cache error: {0}")]
     Cache(#[from] foyer::Error),
-    /// `NoSuchKey` 404; `RangeNotSatisfied` 416; otherwise 500
+    /// `NoSuchKey` 404; `RangeNotSatisfied` 416; timeout 504; otherwise 500
     #[error("Object store: {0}")]
     Download(#[from] DownloadError),
     /// 409
@@ -119,7 +120,8 @@ impl CacheyService {
         let cache = build_cache(config.cache).await?;
         let ingress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
         let egress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
-        let downloader = Downloader::new(s3, config.hedge_quantile, ingress_throughput.clone());
+        let downloader = Downloader::new(s3, config.hedge_quantile, ingress_throughput.clone())
+            .with_limits(config.download_limits)?;
         Ok(Self {
             cache,
             downloader,

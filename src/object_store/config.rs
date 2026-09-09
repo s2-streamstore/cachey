@@ -2,6 +2,53 @@ use std::time::Duration;
 
 use aws_sdk_s3::config::{retry::RetryConfig, timeout::TimeoutConfig};
 
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadLimits {
+    /// Maximum duration of a bucket race, through body validation.
+    pub bucket_timeout: Duration,
+    /// Maximum duration across bucket selection and fallback.
+    pub page_timeout: Duration,
+    /// Concurrent hedges across this downloader and its clones; zero disables hedges.
+    pub max_concurrent_hedges: u16,
+    /// Hedge credits earned per successful bucket fetch, as a percentage (0–100).
+    pub hedge_budget_percent: u8,
+}
+
+impl Default for DownloadLimits {
+    fn default() -> Self {
+        Self {
+            bucket_timeout: Duration::from_secs(5),
+            page_timeout: Duration::from_secs(10),
+            max_concurrent_hedges: 16,
+            hedge_budget_percent: 5,
+        }
+    }
+}
+
+impl DownloadLimits {
+    pub(crate) fn validate(self) -> eyre::Result<()> {
+        eyre::ensure!(
+            !self.bucket_timeout.is_zero(),
+            "bucket timeout must be positive"
+        );
+        eyre::ensure!(
+            !self.page_timeout.is_zero(),
+            "page timeout must be positive"
+        );
+        eyre::ensure!(
+            self.hedge_budget_percent <= 100,
+            "hedge budget must be between 0 and 100 percent"
+        );
+        eyre::ensure!(
+            std::time::Instant::now()
+                .checked_add(self.page_timeout)
+                .is_some(),
+            "page timeout exceeds the clock's supported range"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RequestConfig {
     pub connect_timeout: Option<Duration>,
@@ -90,7 +137,46 @@ mod tests {
 
     use aws_sdk_s3::config::{retry::RetryConfig, timeout::TimeoutConfig};
 
-    use crate::object_store::config::RequestConfig;
+    use crate::object_store::config::{DownloadLimits, RequestConfig};
+
+    #[test]
+    fn download_limits_reject_invalid_deadlines_and_budget() {
+        for limits in [
+            DownloadLimits {
+                bucket_timeout: Duration::ZERO,
+                ..DownloadLimits::default()
+            },
+            DownloadLimits {
+                page_timeout: Duration::ZERO,
+                ..DownloadLimits::default()
+            },
+            DownloadLimits {
+                page_timeout: Duration::MAX,
+                ..DownloadLimits::default()
+            },
+            DownloadLimits {
+                hedge_budget_percent: 101,
+                ..DownloadLimits::default()
+            },
+        ] {
+            assert!(limits.validate().is_err(), "accepted {limits:?}");
+        }
+    }
+
+    #[test]
+    fn download_limits_allow_disabled_hedging_and_bucket_budget_above_page_budget() {
+        assert!(DownloadLimits::default().validate().is_ok());
+        assert!(
+            DownloadLimits {
+                bucket_timeout: Duration::MAX,
+                max_concurrent_hedges: 0,
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
 
     #[test]
     fn merged_timeout_config_preserves_unset_base_fields() {

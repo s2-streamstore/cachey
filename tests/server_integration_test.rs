@@ -30,6 +30,7 @@ async fn setup_test_server() -> TestContext {
             metrics_registry: Some(prometheus::Registry::new()),
         },
         hedge_quantile: 0.99,
+        download_limits: cachey::object_store::DownloadLimits::default(),
     };
 
     let server_handle = axum_server::Handle::new();

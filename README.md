@@ -44,10 +44,12 @@ Space-separated key-value pairs to override S3 request configuration per page mi
 - `rt=<ms>` Read timeout (time-to-first-byte)
 - `ot=<ms>` Operation timeout (across retries)
 - `oat=<ms>` Operation attempt timeout
-- `ma=<num>` Maximum attempts
+- `ma=<num>` Maximum attempts for each bucket's primary SDK operation
 - `ib=<ms>` Initial backoff duration
 - `mb=<ms>` Maximum backoff duration
 - `fps=<bool>` Force path-style addressing
+
+SDK overrides apply within the server's bucket and page download deadlines. A hedge uses the same overrides with one SDK attempt, so retries cannot multiply speculative requests.
 
 #### Example Request
 
@@ -98,9 +100,11 @@ C0-Status: 16777216-18874367; us-west-videos; 0
 
 ### Latency and hedging
 
-A bucket fetch starts with its primary SDK operation and ends when the primary/hedge race produces validated page data or a terminal error. Its duration includes SDK retries and backoff, the wait before starting a hedge, body transfer, and validation. Each completed bucket fetch contributes one outcome to bucket stats: a successful fetch adds one latency sample; a failed fetch updates the error rate and consecutive-failure count. A failed peer rescued by its sibling is one successful bucket fetch. Canceled peers and canceled bucket fetches add no observations.
+A bucket fetch starts with its primary SDK operation and ends when the primary/hedge race produces validated page data or a terminal error. Its duration includes SDK retries and backoff, the wait before starting a hedge, body transfer, and validation. Each completed bucket fetch contributes one outcome to bucket stats: a successful fetch adds one latency sample; a failed fetch, including a deadline expiry, updates the error rate and consecutive-failure count. A failed peer rescued by its sibling is one successful bucket fetch. Canceled peers and caller-canceled bucket fetches add no observations.
 
 The hedge timer uses the configured quantile of these successful bucket-fetch durations. A winning hedge is measured from the original primary start, so it cannot contribute a sample shorter than the time spent waiting to launch it. These samples describe latency delivered with the current hedging policy; they do not estimate how long canceled primary requests would have taken. There is no hedge until the bucket has a successful latency sample, and `--hedge-quantile 0` disables hedging. Latency snapshots refresh at most once per second.
+
+Hedges share a success-funded budget across the downloader and all its clones. The default allowance is one startup hedge plus one credit per 20 successful bucket fetches (`--hedge-budget-percent 5`). Both the global budget and the target bucket's budget must allow a hedge. Stored credits and concurrent hedges are capped at 16 globally (`--max-concurrent-hedges`) and two per bucket, allowing bounded bursts. Failures and cancellations earn no credit; canceling a hedge releases its concurrency slot but does not refund its spent credit. A hedge denied by the budget is skipped. Setting either budget option to zero disables hedging.
 
 | Measurement | Boundary |
 |------------|----------|
@@ -112,7 +116,11 @@ The hedge timer uses the configured quantile of these successful bucket-fetch du
 
 Bucket fallback has its own clock and stats: the fallback bucket is not charged for the failed first bucket. The Rust `DownloadOutput` carries total `latency` and a `hedged` flag for a hedge started in either bucket; `ObjectPiece` carries the returned data and object metadata. The `hedged` page counter counts successful page downloads with that flag, including a primary winner or a hedge in a failed first bucket. Failed page downloads and client response-body transmission are not included in the success latency histograms.
 
-Full body transfer increases the measured latency and therefore can increase hedge delays and change bucket rankings. It does not change request deadlines: [AWS SDK operation timeouts exclude response-body consumption](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/timeouts.html), and the latency measurements do not impose an additional timeout. Hedging, retries, and the two-bucket limit remain separate controls.
+Full body transfer increases the measured latency and therefore can increase hedge delays and change bucket rankings. Since [AWS SDK operation timeouts exclude response-body consumption](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/timeouts.html), Cachey also bounds the full bucket race, including retries, backoff, and body validation. The defaults are 5 seconds per bucket (`--bucket-timeout-ms 5000`) and 10 seconds per page download (`--page-timeout-ms 10000`).
+
+When a fallback bucket is available, the first bucket receives at most half the page budget, capped by the bucket timeout. The fallback receives the remaining page time, also capped by the bucket timeout. A bucket deadline cancels both racing requests before fallback starts. The page clock starts before bucket selection and does not restart for fallback. An exhausted download that ends in a timeout returns HTTP 504 for the first chunk; a later timeout ends the response body with an error.
+
+Rust callers can configure `DownloadLimits` through `Downloader::with_limits` before cloning the downloader, or through `ServiceConfig::download_limits`. `Downloader::new` uses the same defaults as the server. Timeouts must be positive, and the hedge budget percentage must be in `0..=100`.
 
 ## Command line
 
@@ -130,8 +138,18 @@ Options:
           Kind of disk cache, which may be a file system or block device [default: fs] [possible values: block, fs]
       --disk-capacity <DISK_CAPACITY>
           Maximum disk cache capacity (e.g., "100GiB") If not specified, up to 80% of the available space will be used
+      --iouring
+          Use `io_uring` (if available) for disk IO
       --hedge-quantile <HEDGE_QUANTILE>
           Latency quantile for making hedged requests (0.0-1.0, use 0 to disable hedging) [default: 0.99]
+      --bucket-timeout-ms <BUCKET_TIMEOUT_MS>
+          Maximum bucket download time through body validation, in milliseconds [default: 5000]
+      --page-timeout-ms <PAGE_TIMEOUT_MS>
+          Maximum page download time including fallback, in milliseconds [default: 10000]
+      --max-concurrent-hedges <MAX_CONCURRENT_HEDGES>
+          Maximum concurrent hedges across all buckets (0 disables hedging) [default: 16]
+      --hedge-budget-percent <HEDGE_BUDGET_PERCENT>
+          Hedge allowance earned per successful bucket fetch, as a percentage [default: 5]
       --tls-self
           Use a self-signed certificate for TLS
       --tls-cert <TLS_CERT>

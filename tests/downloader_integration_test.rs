@@ -314,6 +314,7 @@ async fn test_fallback_bucket_circuit_breaker_recovers_for_new_primary_failures(
 
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
 
     let recovered_metrics = bucket_metrics(&downloader, &primary_bucket);
     assert!(!recovered_metrics.circuit_breaker_open);
