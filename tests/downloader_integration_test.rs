@@ -31,8 +31,7 @@ fn make_downloader(client: aws_sdk_s3::Client) -> Downloader {
 async fn downloads_ranges_and_reports_object_boundaries() {
     let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone());
-    let buckets =
-        BucketNameSet::new(std::iter::once(BucketName::new(&ctx.bucket_name).unwrap())).unwrap();
+    let buckets = BucketNameSet::from(BucketName::new(&ctx.bucket_name).unwrap());
     for size in [1024, PAGE_SIZE + 100] {
         let data = Bytes::from(
             (0..size)
@@ -80,7 +79,7 @@ async fn missing_primary_falls_back_without_poisoning_health() {
     let key = ObjectKey::new("object").unwrap();
     upload_test_object(&ctx.client, peer, &key, data.clone()).await;
     let primary = BucketName::new(&ctx.bucket_name).unwrap();
-    let primary_only = BucketNameSet::new(std::iter::once(primary.clone())).unwrap();
+    let primary_only = BucketNameSet::from(primary.clone());
     let range = 0..PAGE_SIZE;
     for _ in 0..10 {
         let result = downloader

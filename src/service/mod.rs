@@ -584,7 +584,7 @@ mod tests {
         let kind = ObjectKind::new("size-consistency").unwrap();
         let object = ObjectKey::new("object").unwrap();
         let bucket = BucketName::new("bucket").unwrap();
-        let buckets = BucketNameSet::new(std::iter::once(bucket.clone())).unwrap();
+        let buckets = BucketNameSet::from(bucket.clone());
         let data = Bytes::from(vec![7; 2 * PAGE_SIZE as usize]);
         let (endpoint, _, server_handle) =
             spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
@@ -656,7 +656,7 @@ mod tests {
         let kind = ObjectKind::new(unique_name("kind")).expect("kind");
         let object = ObjectKey::new(unique_name("object")).expect("object");
         let bucket = BucketName::new(unique_name("bucket")).expect("bucket");
-        let buckets = BucketNameSet::new(std::iter::once(bucket.clone())).expect("buckets");
+        let buckets = BucketNameSet::from(bucket.clone());
         let object_data = Bytes::from(vec![7_u8; 4096]);
 
         let (endpoint, request_count, server_handle) = spawn_mock_s3_server(

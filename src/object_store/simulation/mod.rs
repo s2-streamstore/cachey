@@ -154,7 +154,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
             .unwrap();
             let range = 0..scenario.request_bytes();
             for (replica, bucket) in buckets.iter().enumerate() {
-                let singleton = BucketNameSet::new(std::iter::once(bucket.clone())).unwrap();
+                let singleton = BucketNameSet::from(bucket.clone());
                 for warm in 0..scenario.warmup_per_replica {
                     let id = WARM_READ + replica as u64 * 1_000_000 + u64::from(warm);
                     // Calibration needs to measure even a replica that cannot meet the campaign

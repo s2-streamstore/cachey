@@ -169,6 +169,12 @@ impl BucketNameSet {
     }
 }
 
+impl From<BucketName> for BucketNameSet {
+    fn from(bucket: BucketName) -> Self {
+        Self(vec![bucket])
+    }
+}
+
 impl std::ops::Deref for BucketNameSet {
     type Target = [BucketName];
 
@@ -188,7 +194,7 @@ impl IntoIterator for BucketNameSet {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{BucketName, ObjectKey, ObjectKind};
 
     #[test]
     fn bucket_name_rejects_control_characters() {

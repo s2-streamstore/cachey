@@ -716,8 +716,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_request_ranges_do_not_reach_the_backend() {
         let (downloader, script) = scripted_downloader([]);
-        let buckets =
-            BucketNameSet::new(std::iter::once(BucketName::new("bucket").unwrap())).unwrap();
+        let buckets = BucketNameSet::from(BucketName::new("bucket").unwrap());
         for range in [Range { start: 10, end: 10 }, Range { start: 10, end: 1 }] {
             let result = downloader
                 .download(
@@ -958,7 +957,7 @@ mod tests {
             .chain(std::iter::repeat_n(("bucket", 10, 490, false), 101));
         let (downloader, script) = scripted_downloader(responses);
         fetch(&downloader, &["bucket"]).await;
-        let buckets = BucketNameSet::new([BucketName::new("bucket").unwrap()].into_iter()).unwrap();
+        let buckets = BucketNameSet::from(BucketName::new("bucket").unwrap());
         let requests = (0..100).map(|index| {
             let downloader = downloader.clone();
             let buckets = &buckets;

@@ -217,11 +217,10 @@ pub async fn fetch(
     let start = Instant::now();
 
     let buckets = if buckets.is_empty() {
-        BucketNameSet::new(std::iter::once(kind.clone().into()))
+        BucketName::from(kind.clone()).into()
     } else {
-        BucketNameSet::new(buckets.into_iter())
-    }
-    .expect("non-empty set");
+        BucketNameSet::new(buckets.into_iter()).expect("non-empty set")
+    };
 
     debug!(%kind, %object, ?buckets, ?byterange, "processing");
 
