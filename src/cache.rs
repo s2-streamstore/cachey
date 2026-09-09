@@ -422,7 +422,7 @@ impl foyer::Code for CacheValue {
 #[cfg(test)]
 mod tests {
     use foyer::Code;
-    use proptest::{collection, prop_assert_eq, prop_assume, proptest};
+    use proptest::{collection, prop_assert_eq, proptest};
 
     use super::{CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader};
     use crate::{
@@ -433,21 +433,12 @@ mod tests {
     #[test]
     fn test_cache_key_header() {
         let header = CacheKeyHeader::new(255, 63, 1024, 65535).unwrap();
-        assert_eq!(header.version(), 255);
-        assert_eq!(header.kind_len(), 63);
-        assert_eq!(header.key_len(), 1024);
-        assert_eq!(header.page_id(), 65535);
-
         assert_eq!(header.to_bytes(), [0xff, 0xfb, 0xff, 0xff, 0xff]);
 
-        let header_max = CacheKeyHeader::new(1, 64, 1024, 65535).unwrap();
-        assert_eq!(header_max.kind_len(), 64);
-
-        // Test error cases
-        assert!(CacheKeyHeader::new(0, 0, 0, 0).is_err()); // kind_len cannot be zero
-        assert!(CacheKeyHeader::new(0, 65, 0, 0).is_err()); // kind_len too large (> 64)
-        assert!(CacheKeyHeader::new(0, 1, 0, 0).is_err()); // key_len cannot be zero
-        assert!(CacheKeyHeader::new(0, 1, 1025, 0).is_err()); // key_len too large (> 1024)
+        assert!(CacheKeyHeader::new(0, 0, 0, 0).is_err());
+        assert!(CacheKeyHeader::new(0, 65, 0, 0).is_err());
+        assert!(CacheKeyHeader::new(0, 1, 0, 0).is_err());
+        assert!(CacheKeyHeader::new(0, 1, 1025, 0).is_err());
     }
 
     #[test]
@@ -455,12 +446,6 @@ mod tests {
         let header =
             CacheValueHeader::new(63, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1_700_000_000)
                 .unwrap();
-        assert_eq!(header.bucket_name_len(), 63);
-        assert_eq!(header.object_size(), (1 << 40) - 1);
-        assert_eq!(header.mtime(), u32::MAX);
-        assert_eq!(header.data_len(), (1 << 24) - 1);
-        assert_eq!(header.cached_at(), 1_700_000_000);
-
         assert_eq!(
             header.to_bytes(),
             [
@@ -469,20 +454,10 @@ mod tests {
             ]
         );
 
-        // Test maximum bucket_name_len (64)
-        let header_max =
-            CacheValueHeader::new(64, (1 << 40) - 1, u32::MAX, (1 << 24) - 1, 1_700_000_000)
-                .unwrap();
-        assert_eq!(header_max.bucket_name_len(), 64);
-        let bytes_max = header_max.to_bytes();
-        let decoded_max = CacheValueHeader::from_bytes(bytes_max).unwrap();
-        assert_eq!(decoded_max.bucket_name_len(), 64);
-
-        // Test error cases
-        assert!(CacheValueHeader::new(0, 0, 0, 0, 0).is_err()); // bucket_name_len cannot be zero
-        assert!(CacheValueHeader::new(65, 0, 0, 0, 0).is_err()); // bucket_name_len too large (> 64)
-        assert!(CacheValueHeader::new(1, 1 << 40, 0, 0, 0).is_err()); // object_size too large
-        assert!(CacheValueHeader::new(1, 0, 0, (1 << 24) + 1, 0).is_err()); // data_len too large
+        assert!(CacheValueHeader::new(0, 0, 0, 0, 0).is_err());
+        assert!(CacheValueHeader::new(65, 0, 0, 0, 0).is_err());
+        assert!(CacheValueHeader::new(1, 1 << 40, 0, 0, 0).is_err());
+        assert!(CacheValueHeader::new(1, 0, 0, (1 << 24) + 1, 0).is_err());
     }
 
     #[test]
@@ -504,69 +479,22 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_key_encode_decode() {
-        let key = CacheKey {
-            kind: ObjectKind::new("test-kind").unwrap(),
-            object: ObjectKey::new("test/object.txt").unwrap(),
-            page_id: 42,
-        };
-
-        let mut encoded = Vec::new();
-        key.encode(&mut encoded).unwrap();
-
-        let mut reader = std::io::Cursor::new(encoded);
-        let decoded = CacheKey::decode(&mut reader).unwrap();
-
-        assert_eq!(key, decoded);
-    }
-
-    #[test]
-    fn test_cache_value_encode_decode() {
-        let value = CacheValue {
-            bucket: BucketName::new("test-bucket").unwrap(),
-            mtime: 1_234_567_890,
-            object_size: 9_876_543_210,
-            data: bytes::Bytes::from(vec![1, 2, 3, 4, 5]),
-            cached_at: 1_700_000_000,
-        };
-
-        let mut encoded = Vec::new();
-        value.encode(&mut encoded).unwrap();
-
-        let mut reader = std::io::Cursor::new(encoded);
-        let decoded = CacheValue::decode(&mut reader).unwrap();
-
-        assert_eq!(value.bucket, decoded.bucket);
-        assert_eq!(value.mtime, decoded.mtime);
-        assert_eq!(value.object_size, decoded.object_size);
-        assert_eq!(value.data, decoded.data);
-        assert_eq!(value.cached_at, decoded.cached_at);
-    }
-
-    #[test]
     fn test_max_length_bucket_and_kind() {
-        let bucket_64 = "a".repeat(64);
-        let kind_64 = "b".repeat(64);
-        let key = "c".repeat(100);
-
         let cache_key = CacheKey {
-            kind: ObjectKind::new(kind_64).unwrap(),
-            object: ObjectKey::new(key).unwrap(),
+            kind: ObjectKind::new("b".repeat(64)).unwrap(),
+            object: ObjectKey::new("c".repeat(1024)).unwrap(),
             page_id: 42,
         };
 
         let mut encoded_key = Vec::new();
         cache_key.encode(&mut encoded_key).unwrap();
 
-        let mut reader = std::io::Cursor::new(encoded_key);
-        let decoded_key = CacheKey::decode(&mut reader).unwrap();
+        let decoded_key = CacheKey::decode(&mut encoded_key.as_slice()).unwrap();
 
-        assert_eq!(cache_key.kind.len(), 64);
-        assert_eq!(decoded_key.kind.len(), 64);
         assert_eq!(cache_key, decoded_key);
 
         let cache_value = CacheValue {
-            bucket: BucketName::new(bucket_64).unwrap(),
+            bucket: BucketName::new("a".repeat(64)).unwrap(),
             mtime: 1_234_567_890,
             object_size: 9_876_543_210,
             data: bytes::Bytes::from(vec![1, 2, 3, 4, 5]),
@@ -576,15 +504,11 @@ mod tests {
         let mut encoded_value = Vec::new();
         cache_value.encode(&mut encoded_value).unwrap();
 
-        let mut reader = std::io::Cursor::new(encoded_value);
-        let decoded_value = CacheValue::decode(&mut reader).unwrap();
+        let decoded_value = CacheValue::decode(&mut encoded_value.as_slice()).unwrap();
 
-        assert_eq!(cache_value.bucket.len(), 64);
-        assert_eq!(decoded_value.bucket.len(), 64);
-        assert_eq!(cache_value.bucket, decoded_value.bucket);
+        assert_eq!(cache_value, decoded_value);
     }
 
-    // Property-based tests
     proptest! {
         #[test]
         fn prop_cache_key_header_preserves_fields(
@@ -621,19 +545,13 @@ mod tests {
 
         #[test]
         fn prop_cache_key_roundtrip(
-            kind in "[a-z0-9.-]{1,63}",
-            object in "[a-zA-Z0-9/_.-]{1,1000}",
+            kind in "[a-z0-9.-]{1,64}",
+            object in "[a-zA-Z0-9/_.-]{1,1024}",
             page_id in 0u16..=u16::MAX
         ) {
-            let kind = ObjectKind::new(kind);
-            prop_assume!(kind.is_ok());
-
-            let object = ObjectKey::new(object);
-            prop_assume!(object.is_ok());
-
             let key = CacheKey {
-                kind: kind.unwrap(),
-                object: object.unwrap(),
+                kind: ObjectKind::new(kind).unwrap(),
+                object: ObjectKey::new(object).unwrap(),
                 page_id,
             };
 
@@ -642,25 +560,21 @@ mod tests {
 
             prop_assert_eq!(key.estimated_size(), encoded.len());
 
-            let mut reader = std::io::Cursor::new(encoded);
-            let decoded = CacheKey::decode(&mut reader).unwrap();
+            let decoded = CacheKey::decode(&mut encoded.as_slice()).unwrap();
 
             prop_assert_eq!(key, decoded);
         }
 
         #[test]
         fn prop_cache_value_roundtrip(
-            bucket_name in "[a-z0-9.-]{3,63}",
+            bucket_name in "[a-z0-9.-]{1,64}",
             mtime in 0u32..=u32::MAX,
             object_size in 0u64..(1u64 << 40),
             data in collection::vec(0u8..=255, 0..1000),
             cached_at in 0u32..=u32::MAX
         ) {
-            let bucket = BucketName::new(bucket_name);
-            prop_assume!(bucket.is_ok());
-
             let value = CacheValue {
-                bucket: bucket.unwrap(),
+                bucket: BucketName::new(bucket_name).unwrap(),
                 mtime,
                 object_size,
                 data: bytes::Bytes::from(data),
@@ -672,65 +586,33 @@ mod tests {
 
             prop_assert_eq!(value.estimated_size(), encoded.len());
 
-            let mut reader = std::io::Cursor::new(encoded);
-            let decoded = CacheValue::decode(&mut reader).unwrap();
+            let decoded = CacheValue::decode(&mut encoded.as_slice()).unwrap();
 
-            prop_assert_eq!(value.bucket, decoded.bucket);
-            prop_assert_eq!(value.mtime, decoded.mtime);
-            prop_assert_eq!(value.object_size, decoded.object_size);
-            prop_assert_eq!(value.data, decoded.data);
-            prop_assert_eq!(value.cached_at, decoded.cached_at);
+            prop_assert_eq!(value, decoded);
         }
     }
 
     #[test]
     fn test_cache_key_decode_errors() {
-        // Test invalid header (not enough bytes)
-        let data = vec![0xFF, 0xFF, 0xFF, 0xFF]; // Invalid header - only 4 bytes instead of 5
-        let mut reader = std::io::Cursor::new(data);
-        assert!(CacheKey::decode(&mut reader).is_err());
+        assert!(CacheKey::decode(&mut [0xff; 4].as_slice()).is_err());
 
-        // Test unsupported version
-        let header = CacheKeyHeader::new(0, 4, 4, 0).unwrap(); // version 0 (old version)
-        let mut data = Vec::new();
-        data.extend_from_slice(&header.to_bytes());
-        data.extend_from_slice(b"kind"); // object kind
-        data.extend_from_slice(b"test"); // object key
-        let mut reader = std::io::Cursor::new(data);
-        assert!(CacheKey::decode(&mut reader).is_err());
-
-        // Test invalid UTF-8 in object kind
-        let header = CacheKeyHeader::new(CacheKey::VERSION, 4, 4, 0).unwrap();
-        let mut data = Vec::new();
-        data.extend_from_slice(&header.to_bytes());
-        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // invalid UTF-8 in kind
-        data.extend_from_slice(b"test"); // object key
-        let mut reader = std::io::Cursor::new(data);
-        assert!(CacheKey::decode(&mut reader).is_err());
-
-        // Test invalid UTF-8 in object key
-        let header = CacheKeyHeader::new(CacheKey::VERSION, 4, 4, 0).unwrap();
-        let mut data = Vec::new();
-        data.extend_from_slice(&header.to_bytes());
-        data.extend_from_slice(b"kind"); // object kind
-        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // invalid UTF-8 in key
-        let mut reader = std::io::Cursor::new(data);
-        assert!(CacheKey::decode(&mut reader).is_err());
+        for (version, kind, object) in [
+            (0, b"kind", b"test"),
+            (CacheKey::VERSION, b"\xff\xff\xff\xff", b"test"),
+            (CacheKey::VERSION, b"kind", b"\xff\xff\xff\xff"),
+        ] {
+            let header = CacheKeyHeader::new(version, kind.len(), object.len(), 0).unwrap();
+            let data = [header.to_bytes().as_slice(), kind, object].concat();
+            assert!(CacheKey::decode(&mut data.as_slice()).is_err());
+        }
     }
 
     #[test]
     fn test_cache_value_decode_errors() {
-        // Test invalid header
-        let data = vec![0xFF; 17]; // Invalid header with reserved bits set
-        let mut reader = std::io::Cursor::new(data);
-        assert!(CacheValue::decode(&mut reader).is_err());
+        assert!(CacheValue::decode(&mut [0xff; 17].as_slice()).is_err());
 
-        // Test invalid UTF-8 in bucket name
         let header = CacheValueHeader::new(4, 0, 0, 0, 0).unwrap();
-        let mut data = Vec::new();
-        data.extend_from_slice(&header.to_bytes());
-        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // invalid UTF-8
-        let mut reader = std::io::Cursor::new(data);
-        assert!(CacheValue::decode(&mut reader).is_err());
+        let data = [header.to_bytes().as_slice(), &[0xff; 4]].concat();
+        assert!(CacheValue::decode(&mut data.as_slice()).is_err());
     }
 }

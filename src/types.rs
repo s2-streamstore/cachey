@@ -203,54 +203,31 @@ mod tests {
     }
 
     #[test]
-    fn object_kind_rejects_control_characters() {
-        let result = ObjectKind::new("kind\nname");
-        assert_eq!(result, Err("Object kind cannot contain control characters"));
+    fn object_kind_deserialization_enforces_validation() {
+        let kind: ObjectKind = serde_json::from_str(r#""valid-kind""#).unwrap();
+        assert_eq!(&*kind, "valid-kind");
+        for (value, error) in [
+            (String::new(), "empty"),
+            ("a".repeat(ObjectKind::MAX_LEN + 1), "too long"),
+            ("kind\nname".to_owned(), "control characters"),
+        ] {
+            let json = serde_json::to_string(&value).unwrap();
+            let rejected = serde_json::from_str::<ObjectKind>(&json).unwrap_err();
+            assert!(rejected.to_string().contains(error), "{rejected}");
+        }
     }
 
     #[test]
-    fn object_kind_deserialize_rejects_empty() {
-        let result: Result<ObjectKind, _> = serde_json::from_str(r#""""#);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty"));
-    }
-
-    #[test]
-    fn object_kind_deserialize_rejects_too_long() {
-        let long_str = "a".repeat(ObjectKind::MAX_LEN + 1);
-        let json = format!(r#""{long_str}""#);
-        let result: Result<ObjectKind, _> = serde_json::from_str(&json);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("too long"));
-    }
-
-    #[test]
-    fn object_kind_deserialize_accepts_valid() {
-        let result: Result<ObjectKind, _> = serde_json::from_str(r#""valid-kind""#);
-        assert!(result.is_ok());
-        assert_eq!(&*result.unwrap(), "valid-kind");
-    }
-
-    #[test]
-    fn object_key_deserialize_rejects_empty() {
-        let result: Result<ObjectKey, _> = serde_json::from_str(r#""""#);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty"));
-    }
-
-    #[test]
-    fn object_key_deserialize_rejects_too_long() {
-        let long_str = "a".repeat(ObjectKey::MAX_LEN + 1);
-        let json = format!(r#""{long_str}""#);
-        let result: Result<ObjectKey, _> = serde_json::from_str(&json);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("too long"));
-    }
-
-    #[test]
-    fn object_key_deserialize_accepts_valid() {
-        let result: Result<ObjectKey, _> = serde_json::from_str(r#""valid-key""#);
-        assert!(result.is_ok());
-        assert_eq!(&*result.unwrap(), "valid-key");
+    fn object_key_deserialization_enforces_validation() {
+        let key: ObjectKey = serde_json::from_str(r#""valid-key""#).unwrap();
+        assert_eq!(&*key, "valid-key");
+        for (value, error) in [
+            (String::new(), "empty"),
+            ("a".repeat(ObjectKey::MAX_LEN + 1), "too long"),
+        ] {
+            let json = serde_json::to_string(&value).unwrap();
+            let rejected = serde_json::from_str::<ObjectKey>(&json).unwrap_err();
+            assert!(rejected.to_string().contains(error), "{rejected}");
+        }
     }
 }

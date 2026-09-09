@@ -349,13 +349,10 @@ mod tests {
     use bytesize::ByteSize;
     use futures::TryStreamExt;
 
-    use super::{
-        CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, page_id_for_byte_offset, pagerange,
-        slice_page_data,
-    };
+    use super::{CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, pagerange};
     use crate::{
         cache::{CacheConfig, CacheKey, CacheValue},
-        object_store::{DownloadError, DownloadLimits, RequestConfig},
+        object_store::{DownloadLimits, RequestConfig},
         types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
     };
 
@@ -527,55 +524,14 @@ mod tests {
     }
 
     #[test]
-    fn page_id_for_byte_offset_matches_page_boundaries() {
-        assert_eq!(page_id_for_byte_offset(0), 0);
-        assert_eq!(page_id_for_byte_offset(PAGE_SIZE - 1), 0);
-        assert_eq!(page_id_for_byte_offset(PAGE_SIZE), 1);
-        assert_eq!(page_id_for_byte_offset(PAGE_SIZE + 123), 1);
-        assert_eq!(page_id_for_byte_offset(2 * PAGE_SIZE), 2);
-    }
-
-    #[test]
-    fn page_bounds_for_range_end_on_page_boundary_does_not_advance_last_page() {
-        let byterange = 0..PAGE_SIZE;
-        assert_eq!(pagerange(&byterange), 0..=0);
-
-        let byterange = 0..(2 * PAGE_SIZE);
-        assert_eq!(pagerange(&byterange), 0..=1);
-    }
-
-    #[test]
-    fn page_bounds_for_range_crosses_page_boundary() {
-        let byterange = (PAGE_SIZE - 1)..(PAGE_SIZE + 1);
-        assert_eq!(pagerange(&byterange), 0..=1);
-
-        let byterange = PAGE_SIZE..(2 * PAGE_SIZE);
-        assert_eq!(pagerange(&byterange), 1..=1);
-    }
-
-    #[test]
-    fn slice_page_data_rejects_range_start_past_object_end() {
-        let object_len = 1024 * 1024;
-        let byterange = (2 * 1024 * 1024)..(3 * 1024 * 1024);
-        let data = Bytes::from(vec![0_u8; object_len]);
-        let value = CacheValue {
-            bucket: BucketName::new("test-bucket").expect("bucket name"),
-            mtime: 0,
-            data: data.clone(),
-            object_size: object_len as u64,
-            cached_at: 0,
-        };
-        let err = slice_page_data(page_id_for_byte_offset(byterange.start), &byterange, &value)
-            .expect_err("expected range error");
-        match err {
-            ServiceError::Download(DownloadError::RangeNotSatisfied {
-                requested,
-                object_size,
-            }) => {
-                assert_eq!(requested, byterange);
-                assert_eq!(object_size, Some(object_len as u64));
-            }
-            other => panic!("unexpected error: {other:?}"),
+    fn page_bounds_respect_exclusive_range_ends() {
+        for (bytes, pages) in [
+            (0..PAGE_SIZE, 0..=0),
+            (0..2 * PAGE_SIZE, 0..=1),
+            (PAGE_SIZE - 1..PAGE_SIZE + 1, 0..=1),
+            (PAGE_SIZE..2 * PAGE_SIZE, 1..=1),
+        ] {
+            assert_eq!(pagerange(&bytes), pages, "{bytes:?}");
         }
     }
 

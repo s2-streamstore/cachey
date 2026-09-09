@@ -437,7 +437,7 @@ mod tests {
 
     use axum::{
         extract::FromRequestParts,
-        http::{HeaderValue, Method, Request, StatusCode, header},
+        http::{HeaderValue, Method, Request, StatusCode},
     };
 
     use super::{C0_CONFIG_HEADER, on_chunk_error};
@@ -448,57 +448,31 @@ mod tests {
     };
 
     async fn parse_c0_config(
-        header_value: &str,
+        header_value: Option<HeaderValue>,
     ) -> Result<RequestConfig, (StatusCode, &'static str)> {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .header(&C0_CONFIG_HEADER, header_value)
-            .body(())
-            .unwrap();
-
-        let (mut parts, ()) = req.into_parts();
+        let mut request = Request::new(());
+        if let Some(value) = header_value {
+            request.headers_mut().insert(&C0_CONFIG_HEADER, value);
+        }
+        let (mut parts, ()) = request.into_parts();
         RequestConfig::from_request_parts(&mut parts, &()).await
     }
 
     #[tokio::test]
-    async fn test_c0_config_empty_returns_default() {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(())
-            .unwrap();
-
-        let (mut parts, ()) = req.into_parts();
-        let config = RequestConfig::from_request_parts(&mut parts, &())
-            .await
-            .unwrap();
-        assert_eq!(config, RequestConfig::default());
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_single_timeout() {
-        let config = parse_c0_config("ct=1000").await.unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
-        assert_eq!(config.read_timeout, None);
-    }
-
-    #[test]
-    fn test_chunk_error_response_includes_content_range_for_unsatisfied_range() {
-        let error = ServiceError::Download(DownloadError::RangeNotSatisfied {
-            requested: 128..256,
-            object_size: Some(512),
-        });
-
-        let (status, headers) = on_chunk_error(
-            &ObjectKind::new("range-error").unwrap(),
-            &Method::GET,
-            0,
-            &error,
+    async fn c0_config_preserves_unspecified_settings() {
+        assert_eq!(
+            parse_c0_config(None).await.unwrap(),
+            RequestConfig::default()
         );
-
-        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
-        assert_eq!(headers.get(header::CONTENT_RANGE).unwrap(), "bytes */512");
+        assert_eq!(
+            parse_c0_config(Some(HeaderValue::from_static("ct=1000")))
+                .await
+                .unwrap(),
+            RequestConfig {
+                connect_timeout: Some(Duration::from_secs(1)),
+                ..RequestConfig::default()
+            }
+        );
     }
 
     #[test]
@@ -544,112 +518,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_c0_config_all_timeouts() {
-        let config = parse_c0_config("ct=1000 rt=2000 ot=3000 oat=1500")
-            .await
-            .unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
-        assert_eq!(config.read_timeout, Some(Duration::from_secs(2)));
-        assert_eq!(config.operation_timeout, Some(Duration::from_secs(3)));
+    async fn c0_config_parses_settings_and_ignores_unknown_keys() {
+        let config = parse_c0_config(Some(HeaderValue::from_static(
+            "ct=1000 rt=2000 ot=3000 oat=1500 unknown=123 ib=100 mb=5000 ma=3 fps=true",
+        )))
+        .await
+        .unwrap();
         assert_eq!(
-            config.operation_attempt_timeout,
-            Some(Duration::from_millis(1500))
+            config,
+            RequestConfig {
+                connect_timeout: Some(Duration::from_secs(1)),
+                read_timeout: Some(Duration::from_secs(2)),
+                operation_timeout: Some(Duration::from_secs(3)),
+                operation_attempt_timeout: Some(Duration::from_millis(1500)),
+                initial_backoff: Some(Duration::from_millis(100)),
+                max_backoff: Some(Duration::from_secs(5)),
+                max_attempts: Some(3),
+                force_path_style: Some(true),
+            }
         );
     }
 
     #[tokio::test]
-    async fn test_c0_config_backoff_settings() {
-        let config = parse_c0_config("ib=100 mb=5000 ma=3").await.unwrap();
-        assert_eq!(config.initial_backoff, Some(Duration::from_millis(100)));
-        assert_eq!(config.max_backoff, Some(Duration::from_secs(5)));
-        assert_eq!(config.max_attempts, Some(3));
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_force_path_style() {
-        let config = parse_c0_config("fps=true").await.unwrap();
-        assert_eq!(config.force_path_style, Some(true));
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_mixed_settings() {
-        let config = parse_c0_config("ct=1000 ma=5 ib=10 oat=1500")
-            .await
-            .unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
-        assert_eq!(config.max_attempts, Some(5));
-        assert_eq!(config.initial_backoff, Some(Duration::from_millis(10)));
-        assert_eq!(
-            config.operation_attempt_timeout,
-            Some(Duration::from_millis(1500))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_ignores_unknown_keys() {
-        let config = parse_c0_config("ct=1000 unknown=123 rt=2000")
-            .await
-            .unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
-        assert_eq!(config.read_timeout, Some(Duration::from_secs(2)));
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_missing_equals() {
-        let result = parse_c0_config("ct1000").await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().1,
-            "Malformed C0-Config header: missing '=' in key-value pair"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_invalid_duration() {
-        let result = parse_c0_config("ct=invalid").await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().1,
-            "Invalid duration value in C0-Config header"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_invalid_max_attempts() {
-        let result = parse_c0_config("ma=invalid").await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().1,
-            "Invalid value for ma in C0-Config header"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_invalid_force_path_style() {
-        let result = parse_c0_config("fps=1").await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().1,
-            "Invalid value for fps in C0-Config header"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_invalid_header_encoding() {
-        let mut req = Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(())
-            .unwrap();
-
-        req.headers_mut().insert(
-            &C0_CONFIG_HEADER,
-            HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap(),
-        );
-
-        let (mut parts, ()) = req.into_parts();
-        let result = RequestConfig::from_request_parts(&mut parts, &()).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().1, "Invalid C0-Config header encoding");
+    async fn c0_config_rejects_invalid_headers() {
+        for (value, message) in [
+            (
+                HeaderValue::from_static("ct1000"),
+                "Malformed C0-Config header: missing '=' in key-value pair",
+            ),
+            (
+                HeaderValue::from_static("ct=invalid"),
+                "Invalid duration value in C0-Config header",
+            ),
+            (
+                HeaderValue::from_static("ma=invalid"),
+                "Invalid value for ma in C0-Config header",
+            ),
+            (
+                HeaderValue::from_static("fps=1"),
+                "Invalid value for fps in C0-Config header",
+            ),
+            (
+                HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+                "Invalid C0-Config header encoding",
+            ),
+        ] {
+            assert_eq!(
+                parse_c0_config(Some(value)).await.unwrap_err(),
+                (StatusCode::BAD_REQUEST, message)
+            );
+        }
     }
 }

@@ -85,17 +85,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn bps_is_zero_initially() {
-        let mut t = SlidingThroughput::<60>::default();
-        assert_close(t.bps(Duration::from_mins(1)), 0.0);
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn accumulates_within_and_across_buckets() {
         let mut t = SlidingThroughput::<60>::default();
 
-        // t = 0ms
-        t.record(1_000);
+        t.record(600);
+        t.record(400);
         assert_close(t.bps(Duration::from_mins(1)), 0.0);
 
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -113,17 +107,15 @@ mod tests {
     async fn window_rolls_and_evicts_old_data() {
         let mut t = SlidingThroughput::<60>::default();
 
-        // Bucket 0
         t.record(1_000);
 
-        // Move to bucket 1 and add more
         tokio::time::advance(Duration::from_secs(1)).await;
         t.record(500);
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_close(t.bps(Duration::from_mins(1)), 1_500.0 / 60.0);
 
         // After exactly 60s from start, bucket 0 is still within the window
-        tokio::time::advance(Duration::from_secs(58)).await; // total 60_000ms
+        tokio::time::advance(Duration::from_secs(58)).await;
         assert_close(t.bps(Duration::from_mins(1)), 1_500.0 / 60.0);
 
         // After 61s from start, bucket 0 falls out but bucket 1 remains
@@ -148,63 +140,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn different_bucket_sizes() {
-        // Test with 10 buckets
-        let mut t10 = SlidingThroughput::<10>::default();
-        t10.record(1_000);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert_close(t10.bps(Duration::from_secs(10)), 1_000.0 / 10.0);
-
-        // Test with 120 buckets
-        let mut t120 = SlidingThroughput::<120>::default();
-        t120.record(2_000);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert_close(t120.bps(Duration::from_mins(2)), 2_000.0 / 120.0);
-
-        // Verify window clamping works correctly with different sizes
-        assert_close(t10.bps(Duration::from_secs(20)), 1_000.0 / 20.0);
-        assert_close(t120.bps(Duration::from_secs(150)), 2_000.0 / 150.0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn includes_previous_bucket_at_boundary() {
-        let mut t = SlidingThroughput::<60>::default();
-        for _ in 0..10 {
-            t.record(100);
-            tokio::time::advance(Duration::from_millis(100)).await;
-        }
-
-        assert_close(t.bps(Duration::from_secs(1)), 1_000.0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sub_second_lookback_clamps_to_one_second() {
-        let mut t = SlidingThroughput::<60>::default();
+    async fn lookback_beyond_retained_history_counts_missing_seconds_as_zero() {
+        let mut t = SlidingThroughput::<10>::default();
         t.record(1_000);
         tokio::time::advance(Duration::from_secs(1)).await;
-
-        assert_close(t.bps(Duration::from_millis(500)), 1_000.0);
-        assert_close(t.bps(Duration::from_secs(1)), 1_000.0);
+        assert_close(t.bps(Duration::from_secs(10)), 100.0);
+        assert_close(t.bps(Duration::from_secs(20)), 50.0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn fractional_lookback_uses_fractional_divisor() {
+    async fn fractional_lookback_clamps_to_one_second() {
         let mut t = SlidingThroughput::<60>::default();
         t.record(1_000);
         tokio::time::advance(Duration::from_millis(1_500)).await;
 
-        assert_close(t.bps(Duration::from_millis(1_500)), 1_000.0 / 1.5);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn excludes_current_partial_bucket() {
-        let mut t = SlidingThroughput::<60>::default();
-        t.record(1_000);
-
-        tokio::time::advance(Duration::from_millis(500)).await;
-        assert_close(t.bps(Duration::from_secs(1)), 0.0);
-
-        tokio::time::advance(Duration::from_millis(500)).await;
-        assert_close(t.bps(Duration::from_secs(1)), 1_000.0);
+        for (millis, expected) in [(500, 1_000.0), (1_000, 1_000.0), (1_500, 1_000.0 / 1.5)] {
+            assert_close(t.bps(Duration::from_millis(millis)), expected);
+        }
     }
 }

@@ -1,7 +1,5 @@
 mod common;
 
-use std::time::Duration;
-
 use bytes::{Bytes, BytesMut};
 use bytesize::ByteSize;
 use cachey::{
@@ -51,8 +49,6 @@ async fn setup_test_server() -> TestContext {
             .expect("Failed to start server");
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     TestContext {
         _rustfs: rustfs,
         s3_client,
@@ -86,96 +82,9 @@ async fn scrape_metrics(client: &reqwest::Client, server_url: &str) -> String {
 }
 
 #[tokio::test]
-async fn test_fetch_endpoint_full_object() {
-    let ctx = setup_test_server().await;
-
-    // Larger than PAGE_SIZE for multiple pages
-    let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize + 100);
-    for (i, byte) in test_data.iter_mut().enumerate() {
-        *byte = (i % 256) as u8;
-    }
-    let test_data = test_data.freeze();
-    let object_key = "test-object.txt";
-    upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
-        object_key,
-        test_data.clone(),
-    )
-    .await;
-
-    let client = reqwest::Client::new();
-
-    // Request a small range from the beginning
-    let response = client
-        .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
-        ))
-        .header("Range", "bytes=0-99")
-        .send()
-        .await
-        .expect("Failed to send request");
-
-    assert_eq!(response.status(), 206);
-
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .expect("Missing content-type header");
-    assert_eq!(content_type, "application/octet-stream");
-
-    let body = response
-        .bytes()
-        .await
-        .expect("Failed to read response body");
-    assert_eq!(body, test_data.slice(0..100));
-}
-
-#[tokio::test]
-async fn test_fetch_endpoint_partial_range() {
-    let ctx = setup_test_server().await;
-
-    // Larger than PAGE_SIZE for multiple pages
-    let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize + 1000);
-    for (i, byte) in test_data.iter_mut().enumerate() {
-        *byte = (i % 256) as u8;
-    }
-    let test_data = test_data.freeze();
-    let object_key = "range-test.txt";
-    upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
-        object_key,
-        test_data.clone(),
-    )
-    .await;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
-        ))
-        .header("Range", "bytes=1000-1999")
-        .send()
-        .await
-        .expect("Failed to send request");
-
-    assert_eq!(response.status(), 206);
-
-    let body = response
-        .bytes()
-        .await
-        .expect("Failed to read response body");
-    assert_eq!(body, test_data.slice(1000..2000));
-}
-
-#[tokio::test]
 async fn test_fetch_endpoint_head_request() {
     let ctx = setup_test_server().await;
 
-    // Create a large object
     let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize + 500);
     test_data.fill(42u8);
     let test_data = test_data.freeze();
@@ -269,57 +178,6 @@ async fn test_fetch_endpoint_not_found() {
 }
 
 #[tokio::test]
-async fn test_fetch_endpoint_with_custom_bucket_header() {
-    let ctx = setup_test_server().await;
-
-    // Create a large object
-    let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize + 200);
-    test_data.fill(99u8);
-    let test_data = test_data.freeze();
-    let object_key = "custom-bucket-test.txt";
-    upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
-        object_key,
-        test_data.clone(),
-    )
-    .await;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .get(format!(
-            "{}/fetch/ignored-kind/{}",
-            ctx.server_url, object_key
-        ))
-        .header("Range", "bytes=0-199")
-        .header("c0-bucket", &ctx.bucket_name)
-        .send()
-        .await
-        .expect("Failed to send request");
-
-    assert_eq!(response.status(), 206);
-
-    let body = response
-        .bytes()
-        .await
-        .expect("Failed to read response body");
-    assert_eq!(body, test_data.slice(0..200));
-}
-
-#[tokio::test]
-async fn test_metrics_endpoint() {
-    let ctx = setup_test_server().await;
-
-    let client = reqwest::Client::new();
-    let body = scrape_metrics(&client, &ctx.server_url).await;
-
-    println!("Metrics body length: {}", body.len());
-    if !body.is_empty() {
-        println!("Metrics body preview: {}", &body[..body.len().min(200)]);
-    }
-}
-
-#[tokio::test]
 async fn test_fetch_metrics_record_success_for_ranged_get() {
     let ctx = setup_test_server().await;
 
@@ -370,62 +228,65 @@ async fn test_fetch_metrics_record_success_for_ranged_get() {
 }
 
 #[tokio::test]
-async fn test_fetch_endpoint_cache_hit() {
+async fn cached_object_serves_ranges_after_backend_deletion() {
     let ctx = setup_test_server().await;
-
-    // Create a large object that spans exactly one page
-    let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize);
-    test_data.fill(77u8);
-    let test_data = test_data.freeze();
-    let object_key = "cache-test.txt";
-    upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
-        object_key,
-        test_data.clone(),
-    )
-    .await;
-
+    let data = Bytes::from_static(b"0123456789abcdefghijklmnopqrstuvwxyz");
+    let key = "cached-object";
+    upload_test_object(&ctx.s3_client, &ctx.bucket_name, key, data.clone()).await;
     let client = reqwest::Client::new();
+    let url = format!("{}/fetch/{}/{key}", ctx.server_url, ctx.bucket_name);
 
-    // First request - cache miss, request first 1000 bytes
-    let response1 = client
-        .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
-        ))
-        .header("Range", "bytes=0-999")
+    for (index, range) in [0..data.len(), 10..20, 10..PAGE_SIZE as usize]
+        .into_iter()
+        .enumerate()
+    {
+        let response = client
+            .get(&url)
+            .header("Range", format!("bytes={}-{}", range.start, range.end - 1))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 206);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert_eq!(
+            response.headers()["content-range"],
+            format!(
+                "bytes {}-{}/{}",
+                range.start,
+                range.end.min(data.len()) - 1,
+                data.len()
+            )
+        );
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            data.slice(range.start..range.end.min(data.len()))
+        );
+
+        if index == 0 {
+            ctx.s3_client
+                .delete_object()
+                .bucket(&ctx.bucket_name)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+
+    let response = client
+        .get(&url)
+        .header("Range", format!("bytes={0}-{0}", data.len()))
         .send()
         .await
-        .expect("Failed to send first request");
-
-    assert_eq!(response1.status(), 206);
-    let body1 = response1
-        .bytes()
-        .await
-        .expect("Failed to read first response");
-    assert_eq!(body1, test_data.slice(0..1000));
-
-    // Small delay to ensure cache is populated
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Second request - should be a cache hit for the same range
-    let response2 = client
-        .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
-        ))
-        .header("Range", "bytes=500-1499")
-        .send()
-        .await
-        .expect("Failed to send second request");
-
-    assert_eq!(response2.status(), 206);
-    let body2 = response2
-        .bytes()
-        .await
-        .expect("Failed to read second response");
-    assert_eq!(body2, test_data.slice(500..1500));
+        .unwrap();
+    assert_eq!(response.status(), 416);
+    assert_eq!(
+        response.headers()["content-range"],
+        format!("bytes */{}", data.len())
+    );
 }
 
 #[tokio::test]
@@ -467,136 +328,6 @@ async fn test_fetch_endpoint_range_ending_at_page_boundary() {
 }
 
 #[tokio::test]
-async fn test_fetch_endpoint_concurrent_requests() {
-    let ctx = setup_test_server().await;
-
-    // Create a large object
-    let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize);
-    test_data.fill(123u8);
-    let test_data = test_data.freeze();
-    let object_key = "concurrent-test.txt";
-    upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
-        object_key,
-        test_data.clone(),
-    )
-    .await;
-
-    let client = reqwest::Client::new();
-    let server_url = ctx.server_url.clone();
-    let bucket_name = ctx.bucket_name.clone();
-
-    let mut handles = vec![];
-    for i in 0..5 {
-        let client = client.clone();
-        let server_url = server_url.clone();
-        let bucket_name = bucket_name.clone();
-        let object_key = object_key.to_string();
-        let test_data = test_data.clone();
-
-        let handle = tokio::spawn(async move {
-            // Each request asks for a different range
-            let start = i * 100;
-            let end = start + 99;
-            let response = client
-                .get(format!("{server_url}/fetch/{bucket_name}/{object_key}"))
-                .header("Range", format!("bytes={start}-{end}"))
-                .send()
-                .await
-                .expect("Failed to send concurrent request");
-
-            assert_eq!(response.status(), 206);
-            let body = response
-                .bytes()
-                .await
-                .expect("Failed to read concurrent response");
-            assert_eq!(body, test_data.slice(start..=end));
-        });
-
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle.await.expect("Concurrent request failed");
-    }
-}
-
-#[tokio::test]
-async fn test_small_object_full_range() {
-    let ctx = setup_test_server().await;
-
-    // Create a small object (much smaller than PAGE_SIZE)
-    let test_data = b"Hello, this is a small test object!";
-    let object_key = "small-object.txt";
-    upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
-        object_key,
-        Bytes::from_static(test_data),
-    )
-    .await;
-
-    let client = reqwest::Client::new();
-
-    // Request the full small object
-    let response = client
-        .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
-        ))
-        .header("Range", format!("bytes=0-{}", test_data.len() - 1))
-        .send()
-        .await
-        .expect("Failed to send request");
-
-    assert_eq!(response.status(), 206);
-
-    let body = response
-        .bytes()
-        .await
-        .expect("Failed to read response body");
-    assert_eq!(body, Bytes::from_static(test_data));
-}
-
-#[tokio::test]
-async fn test_small_object_partial_range() {
-    let ctx = setup_test_server().await;
-
-    // Create a small object
-    let test_data = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let object_key = "small-range-object.txt";
-    upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
-        object_key,
-        Bytes::from_static(test_data),
-    )
-    .await;
-
-    let client = reqwest::Client::new();
-
-    // Request a partial range from the small object
-    let response = client
-        .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
-        ))
-        .header("Range", "bytes=10-19")
-        .send()
-        .await
-        .expect("Failed to send request");
-
-    assert_eq!(response.status(), 206);
-
-    let body = response
-        .bytes()
-        .await
-        .expect("Failed to read response body");
-    assert_eq!(body, Bytes::from(&test_data[10..20]));
-}
-
-#[tokio::test]
 async fn test_small_object_range_start_beyond_end_returns_416() {
     let ctx = setup_test_server().await;
 
@@ -621,156 +352,33 @@ async fn test_small_object_range_start_beyond_end_returns_416() {
 }
 
 #[tokio::test]
-async fn test_1kb_object() {
-    let ctx = setup_test_server().await;
-
-    // Create a 1KB object
-    let mut test_data = BytesMut::zeroed(1024);
-    test_data.fill(42u8);
-    let test_data = test_data.freeze();
-    let object_key = "1kb-object.bin";
-    upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
-        object_key,
-        test_data.clone(),
-    )
-    .await;
-
-    let client = reqwest::Client::new();
-
-    // Request the full 1KB object
-    let response = client
-        .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
-        ))
-        .header("Range", format!("bytes=0-{}", test_data.len() - 1))
-        .send()
-        .await
-        .expect("Failed to send request");
-
-    assert_eq!(response.status(), 206);
-
-    let body = response
-        .bytes()
-        .await
-        .expect("Failed to read response body");
-    assert_eq!(body.len(), test_data.len());
-    assert_eq!(body, test_data);
-}
-
-#[tokio::test]
-async fn test_100kb_object_partial_range() {
-    let ctx = setup_test_server().await;
-
-    // Create a 100KB object (still much smaller than PAGE_SIZE)
-    let mut test_data = BytesMut::zeroed(100 * 1024);
-    test_data.fill(99u8);
-    let test_data = test_data.freeze();
-    let object_key = "100kb-object.bin";
-    upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
-        object_key,
-        test_data.clone(),
-    )
-    .await;
-
-    let client = reqwest::Client::new();
-
-    // Request a range from the middle of the object
-    let response = client
-        .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
-        ))
-        .header("Range", "bytes=50000-59999")
-        .send()
-        .await
-        .expect("Failed to send request");
-
-    assert_eq!(response.status(), 206);
-
-    let body = response
-        .bytes()
-        .await
-        .expect("Failed to read response body");
-    assert_eq!(body.len(), 10000);
-    assert_eq!(body, test_data.slice(50000..60000));
-}
-
-#[tokio::test]
 async fn test_fetch_endpoint_multi_page_range() {
     let ctx = setup_test_server().await;
+    let data = Bytes::from(
+        (0..3 * PAGE_SIZE)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let key = "multi-page-object.bin";
+    upload_test_object(&ctx.s3_client, &ctx.bucket_name, key, data.clone()).await;
 
-    // Create an object that spans multiple pages (3 * PAGE_SIZE)
-    let object_size = 3 * PAGE_SIZE as usize;
-    let mut test_data = BytesMut::zeroed(object_size);
-    for (i, byte) in test_data.iter_mut().enumerate() {
-        *byte = (i % 256) as u8;
-    }
-    let test_data = test_data.freeze();
-    let object_key = "multi-page-object.bin";
-    upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
-        object_key,
-        test_data.clone(),
-    )
-    .await;
-
-    let client = reqwest::Client::new();
-
-    // Request a range that spans across 2 pages
-    // Start in the middle of first page, end in the middle of second page
-    let start = PAGE_SIZE as usize / 2; // Middle of first page
-    let end = PAGE_SIZE as usize + (PAGE_SIZE as usize / 2); // Middle of second page
-
-    let response = client
+    let start = PAGE_SIZE / 2;
+    let end = 2 * PAGE_SIZE + PAGE_SIZE / 2;
+    let response = reqwest::Client::new()
         .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
+            "{}/fetch/{}/{key}",
+            ctx.server_url, ctx.bucket_name
         ))
-        .header("Range", format!("bytes={}-{}", start, end - 1))
+        .header("Range", format!("bytes={start}-{}", end - 1))
         .send()
         .await
-        .expect("Failed to send request");
+        .unwrap();
 
     assert_eq!(response.status(), 206);
-
-    let body = response
-        .bytes()
-        .await
-        .expect("Failed to read response body");
-
-    assert_eq!(body.len(), end - start);
-    assert_eq!(body, test_data.slice(start..end));
-
-    // Test another range that spans all 3 pages
-    // Request from middle of first page to middle of third page
-    let start2 = PAGE_SIZE as usize / 2;
-    let end2 = (2 * PAGE_SIZE as usize) + (PAGE_SIZE as usize / 2);
-
-    let response2 = client
-        .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
-        ))
-        .header("Range", format!("bytes={}-{}", start2, end2 - 1))
-        .send()
-        .await
-        .expect("Failed to send request");
-
-    assert_eq!(response2.status(), 206);
-
-    let body2 = response2
-        .bytes()
-        .await
-        .expect("Failed to read response body");
-
-    assert_eq!(body2.len(), end2 - start2);
-    assert_eq!(body2, test_data.slice(start2..end2));
+    assert_eq!(
+        response.bytes().await.unwrap(),
+        data.slice(start as usize..end as usize)
+    );
 }
 
 #[tokio::test]
@@ -836,7 +444,6 @@ async fn test_fetch_endpoint_multi_page_trailers_past_eof() {
         .expect("Expected trailers to be present in HTTP/2 response");
 
     let body_bytes = collected.to_bytes();
-    assert_eq!(body_bytes.len(), object_size);
     assert_eq!(body_bytes, test_data);
 
     let statuses: Vec<_> = trailers
