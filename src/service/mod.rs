@@ -153,9 +153,11 @@ impl CacheyService {
         self.egress_throughput.lock().bps(lookback)
     }
 
+    /// Zero concurrency is treated as one.
+    ///
     /// # Panics
     ///
-    /// if `byterange.start > byterange.end` or `byterange.end >= MAX_RANGE_END`.
+    /// If `byterange.start >= byterange.end` or `byterange.end > MAX_RANGE_END`.
     pub fn get(
         self,
         kind: ObjectKind,
@@ -184,7 +186,7 @@ impl CacheyService {
 
         futures::stream::iter(pagerange)
             .map(move |page_id| executor.clone().execute(page_id, self.cache.clone()))
-            .buffered(concurrency)
+            .buffered(concurrency.max(1))
             .map(move |result| {
                 let (page_id, value) = result?;
                 let expected_size = *object_size.get_or_insert(value.object_size);
@@ -347,15 +349,14 @@ mod tests {
     use bytes::Bytes;
     use bytesize::ByteSize;
     use futures::TryStreamExt;
-    use parking_lot::Mutex;
 
     use super::{
-        CacheyService, PAGE_SIZE, PageGetExecutor, ServiceConfig, ServiceError, SlidingThroughput,
-        page_id_for_byte_offset, pagerange, slice_page_data,
+        CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, page_id_for_byte_offset, pagerange,
+        slice_page_data,
     };
     use crate::{
-        cache::{CacheConfig, CacheKey, CacheValue, build_cache},
-        object_store::{DownloadError, DownloadLimits, Downloader, RequestConfig},
+        cache::{CacheConfig, CacheKey, CacheValue},
+        object_store::{DownloadError, DownloadLimits, RequestConfig},
         types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
     };
 
@@ -652,73 +653,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_get_executor_coalesced_miss_is_counted_end_to_end() {
+    async fn zero_and_serial_concurrency_reads_share_one_download() {
         let kind = ObjectKind::new(unique_name("kind")).expect("kind");
         let object = ObjectKey::new(unique_name("object")).expect("object");
         let bucket = BucketName::new(unique_name("bucket")).expect("bucket");
         let buckets = BucketNameSet::new(std::iter::once(bucket.clone())).expect("buckets");
         let object_data = Bytes::from(vec![7_u8; 4096]);
 
-        let (endpoint, request_count, server_handle) =
-            spawn_mock_s3_server(&bucket, &object, object_data, Duration::from_millis(50)).await;
-        let s3 = mock_s3_client(&endpoint);
-        let downloader = Downloader::new(
-            s3,
-            DownloadLimits::default(),
-            Arc::new(Mutex::new(SlidingThroughput::default())),
+        let (endpoint, request_count, server_handle) = spawn_mock_s3_server(
+            &bucket,
+            &object,
+            object_data.clone(),
+            Duration::from_millis(50),
         )
-        .unwrap();
-        let cache = build_cache(CacheConfig {
-            memory_size: ByteSize::mib(16),
-            disk_cache: None,
-            metrics_registry: None,
+        .await;
+        let service = CacheyService::new(
+            ServiceConfig {
+                cache: CacheConfig {
+                    memory_size: ByteSize::mib(16),
+                    disk_cache: None,
+                    metrics_registry: None,
+                },
+                download_limits: DownloadLimits::default(),
+            },
+            mock_s3_client(&endpoint),
+            axum_server::Handle::new(),
+        )
+        .await
+        .expect("service");
+
+        let read = |concurrency| {
+            service
+                .clone()
+                .get(
+                    kind.clone(),
+                    object.clone(),
+                    buckets.clone(),
+                    0..object_data.len() as u64,
+                    concurrency,
+                    RequestConfig::default(),
+                )
+                .try_collect::<Vec<_>>()
+        };
+        let (left, right) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(read(0), read(1))
         })
         .await
-        .expect("cache");
-
-        let before_access = metric_page_request_total(&kind, "access");
-        let before_success = metric_page_request_total(&kind, "success");
-        let before_download = metric_page_request_total(&kind, "download");
-        let before_coalesced = metric_page_request_total(&kind, "coalesced");
-        let before_cache_hit = metric_page_request_total(&kind, "cache_hit");
-
-        let executor = Arc::new(PageGetExecutor {
-            downloader,
-            kind: kind.clone(),
-            object: object.clone(),
-            buckets,
-            req_config: RequestConfig::default(),
-        });
-        let (left, right) = tokio::join!(
-            executor.clone().execute(0, cache.clone()),
-            executor.execute(0, cache)
-        );
-        let left_value = left.expect("left request").1;
-        let right_value = right.expect("right request").1;
+        .expect("both streams must make progress");
 
         assert_eq!(request_count.load(AtomicOrdering::Relaxed), 1);
-        assert_eq!(left_value.cached_at, 0);
-        assert_eq!(right_value.cached_at, 0);
-        assert_eq!(
-            metric_page_request_total(&kind, "access") - before_access,
-            2
-        );
-        assert_eq!(
-            metric_page_request_total(&kind, "success") - before_success,
-            2
-        );
-        assert_eq!(
-            metric_page_request_total(&kind, "download") - before_download,
-            1
-        );
-        assert_eq!(
-            metric_page_request_total(&kind, "coalesced") - before_coalesced,
-            1
-        );
-        assert_eq!(
-            metric_page_request_total(&kind, "cache_hit") - before_cache_hit,
-            0
-        );
+        for chunks in [left, right] {
+            let chunks = chunks.expect("read");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].data, object_data);
+            assert_eq!(chunks[0].cached_at, None);
+        }
+        assert_eq!(metric_page_request_total(&kind, "access"), 2);
+        assert_eq!(metric_page_request_total(&kind, "success"), 2);
+        assert_eq!(metric_page_request_total(&kind, "download"), 1);
+        assert_eq!(metric_page_request_total(&kind, "coalesced"), 1);
+        assert_eq!(metric_page_request_total(&kind, "cache_hit"), 0);
 
         server_handle.abort();
     }
