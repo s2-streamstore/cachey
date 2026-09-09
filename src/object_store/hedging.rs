@@ -7,19 +7,9 @@ use crate::types::BucketName;
 const HEDGE_COST: u32 = 100;
 const MAX_BUCKET_HEDGES: u16 = 2;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct BucketBudget {
-    credits: u32,
     active: u16,
-}
-
-impl Default for BucketBudget {
-    fn default() -> Self {
-        Self {
-            credits: HEDGE_COST,
-            active: 0,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -49,25 +39,13 @@ impl HedgeBudget {
         }
     }
 
-    pub fn observe_success(&self, bucket: &BucketName) {
+    pub fn observe_success(&self) {
         if self.max_concurrent == 0 || self.success_credit == 0 {
             return;
         }
         let mut state = self.state.lock();
         let credit = u32::from(self.success_credit);
         state.credits = (state.credits + credit).min(u32::from(self.max_concurrent) * HEDGE_COST);
-        if let Some(budget) = state.buckets.get_mut(bucket) {
-            budget.credits =
-                (budget.credits + credit).min(u32::from(MAX_BUCKET_HEDGES) * HEDGE_COST);
-        } else {
-            state.buckets.insert(
-                bucket.clone(),
-                BucketBudget {
-                    credits: HEDGE_COST + credit,
-                    active: 0,
-                },
-            );
-        }
     }
 
     pub fn try_acquire(&self, bucket: &BucketName) -> Option<HedgePermit> {
@@ -79,17 +57,41 @@ impl HedgeBudget {
             return None;
         }
         let budget = state.buckets.entry(bucket.clone()).or_default();
-        if budget.active >= MAX_BUCKET_HEDGES || budget.credits < HEDGE_COST {
+        if budget.active >= MAX_BUCKET_HEDGES {
             return None;
         }
         budget.active += 1;
-        budget.credits -= HEDGE_COST;
         state.active += 1;
         state.credits -= HEDGE_COST;
         Some(HedgePermit {
             state: self.state.clone(),
             bucket: bucket.clone(),
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct OverloadRetryBudget(Arc<Mutex<u32>>);
+
+impl Default for OverloadRetryBudget {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(HEDGE_COST)))
+    }
+}
+
+impl OverloadRetryBudget {
+    pub fn observe_success(&self) {
+        let mut credits = self.0.lock();
+        *credits = (*credits + 10).min(16 * HEDGE_COST);
+    }
+
+    pub fn try_retry(&self) -> bool {
+        let mut credits = self.0.lock();
+        if *credits < HEDGE_COST {
+            return false;
+        }
+        *credits -= HEDGE_COST;
+        true
     }
 }
 
@@ -119,10 +121,10 @@ mod tests {
         let bucket = BucketName::new("bucket").unwrap();
         drop(budget.try_acquire(&bucket).unwrap());
         for _ in 0..19 {
-            budget.observe_success(&bucket);
+            budget.observe_success();
         }
         assert!(budget.try_acquire(&bucket).is_none());
-        budget.observe_success(&bucket);
+        budget.observe_success();
         drop(budget.try_acquire(&bucket).unwrap());
         assert!(budget.try_acquire(&bucket).is_none());
     }
@@ -135,7 +137,7 @@ mod tests {
         drop(budget.try_acquire(&first).unwrap());
         assert!(budget.clone().try_acquire(&second).is_none());
         for _ in 0..20 {
-            budget.observe_success(&first);
+            budget.observe_success();
         }
         drop(budget.clone().try_acquire(&second).unwrap());
         assert!(budget.try_acquire(&first).is_none());
@@ -149,8 +151,8 @@ mod tests {
         ] {
             let budget = HedgeBudget::new(global_limit, 100);
             let buckets = buckets.map(|name| BucketName::new(name).unwrap());
-            for bucket in &buckets {
-                budget.observe_success(bucket);
+            for _ in &buckets {
+                budget.observe_success();
             }
             let first = budget.try_acquire(&buckets[0]).unwrap();
             let second = if global_limit > 1 {
@@ -158,8 +160,8 @@ mod tests {
             } else {
                 None
             };
-            for bucket in &buckets {
-                budget.observe_success(bucket);
+            for _ in &buckets {
+                budget.observe_success();
             }
             assert!(budget.try_acquire(&buckets[2]).is_none());
             drop(first);
@@ -172,7 +174,7 @@ mod tests {
     fn zero_limits_disable_speculation() {
         let bucket = BucketName::new("bucket").unwrap();
         for budget in [HedgeBudget::new(0, 5), HedgeBudget::new(16, 0)] {
-            budget.observe_success(&bucket);
+            budget.observe_success();
             assert!(budget.try_acquire(&bucket).is_none());
         }
     }

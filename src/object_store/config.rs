@@ -4,14 +4,18 @@ use aws_sdk_s3::config::{retry::RetryConfig, timeout::TimeoutConfig};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadLimits {
-    /// Maximum duration of a bucket race, through body validation.
+    /// Maximum duration of a bucket operation, through body validation.
     pub bucket_timeout: Duration,
     /// Maximum duration across bucket selection and fallback.
     pub page_timeout: Duration,
-    /// Concurrent hedges across this downloader and its clones; zero disables hedges.
+    /// Concurrent early hedges across this downloader and its clones; zero disables early hedges.
     pub max_concurrent_hedges: u16,
-    /// Hedge credits earned per successful bucket fetch, as a percentage (0–100).
+    /// Hedge credits earned per successful page fetch, as a percentage (0–100).
     pub hedge_budget_percent: u8,
+    /// Active backend requests, including speculative copies, shared across clones.
+    pub max_inflight_requests: u32,
+    /// Requested body bytes reserved by active backend requests, separate from the cache.
+    pub max_inflight_bytes: u64,
 }
 
 impl Default for DownloadLimits {
@@ -21,12 +25,24 @@ impl Default for DownloadLimits {
             page_timeout: Duration::from_secs(10),
             max_concurrent_hedges: 16,
             hedge_budget_percent: 5,
+            max_inflight_requests: 1024,
+            max_inflight_bytes: 1024 * 1024 * 1024,
         }
     }
 }
 
 impl DownloadLimits {
     pub(crate) fn validate(self) -> eyre::Result<()> {
+        eyre::ensure!(
+            self.max_inflight_requests > 0
+                && self.max_inflight_requests as usize <= tokio::sync::Semaphore::MAX_PERMITS,
+            "max_inflight_requests must fit a positive semaphore capacity"
+        );
+        eyre::ensure!(
+            self.max_inflight_bytes > 0
+                && self.max_inflight_bytes <= tokio::sync::Semaphore::MAX_PERMITS as u64,
+            "max_inflight_bytes must fit a positive semaphore capacity"
+        );
         eyre::ensure!(
             !self.bucket_timeout.is_zero(),
             "bucket timeout must be positive"
@@ -142,6 +158,18 @@ mod tests {
     #[test]
     fn download_limits_reject_invalid_deadlines_and_budget() {
         for limits in [
+            DownloadLimits {
+                max_inflight_requests: 0,
+                ..DownloadLimits::default()
+            },
+            DownloadLimits {
+                max_inflight_bytes: 0,
+                ..DownloadLimits::default()
+            },
+            DownloadLimits {
+                max_inflight_bytes: u64::MAX,
+                ..DownloadLimits::default()
+            },
             DownloadLimits {
                 bucket_timeout: Duration::ZERO,
                 ..DownloadLimits::default()

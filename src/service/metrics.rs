@@ -40,10 +40,10 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         .unwrap()
     });
 
-    static CIRCUIT_BREAKER_OPEN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    static DEPRIORITIZED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         register_int_gauge_vec!(
-            "cachey_bucket_circuit_breaker_open",
-            "Whether circuit breaker is open (1) or closed (0) per bucket",
+            "cachey_bucket_deprioritized",
+            "Whether the bucket is deprioritized while remaining eligible for fallback",
             &["bucket"]
         )
         .unwrap()
@@ -67,9 +67,9 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     LATENCY_HEDGE
         .with_label_values(&[bucket])
         .set(metrics.latency_hedge.as_secs_f64());
-    CIRCUIT_BREAKER_OPEN
+    DEPRIORITIZED
         .with_label_values(&[bucket])
-        .set(i64::from(metrics.circuit_breaker_open));
+        .set(i64::from(metrics.deprioritized));
     CONSECUTIVE_FAILURES
         .with_label_values(&[bucket])
         .set(i64::from(metrics.consecutive_failures));
@@ -135,11 +135,11 @@ pub enum PageRequestType {
     Access,
     /// Page requests that fetched bytes from object storage.
     Download,
-    /// Successful page downloads where a hedge was started in either bucket.
+    /// Successful page downloads that started overlapping requests.
     Hedged,
     /// Fetches whose primary attempt used the client-preferred bucket.
     ClientPref,
-    /// Fetches that succeeded via a fallback bucket after the primary path failed.
+    /// Fetches that succeeded using a copy other than the initially selected one.
     Fallback,
     /// Page requests that completed successfully, regardless of hit/miss path.
     Success,

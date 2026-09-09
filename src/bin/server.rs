@@ -63,7 +63,7 @@ struct Args {
     #[command(flatten)]
     disk_cache: DiskCacheGroup,
 
-    /// Latency quantile for making hedged requests (0.0-1.0, use 0 to disable hedging)
+    /// Latency quantile for early hedges (0.0-1.0, use 0 to disable early hedging)
     #[arg(long, default_value = "0.99", value_parser = parse_hedge_quantile)]
     hedge_quantile: f64,
 
@@ -75,13 +75,21 @@ struct Args {
     #[arg(long, default_value = "10000", value_parser = clap::value_parser!(u64).range(1..))]
     page_timeout_ms: u64,
 
-    /// Maximum concurrent hedges across all buckets (0 disables hedging).
+    /// Maximum concurrent early hedges across all buckets (0 disables early hedging).
     #[arg(long, default_value = "16")]
     max_concurrent_hedges: u16,
 
-    /// Hedge allowance earned per successful bucket fetch, as a percentage.
+    /// Hedge allowance earned per successful page fetch, as a percentage.
     #[arg(long, default_value = "5", value_parser = clap::value_parser!(u8).range(0..=100))]
     hedge_budget_percent: u8,
+
+    /// Maximum active backend requests, including speculative copies.
+    #[arg(long, default_value = "1024", value_parser = clap::value_parser!(u32).range(1..))]
+    max_inflight_requests: u32,
+
+    /// Body memory reserved by active downloads, separate from the cache.
+    #[arg(long, value_parser = parse_bytes, default_value = "1GiB")]
+    max_download_memory: ByteSize,
 
     /// TLS configuration (defaults to plain HTTP if not specified).
     #[command(flatten)]
@@ -140,6 +148,8 @@ async fn main() -> eyre::Result<()> {
             page_timeout: Duration::from_millis(args.page_timeout_ms),
             max_concurrent_hedges: args.max_concurrent_hedges,
             hedge_budget_percent: args.hedge_budget_percent,
+            max_inflight_requests: args.max_inflight_requests,
+            max_inflight_bytes: args.max_download_memory.as_u64(),
         },
     };
 

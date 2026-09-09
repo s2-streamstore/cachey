@@ -98,29 +98,32 @@ C0-Status: 16777216-18874367; us-west-videos; 0
 
 `GET /metrics` returns a more comprehensive set of metrics in Prometheus text format.
 
-### Latency and hedging
+### Replica selection, deadlines, and hedging
 
-A bucket fetch starts with its primary SDK operation and ends when the primary/hedge race produces validated page data or a terminal error. Its duration includes SDK retries and backoff, the wait before starting a hedge, body transfer, and validation. Each completed bucket fetch contributes one outcome to bucket stats: a successful fetch adds one latency sample; a failed fetch, including a deadline expiry, updates the error rate and consecutive-failure count. A failed peer rescued by its sibling is one successful bucket fetch. Canceled peers and caller-canceled bucket fetches add no observations.
+Cachey prefers copies likely to finish within the remaining page deadline, then healthy copies, then recent complete-read latency. The first client-supplied bucket has a locality preference: its latency is compared with 1.5 times each alternative's latency. Other buckets have equal preference. Unknown alternatives initially use the preferred bucket's latency as an estimate. Every supplied bucket remains eligible for fallback.
 
-The hedge timer uses the configured quantile of these successful bucket-fetch durations. A winning hedge is measured from the original primary start, so it cannot contribute a sample shorter than the time spent waiting to launch it. These samples describe latency delivered with the current hedging policy; they do not estimate how long canceled primary requests would have taken. There is no hedge until the bucket has a successful latency sample, and `--hedge-quantile 0` disables hedging. Latency snapshots refresh at most once per second.
+A backend failure immediately deprioritizes that bucket. Missing objects, invalid ranges, caller cancellation, and local admission failures do not count as backend health failures. The error fraction decays over time, but health recovers through evidence: 20 consecutive successful operations started after the latest failure restore normal preference. After 24–36 seconds, a previously competitive bucket can receive one recovery probe at a time. A working alternative protects that probe if it is slow. Probing requires reserving admission for both copies; otherwise the healthy route keeps the request. Idle time permits a recheck; it does not declare recovery.
 
-Hedges share a success-funded budget across the downloader and all its clones. The default allowance is one startup hedge plus one credit per 20 successful bucket fetches (`--hedge-budget-percent 5`). Both the global budget and the target bucket's budget must allow a hedge. Stored credits and concurrent hedges are capped at 16 globally (`--max-concurrent-hedges`) and two per bucket, allowing bounded bursts. Failures and cancellations earn no credit; canceling a hedge releases its concurrency slot but does not refund its spent credit. A hedge denied by the budget is skipped. Setting either budget option to zero disables hedging.
+Each distinct copy gets its own operation deadline, including SDK retries, body transfer, and validation. Defaults are 5 seconds per copy (`--bucket-timeout-ms`) and 10 seconds for the entire page (`--page-timeout-ms`). Recoverable errors immediately advance to an untried copy. Timed rescue attempts reserve part of the page budget using the alternatives' recent successful p99 durations; they do not cancel an otherwise viable earlier read. At most three copies are active per page, and each supplied copy is tried at most once at this layer. Backend SDK retries are contained within those operations. The first fully validated result wins and cancels the remaining work.
+
+With multiple buckets, early hedges use another copy. With one bucket, the existing same-bucket primary/hedge race remains. Early hedges use the configured successful-latency quantile (`--hedge-quantile`, zero disables early hedging). They require a shared success-funded allowance: one startup hedge plus one per 20 successful page downloads by default (`--hedge-budget-percent 5`). Credits and concurrent early hedges are capped globally at 16 (`--max-concurrent-hedges`); each destination allows at most two concurrent early hedges. Early hedges use one SDK attempt. Ordinary fallback and deadline rescue do not require early-hedge credits. When every supplied bucket has recently reported explicit overload, early hedges stop and extra attempts share a separate bounded retry allowance, replenished by successful pages.
+
+Admission limits are shared by downloader clones and cover primaries, retries within their operations, and speculative copies: 1,024 backend requests (`--max-inflight-requests`) and 1 GiB of requested body bytes (`--max-download-memory`) by default. Waiting consumes the original deadline and does not count as backend failure. These limits cover active downloads, separately from cache capacity and total process memory. Body collection rejects excess data as soon as it exceeds the validated response range. Early hedges skip unavailable admission; ordinary copy operations can wait until their deadline. Admission exhaustion and explicit backend overload return HTTP 503 for the first chunk; a timeout returns HTTP 504. Later failures terminate the response body.
+
+Successful full-operation durations populate the bucket latency histogram. A separate routing EWMA reacts to latency changes; several concurrent stalled operations also affect routing before their hard timeouts. Cancellation can raise a too-optimistic routing estimate, but cannot count as a successful latency sample or a health failure. Snapshots refresh at most once per second, with immediate initialization from the first success. For the single-bucket race, a success is measured from the original primary start, including the hedge delay. Multi-copy operations each use their own start time; page latency includes all elapsed selection, admission, and fallback time.
 
 | Measurement | Boundary |
-|------------|----------|
-| `cachey_bucket_latency_mean_seconds` | Mean successful bucket-fetch duration; used in bucket ranking. |
-| `cachey_bucket_latency_hedge_seconds` | Successful bucket-fetch quantile used as the hedge delay; zero when hedging is disabled. |
-| `cachey_bucket_error_rate` / `cachey_bucket_consecutive_failures` | Completed bucket-fetch outcomes after resolving any hedge. |
-| `cachey_page_download_latency_seconds` | Successful page download across both buckets, including time spent failing the first bucket. |
-| `cachey_first_chunk_latency_seconds` | Successful HTTP handler's time to its first available chunk, including cache lookup or waiting for a coalesced fill. |
+|-------------|----------|
+| `cachey_bucket_latency_mean_seconds` | Mean successful complete bucket-operation duration. |
+| `cachey_bucket_latency_hedge_seconds` | Successful bucket-operation quantile used for early hedging. |
+| `cachey_bucket_error_rate` / `cachey_bucket_consecutive_failures` | Backend health outcomes; object-specific and local failures are excluded. |
+| `cachey_bucket_deprioritized` | Soft health priority; replaces `cachey_bucket_circuit_breaker_open`. |
+| `cachey_page_download_latency_seconds` | Successful page download, including admission and every attempted copy. |
+| `cachey_first_chunk_latency_seconds` | HTTP handler time to its first available chunk, including cache lookup or coalesced-fill waiting. |
 
-Bucket fallback has its own clock and stats: the fallback bucket is not charged for the failed first bucket. The Rust `DownloadOutput` carries total `latency` and a `hedged` flag for a hedge started in either bucket; `ObjectPiece` carries the returned data and object metadata. The `hedged` page counter counts successful page downloads with that flag, including a primary winner or a hedge in a failed first bucket. Failed page downloads and client response-body transmission are not included in the success latency histograms.
+`DownloadOutput::secondary_bucket_idx` identifies the first additional copy actually started; `used_bucket_idx` can identify any supplied copy. Its `hedged` flag reports overlapping requests, including timed rescue and protected recovery probes. The page `fallback` metric counts successes from a copy other than the initially selected one. Successful latency histograms exclude failed pages and client response-body transmission.
 
-Full body transfer increases the measured latency and therefore can increase hedge delays and change bucket rankings. Since [AWS SDK operation timeouts exclude response-body consumption](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/timeouts.html), Cachey also bounds the full bucket race, including retries, backoff, and body validation. The defaults are 5 seconds per bucket (`--bucket-timeout-ms 5000`) and 10 seconds per page download (`--page-timeout-ms 10000`).
-
-When a fallback bucket is available, the first bucket receives at most half the page budget, capped by the bucket timeout. The fallback receives the remaining page time, also capped by the bucket timeout. A bucket deadline cancels both racing requests before fallback starts. The page clock starts before bucket selection and does not restart for fallback. An exhausted download that ends in a timeout returns HTTP 504 for the first chunk; a later timeout ends the response body with an error.
-
-Rust callers can configure `DownloadLimits` through `Downloader::with_limits` before cloning the downloader, or through `ServiceConfig::download_limits`. `Downloader::new` uses the same defaults as the server. Timeouts must be positive, and the hedge budget percentage must be in `0..=100`.
+Rust callers configure `DownloadLimits` through `Downloader::with_limits` before sharing clones, or through `ServiceConfig::download_limits`. Deadlines and admission capacities must be positive, and the hedge budget percentage must be in `0..=100`. Adaptive concurrency control is not enabled.
 
 ## Command line
 
@@ -141,15 +144,19 @@ Options:
       --iouring
           Use `io_uring` (if available) for disk IO
       --hedge-quantile <HEDGE_QUANTILE>
-          Latency quantile for making hedged requests (0.0-1.0, use 0 to disable hedging) [default: 0.99]
+          Latency quantile for early hedges (0.0-1.0, use 0 to disable early hedging) [default: 0.99]
       --bucket-timeout-ms <BUCKET_TIMEOUT_MS>
           Maximum bucket download time through body validation, in milliseconds [default: 5000]
       --page-timeout-ms <PAGE_TIMEOUT_MS>
           Maximum page download time including fallback, in milliseconds [default: 10000]
       --max-concurrent-hedges <MAX_CONCURRENT_HEDGES>
-          Maximum concurrent hedges across all buckets (0 disables hedging) [default: 16]
+          Maximum concurrent early hedges across all buckets (0 disables early hedging) [default: 16]
       --hedge-budget-percent <HEDGE_BUDGET_PERCENT>
-          Hedge allowance earned per successful bucket fetch, as a percentage [default: 5]
+          Hedge allowance earned per successful page fetch, as a percentage [default: 5]
+      --max-inflight-requests <MAX_INFLIGHT_REQUESTS>
+          Maximum active backend requests, including speculative copies [default: 1024]
+      --max-download-memory <MAX_DOWNLOAD_MEMORY>
+          Body memory reserved by active downloads, separate from the cache [default: 1GiB]
       --tls-self
           Use a self-signed certificate for TLS
       --tls-cert <TLS_CERT>

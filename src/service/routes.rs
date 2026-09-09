@@ -51,6 +51,15 @@ impl ChunkErrorResponse {
                 metric_code: "timeout",
                 headers: HeaderMap::new(),
             },
+            ServiceError::Download(
+                DownloadError::AdmissionTimeout
+                | DownloadError::AdmissionExhausted { .. }
+                | DownloadError::Overloaded(_),
+            ) => Self {
+                status_code: StatusCode::SERVICE_UNAVAILABLE,
+                metric_code: "overloaded",
+                headers: HeaderMap::new(),
+            },
             ServiceError::ObjectSizeInconsistency { .. } => Self {
                 status_code: StatusCode::CONFLICT,
                 metric_code: "object_size_inconsistency",
@@ -569,6 +578,26 @@ mod tests {
             response.into_response(error.to_string()).status(),
             StatusCode::GATEWAY_TIMEOUT
         );
+    }
+
+    #[test]
+    fn download_admission_and_backend_overload_return_service_unavailable() {
+        for error in [
+            DownloadError::AdmissionTimeout,
+            DownloadError::AdmissionExhausted {
+                requested_bytes: 8,
+                limit_bytes: 4,
+            },
+            DownloadError::Overloaded("SlowDown".to_owned()),
+        ] {
+            let error = ServiceError::Download(error);
+            let response = ChunkErrorResponse::from_error(0, &error);
+            assert_eq!(response.metric_code, "overloaded");
+            assert_eq!(
+                response.into_response(error.to_string()).status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
     }
 
     #[tokio::test]

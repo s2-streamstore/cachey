@@ -1,6 +1,6 @@
 mod common;
 
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{ops::Range, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
 use cachey::{
@@ -248,7 +248,7 @@ async fn test_download_with_fallback_bucket() {
 }
 
 #[tokio::test]
-async fn test_fallback_bucket_circuit_breaker_recovers_for_new_primary_failures() {
+async fn test_missing_objects_do_not_deprioritize_a_healthy_bucket() {
     let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
 
@@ -283,7 +283,6 @@ async fn test_fallback_bucket_circuit_breaker_recovers_for_new_primary_failures(
         end: test_data.len() as u64,
     };
 
-    let mut circuit_breaker_open = false;
     for _ in 0..10 {
         let result = downloader
             .download(
@@ -294,40 +293,20 @@ async fn test_fallback_bucket_circuit_breaker_recovers_for_new_primary_failures(
             )
             .await;
         assert!(matches!(result, Err(DownloadError::NoSuchKey)));
-        if bucket_metrics(&downloader, &primary_bucket).circuit_breaker_open {
-            circuit_breaker_open = true;
-            break;
-        }
     }
-    assert!(
-        circuit_breaker_open,
-        "primary bucket circuit breaker should open after repeated failures"
-    );
+    let metrics = bucket_metrics(&downloader, &primary_bucket);
+    assert!(!metrics.deprioritized);
+    assert_eq!(metrics.consecutive_failures, 0);
+    assert!(metrics.error_rate.abs() < f64::EPSILON);
 
-    let open_order = downloader
-        .download(&all_buckets, key.clone(), &range, &RequestConfig::default())
+    let output = downloader
+        .download(&all_buckets, key, &range, &RequestConfig::default())
         .await
         .unwrap();
-    assert_eq!(open_order.primary_bucket_idx, 1);
-    assert_eq!(open_order.secondary_bucket_idx, Some(0));
-    assert_eq!(open_order.used_bucket_idx, 1);
-
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(31)).await;
-    tokio::time::resume();
-
-    let recovered_metrics = bucket_metrics(&downloader, &primary_bucket);
-    assert!(!recovered_metrics.circuit_breaker_open);
-    assert_eq!(recovered_metrics.consecutive_failures, 0);
-
-    let primary_only_result = downloader
-        .download(&primary_only, key, &range, &RequestConfig::default())
-        .await;
-    assert!(matches!(primary_only_result, Err(DownloadError::NoSuchKey)));
-
-    let post_recovery_metrics = bucket_metrics(&downloader, &primary_bucket);
-    assert_eq!(post_recovery_metrics.consecutive_failures, 1);
-    assert!(!post_recovery_metrics.circuit_breaker_open);
+    assert_eq!(output.primary_bucket_idx, 0);
+    assert_eq!(output.secondary_bucket_idx, Some(1));
+    assert_eq!(output.used_bucket_idx, 1);
+    assert_eq!(output.piece.data, test_data);
 }
 
 #[tokio::test]
@@ -407,7 +386,6 @@ async fn test_download_with_hedged_requests() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "assertion failed")]
 async fn test_download_empty_range() {
     let ctx = setup_rustfs().await;
     let downloader = make_downloader(ctx.client.clone(), 0.9);
@@ -416,7 +394,7 @@ async fn test_download_empty_range() {
     let buckets = BucketNameSet::new(std::iter::once(bucket.clone())).unwrap();
     let key = ObjectKey::new("any-key").unwrap();
 
-    let _ = downloader
+    let result = downloader
         .download(
             &buckets,
             key,
@@ -424,6 +402,10 @@ async fn test_download_empty_range() {
             &RequestConfig::default(),
         )
         .await;
+    assert!(matches!(
+        result,
+        Err(DownloadError::RangeNotSatisfied { .. })
+    ));
 }
 
 #[tokio::test]
