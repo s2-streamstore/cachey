@@ -1,11 +1,18 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use exponential_decay_histogram::ExponentialDecayHistogram;
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
-use crate::types::{BucketName, BucketNameSet};
+use crate::{
+    object_store::DownloadLimits,
+    types::{BucketName, BucketNameSet},
+};
 
 const ERROR_ALPHA: f64 = 0.015;
 const LATENCY_ALPHA: f64 = 0.1;
@@ -289,12 +296,73 @@ impl RoutingSnapshot {
             .min_by(|left, right| self.compare(*left, *right, remaining))
     }
 
-    pub fn alternatives(&self, primary: usize, remaining: Duration) -> Vec<usize> {
-        let mut order: Vec<_> = (0..self.0.len())
-            .filter(|index| *index != primary)
-            .collect();
-        order.sort_by(|left, right| self.compare(*left, *right, remaining));
-        order
+    pub fn rescue_schedule(
+        &self,
+        primary: usize,
+        probing: bool,
+        limits: DownloadLimits,
+    ) -> VecDeque<(Duration, usize)> {
+        let page_budget = limits.page_timeout;
+        let unknown_latency = page_budget / u32::try_from(self.0.len()).unwrap_or(u32::MAX);
+        let reserve_budget = page_budget / 3 * 2;
+        let mut schedule = Vec::with_capacity(self.0.len());
+        schedule.extend((0..self.0.len()).filter_map(|index| {
+            let tail = self.tail(index);
+            if index == primary || tail.is_some_and(|tail| tail >= page_budget) {
+                return None;
+            }
+            let reserve = tail
+                .map_or(unknown_latency, |tail| {
+                    tail.saturating_mul(2)
+                        .min(reserve_budget)
+                        .max(tail.saturating_add(Duration::from_millis(1)))
+                })
+                .max(Duration::from_millis(20))
+                .min(limits.bucket_timeout)
+                .min(page_budget);
+            Some((reserve, index))
+        }));
+        schedule.sort_unstable_by(|(_, left), (_, right)| self.compare(*left, *right, page_budget));
+        let backup = schedule.first().filter(|_| probing).map(|(_, index)| {
+            let grace = self
+                .tail(*index)
+                .unwrap_or(unknown_latency)
+                .saturating_mul(2)
+                .max(Duration::from_millis(1));
+            (grace.min(page_budget), *index)
+        });
+        let total = schedule
+            .iter()
+            .map(|(reserve, _)| *reserve)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        let scale = if total > reserve_budget && !total.is_zero() {
+            reserve_budget.as_secs_f64() / total.as_secs_f64()
+        } else {
+            1.0
+        };
+        let primary_tail = self
+            .tail(primary)
+            .unwrap_or_default()
+            .min(limits.bucket_timeout)
+            .min(page_budget);
+        let overloaded = self.0.iter().any(|bucket| bucket.overloaded);
+        let mut remaining = total.mul_f64(scale);
+        // Convert reservations to launch delays in place, retaining each destination.
+        for (after, index) in &mut schedule {
+            let reserve = *after;
+            let latest_start = page_budget.saturating_sub(reserve);
+            let planned = page_budget.saturating_sub(remaining).max(primary_tail);
+            let expected = self.tail(*index).unwrap_or(reserve);
+            *after = if !overloaded && planned.saturating_add(expected) >= page_budget {
+                planned.min(latest_start)
+            } else {
+                planned
+            };
+            remaining = remaining.saturating_sub(reserve.mul_f64(scale));
+        }
+        schedule.extend(backup);
+        schedule.sort_unstable();
+        schedule.into()
     }
 
     pub fn primary(&self, remaining: Duration) -> (usize, Option<ProbePermit>) {
@@ -330,10 +398,6 @@ impl RoutingSnapshot {
 
     pub fn tail(&self, index: usize) -> Option<Duration> {
         self.0[index].tail
-    }
-
-    pub fn any_overloaded(&self) -> bool {
-        self.0.iter().any(|bucket| bucket.overloaded)
     }
 
     pub fn all_overloaded(&self) -> bool {

@@ -1,6 +1,6 @@
-use std::{collections::VecDeque, ops::Range, time::Duration};
+use std::{ops::Range, time::Duration};
 
-use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::{
     select,
     time::{Instant, sleep_until},
@@ -12,7 +12,7 @@ use super::{
 use crate::{
     object_store::{
         admission::DownloadPermit,
-        hedging::HedgePermit,
+        budget::HedgePermit,
         stats::{ProbePermit, RoutingSnapshot},
     },
     types::{BucketNameSet, ObjectKey},
@@ -141,7 +141,6 @@ impl ReplicaRequest<'_> {
 }
 
 impl Downloader {
-    #[allow(clippy::too_many_lines)]
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -173,37 +172,30 @@ impl Downloader {
         );
         let mut tried = vec![false; buckets.len()];
         tried[primary] = true;
-        let mut rescues = self.rescue_schedule(
-            buckets.len(),
-            primary,
-            start,
-            deadline,
-            probe.is_some(),
-            &routing,
-        );
+        let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
         let threshold = routing.tail(primary).unwrap_or_default();
         let mut hedge_at =
             (self.limits.hedge_budget_percent > 0 && !threshold.is_zero() && probe.is_none())
                 .then(|| start + threshold.min(self.limits.page_timeout));
-        let mut active: FuturesUnordered<BoxFuture<'_, Completion>> = FuturesUnordered::new();
-        active.push(request.attempt(primary, probe, primary_permits).boxed());
+        let mut active = FuturesUnordered::new();
+        active.push(request.attempt(primary, probe, primary_permits));
         let mut last_error = None;
-        loop {
-            let next_rescue = rescues.front().map_or(deadline, |(at, _)| *at);
+        while !active.is_empty() {
+            let next_rescue = rescues
+                .front()
+                .map_or(deadline, |(after, _)| start + *after);
             let next_hedge = hedge_at.unwrap_or(deadline);
             let (early, scheduled) = select! {
                 biased;
-                completion = active.next(), if !active.is_empty() => {
-                    if let Some((index, result)) = completion {
-                        match result {
-                            Ok(piece) => return Ok(request.output(piece, primary, index, start)),
-                            Err(error) => {
-                                if !error.should_attempt_fallback_bucket() { return Err(error); }
-                                if last_error.is_none() || !matches!(error, DownloadError::NoSuchKey) {
-                                    last_error = Some(error);
-                                }
-                                hedge_at = None;
+                Some((index, result)) = active.next() => {
+                    match result {
+                        Ok(piece) => return Ok(request.output(piece, primary, index, start)),
+                        Err(error) => {
+                            if !error.should_attempt_fallback_bucket() { return Err(error); }
+                            if last_error.is_none() || !matches!(error, DownloadError::NoSuchKey) {
+                                last_error = Some(error);
                             }
+                            hedge_at = None;
                         }
                     }
                     (false, None)
@@ -226,37 +218,32 @@ impl Downloader {
                     routing.best(&tried, deadline.saturating_duration_since(Instant::now()))
                 })
                 .filter(|index| !tried[*index]);
-            if allowed && let Some(index) = next {
-                if overloaded && !self.overload_retry_budget.try_retry() {
-                    if matches!(last_error, None | Some(DownloadError::NoSuchKey)) {
-                        last_error = Some(DownloadError::Overloaded(
-                            "Replica retry budget exhausted during widespread overload".to_owned(),
-                        ));
-                    }
-                    if active.is_empty() {
-                        break;
-                    }
-                    continue;
+            if !allowed {
+                continue;
+            }
+            let Some(index) = next else { continue };
+            if overloaded && !self.attempt_budget.try_retry() {
+                if matches!(last_error, None | Some(DownloadError::NoSuchKey)) {
+                    last_error = Some(DownloadError::Overloaded(
+                        "Replica retry budget exhausted during widespread overload".to_owned(),
+                    ));
                 }
-                let permits = if early {
-                    let Some(permits) =
-                        self.hedge_permits(&buckets[index], range.end - range.start)
-                    else {
-                        continue;
-                    };
-                    Some(permits)
-                } else {
-                    backup_admission.take().map(|admission| AttemptPermits {
-                        hedge: None,
-                        admission,
-                    })
+                continue;
+            }
+            let permits = if early {
+                let Some(permits) = self.hedge_permits(&buckets[index], range.end - range.start)
+                else {
+                    continue;
                 };
-                tried[index] = true;
-                active.push(request.attempt(index, None, permits).boxed());
-            }
-            if active.is_empty() {
-                break;
-            }
+                Some(permits)
+            } else {
+                backup_admission.take().map(|admission| AttemptPermits {
+                    hedge: None,
+                    admission,
+                })
+            };
+            tried[index] = true;
+            active.push(request.attempt(index, None, permits));
         }
         Err(last_error.unwrap_or_else(|| {
             DownloadError::Unknown("No replica could complete the read".to_owned())
@@ -269,7 +256,7 @@ impl Downloader {
         bytes: u64,
     ) -> Option<AttemptPermits> {
         let admission = self.admission.try_acquire(bytes)?;
-        let hedge = self.hedge_budget.try_acquire(bucket)?;
+        let hedge = self.attempt_budget.try_hedge(bucket)?;
         Some(AttemptPermits {
             hedge: Some(hedge),
             admission,
@@ -310,75 +297,5 @@ impl Downloader {
             permits,
             backup_admission,
         }
-    }
-
-    fn rescue_schedule(
-        &self,
-        bucket_count: usize,
-        primary: usize,
-        start: Instant,
-        deadline: Instant,
-        probing: bool,
-        routing: &RoutingSnapshot,
-    ) -> VecDeque<(Instant, usize)> {
-        let page_budget = deadline.saturating_duration_since(start);
-        let mut alternatives = routing.alternatives(primary, page_budget);
-        alternatives.retain(|index| routing.tail(*index).is_none_or(|tail| tail < page_budget));
-        let unknown_latency = page_budget / u32::try_from(bucket_count).unwrap_or(u32::MAX);
-        let reserve_budget = page_budget / 3 * 2;
-        let reserves: Vec<_> = alternatives
-            .iter()
-            .map(|index| {
-                routing
-                    .tail(*index)
-                    .map_or(unknown_latency, |tail| {
-                        tail.saturating_mul(2)
-                            .min(reserve_budget)
-                            .max(tail.saturating_add(Duration::from_millis(1)))
-                    })
-                    .max(Duration::from_millis(20))
-                    .min(self.limits.bucket_timeout)
-                    .min(page_budget)
-            })
-            .collect();
-        let total = reserves
-            .iter()
-            .copied()
-            .fold(Duration::ZERO, Duration::saturating_add);
-        let scale = if total > reserve_budget && !total.is_zero() {
-            reserve_budget.as_secs_f64() / total.as_secs_f64()
-        } else {
-            1.0
-        };
-        let primary_tail = routing
-            .tail(primary)
-            .unwrap_or_default()
-            .min(self.limits.bucket_timeout)
-            .min(page_budget);
-        let mut remaining = total.mul_f64(scale);
-        let mut schedule = Vec::with_capacity(reserves.len() + 1);
-        for (index, reserve) in alternatives.iter().copied().zip(reserves) {
-            let latest_start = page_budget.saturating_sub(reserve);
-            let planned = page_budget.saturating_sub(remaining).max(primary_tail);
-            let expected = routing.tail(index).unwrap_or(reserve);
-            let at = if !routing.any_overloaded() && planned.saturating_add(expected) >= page_budget
-            {
-                planned.min(latest_start)
-            } else {
-                planned
-            };
-            schedule.push((start + at, index));
-            remaining = remaining.saturating_sub(reserve.mul_f64(scale));
-        }
-        if probing && let Some(index) = alternatives.first() {
-            let grace = routing
-                .tail(*index)
-                .unwrap_or(unknown_latency)
-                .saturating_mul(2)
-                .max(Duration::from_millis(1));
-            schedule.push((start + grace.min(page_budget), *index));
-        }
-        schedule.sort_unstable();
-        schedule.into()
     }
 }

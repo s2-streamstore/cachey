@@ -16,8 +16,8 @@ use crate::{
     object_store::{
         BucketMetrics,
         admission::{DownloadAdmission, DownloadPermit},
+        budget::AttemptBudget,
         config::{DownloadLimits, RequestConfig},
-        hedging::{HedgeBudget, OverloadRetryBudget},
         stats::{BucketedStats, Outcome, ProbePermit},
     },
     service::SlidingThroughput,
@@ -226,8 +226,7 @@ pub struct Downloader {
     bucketed_stats: BucketedStats,
     throughput: Arc<Mutex<SlidingThroughput>>,
     limits: DownloadLimits,
-    hedge_budget: HedgeBudget,
-    overload_retry_budget: OverloadRetryBudget,
+    attempt_budget: AttemptBudget,
     admission: Arc<DownloadAdmission>,
 }
 
@@ -243,8 +242,7 @@ impl Downloader {
             bucketed_stats: BucketedStats::default(),
             throughput,
             limits,
-            hedge_budget: HedgeBudget::new(16, limits.hedge_budget_percent),
-            overload_retry_budget: OverloadRetryBudget::default(),
+            attempt_budget: AttemptBudget::new(16, limits.hedge_budget_percent),
             admission: Arc::new(DownloadAdmission::new(limits)),
         })
     }
@@ -298,8 +296,7 @@ impl Downloader {
             self.download_replicas(buckets, &object, byterange, req_config, start, deadline)
                 .await?
         };
-        self.hedge_budget.observe_success();
-        self.overload_retry_budget.observe_success();
+        self.attempt_budget.observe_success();
         Ok(output)
     }
 
@@ -793,7 +790,8 @@ mod latency_tests {
     use tokio::time::{advance, sleep, timeout};
 
     use super::{
-        BucketMetrics, DownloadError, DownloadLimits, DownloadOutput, Downloader, RequestConfig,
+        AttemptBudget, BucketMetrics, DownloadError, DownloadLimits, DownloadOutput, Downloader,
+        RequestConfig,
     };
     use crate::{
         service::SlidingThroughput,
@@ -1241,8 +1239,8 @@ mod latency_tests {
         fetch(&downloader, &["primary"]).await;
         drop(
             downloader
-                .hedge_budget
-                .try_acquire(&BucketName::new("primary").unwrap())
+                .attempt_budget
+                .try_hedge(&BucketName::new("primary").unwrap())
                 .unwrap(),
         );
         let output = fetch(&downloader, &["primary", "fallback"]).await;
@@ -1272,7 +1270,7 @@ mod latency_tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        downloader.hedge_budget = crate::object_store::hedging::HedgeBudget::new(1, 100);
+        downloader.attempt_budget = AttemptBudget::new(1, 100);
         fetch(&downloader, &["bucket"]).await;
         assert!(
             timeout(Duration::from_millis(150), fetch(&downloader, &["bucket"]))
@@ -1715,7 +1713,7 @@ mod latency_tests {
                 .begin(&BucketName::new(bucket).unwrap(), None)
                 .complete(crate::object_store::stats::Outcome::Overload);
         }
-        assert!(downloader.overload_retry_budget.try_retry());
+        assert!(downloader.attempt_budget.try_retry());
         let result =
             fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
         assert!(
