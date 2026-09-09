@@ -36,9 +36,7 @@ struct PrimaryAttempt {
 
 #[derive(Default)]
 struct Progress {
-    started: usize,
     active: usize,
-    secondary: Option<usize>,
     hedged: bool,
 }
 
@@ -76,7 +74,6 @@ impl ReplicaRequest<'_> {
         DownloadOutput {
             piece,
             primary_bucket_idx: primary,
-            secondary_bucket_idx: progress.secondary,
             used_bucket_idx: used,
             latency: start.elapsed(),
             hedged: progress.hedged,
@@ -110,10 +107,6 @@ impl ReplicaRequest<'_> {
         .execute(self.range.end - self.range.start, admission, |_| async {
             let _active = {
                 let mut progress = self.progress.lock();
-                if progress.started == 1 {
-                    progress.secondary = Some(index);
-                }
-                progress.started += 1;
                 progress.hedged |= progress.active > 0;
                 progress.active += 1;
                 ActiveCopy(&self.progress)

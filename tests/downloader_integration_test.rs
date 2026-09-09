@@ -304,7 +304,6 @@ async fn test_missing_objects_do_not_deprioritize_a_healthy_bucket() {
         .await
         .unwrap();
     assert_eq!(output.primary_bucket_idx, 0);
-    assert_eq!(output.secondary_bucket_idx, Some(1));
     assert_eq!(output.used_bucket_idx, 1);
     assert_eq!(output.piece.data, test_data);
 }

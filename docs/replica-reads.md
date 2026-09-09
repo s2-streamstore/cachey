@@ -31,6 +31,6 @@ Successful full-operation durations populate the bucket latency histogram. A sep
 | `cachey_page_download_latency_seconds` | Successful page download, including admission and every attempted copy. |
 | `cachey_first_chunk_latency_seconds` | HTTP handler time to its first available chunk, including cache lookup or coalesced-fill waiting. |
 
-`DownloadOutput::secondary_bucket_idx` identifies the first additional copy actually started; `used_bucket_idx` can identify any supplied copy. Its `hedged` flag reports overlapping requests, including timed rescue and protected recovery probes. The page `fallback` metric counts successes from a copy other than the initially selected one. Successful latency histograms exclude failed pages and client response-body transmission.
+`DownloadOutput` reports the initially selected bucket and the winning copy. Its `hedged` flag reports overlapping requests, including timed rescue and protected recovery probes. The page `fallback` metric counts successes from a copy other than the initially selected one. Successful latency histograms exclude failed pages and client response-body transmission.
 
 See the [simulation harness](simulation/README.md) for scenarios and run instructions, and the [reference report](simulation/REFERENCE.md) for measured behavior and limitations.

@@ -159,8 +159,6 @@ pub struct ObjectPiece {
 pub struct DownloadOutput {
     pub piece: ObjectPiece,
     pub primary_bucket_idx: usize,
-    /// First additional copy actually started, if any.
-    pub secondary_bucket_idx: Option<usize>,
     pub used_bucket_idx: usize,
     /// Time to validated page data, including SDK retries, hedging, and bucket fallback.
     pub latency: Duration,
@@ -296,7 +294,6 @@ impl Downloader {
             DownloadOutput {
                 piece,
                 primary_bucket_idx: 0,
-                secondary_bucket_idx: None,
                 used_bucket_idx: 0,
                 latency: start.elapsed(),
                 hedged,
@@ -338,19 +335,17 @@ impl Downloader {
         config: &RequestConfig,
         deadline: Instant,
     ) -> Result<(ObjectPiece, bool), DownloadError> {
+        let primary = self.fetch_piece(bucket, object, byterange, config);
+        tokio::pin!(primary);
         let Some(hedge_delay) = self
             .bucketed_stats
             .tail_latency(bucket)
             .filter(|delay| !delay.is_zero() && self.limits.hedge_budget_percent > 0)
         else {
-            return self
-                .fetch_piece(bucket, object, byterange, config)
-                .await
-                .map(|piece| (piece, false));
+            return primary.await.map(|piece| (piece, false));
         };
         let now = Instant::now();
         let hedge_at = now + hedge_delay.min(deadline.saturating_duration_since(now));
-        let mut primary = Box::pin(self.fetch_piece(bucket, object, byterange, config));
         select! {
             biased;
             result = &mut primary => return result.map(|piece| (piece, false)),
@@ -1640,7 +1635,6 @@ mod latency_tests {
         let output = fetch(&downloader, &["local", "peer"]).await;
         assert_eq!(output.used_bucket_idx, 0);
         assert!(!output.hedged);
-        assert_eq!(output.secondary_bucket_idx, None);
         assert_eq!(script.requests.load(Ordering::SeqCst), 1);
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
