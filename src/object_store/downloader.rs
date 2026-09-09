@@ -510,33 +510,31 @@ mod tests {
 
     #[derive(Debug)]
     struct ScriptedConnector {
-        responses: Arc<Mutex<VecDeque<ResponseStep>>>,
-        requests: Arc<AtomicUsize>,
-        active: Arc<AtomicUsize>,
-        service_errors: Arc<Mutex<HashMap<usize, u16>>>,
+        responses: Mutex<VecDeque<ResponseStep>>,
+        state: Arc<ScriptState>,
     }
 
-    struct ActiveRequest(Arc<AtomicUsize>);
+    struct ActiveRequest(Arc<ScriptState>);
 
     impl Drop for ActiveRequest {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Debug, Default)]
     struct ScriptState {
-        requests: Arc<AtomicUsize>,
-        active: Arc<AtomicUsize>,
-        service_errors: Arc<Mutex<HashMap<usize, u16>>>,
+        requests: AtomicUsize,
+        active: AtomicUsize,
+        service_errors: Mutex<HashMap<usize, u16>>,
     }
 
     impl HttpConnector for ScriptedConnector {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-            let request_idx = self.requests.fetch_add(1, Ordering::SeqCst);
-            self.active.fetch_add(1, Ordering::SeqCst);
-            let active = ActiveRequest(self.active.clone());
-            let service_error = self.service_errors.lock().get(&request_idx).copied();
+            let request_idx = self.state.requests.fetch_add(1, Ordering::SeqCst);
+            self.state.active.fetch_add(1, Ordering::SeqCst);
+            let active = ActiveRequest(self.state.clone());
+            let service_error = self.state.service_errors.lock().get(&request_idx).copied();
             let (bucket, headers_ms, body_ms, fail_body) = self
                 .responses
                 .lock()
@@ -586,17 +584,11 @@ mod tests {
 
     fn scripted_downloader(
         responses: impl IntoIterator<Item = ResponseStep>,
-    ) -> (Downloader, ScriptState) {
-        let state = ScriptState {
-            requests: Arc::new(AtomicUsize::new(0)),
-            active: Arc::new(AtomicUsize::new(0)),
-            service_errors: Arc::default(),
-        };
+    ) -> (Downloader, Arc<ScriptState>) {
+        let state = Arc::new(ScriptState::default());
         let connector = SharedHttpConnector::new(ScriptedConnector {
-            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
-            requests: state.requests.clone(),
-            active: state.active.clone(),
-            service_errors: state.service_errors.clone(),
+            responses: Mutex::new(responses.into_iter().collect()),
+            state: state.clone(),
         });
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(aws_config::BehaviorVersion::latest())

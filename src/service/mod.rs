@@ -332,7 +332,7 @@ mod tests {
         num::NonZeroUsize,
         sync::{
             Arc,
-            atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -365,64 +365,34 @@ mod tests {
         response_delay: Duration,
     }
 
-    fn parse_range_header(range_header: &str) -> Option<(u64, u64)> {
-        let range = range_header.strip_prefix("bytes=")?;
-        let (start, end) = range.split_once('-')?;
-        Some((start.parse().ok()?, end.parse().ok()?))
-    }
-
     async fn mock_get_object(
         State(state): State<Arc<MockS3State>>,
         Path((bucket, key)): Path<(String, String)>,
         headers: HeaderMap,
-    ) -> (StatusCode, HeaderMap, Bytes) {
-        if bucket != state.expected_bucket || key != state.expected_key {
-            return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new());
-        }
+    ) -> impl axum::response::IntoResponse {
+        assert_eq!(bucket, state.expected_bucket);
+        assert_eq!(key, state.expected_key);
+        let (start, end) = headers[http::header::RANGE]
+            .to_str()
+            .unwrap()
+            .strip_prefix("bytes=")
+            .unwrap()
+            .split_once('-')
+            .unwrap();
+        let start = start.parse::<usize>().unwrap();
+        let end = (end.parse::<usize>().unwrap() + 1).min(state.object.len());
+        assert!(start < end);
 
-        let Some(range_header) = headers
-            .get(http::header::RANGE)
-            .and_then(|v| v.to_str().ok())
-        else {
-            return (StatusCode::BAD_REQUEST, HeaderMap::new(), Bytes::new());
-        };
-        let Some((requested_start, requested_end)) = parse_range_header(range_header) else {
-            return (StatusCode::BAD_REQUEST, HeaderMap::new(), Bytes::new());
-        };
-
-        state.request_count.fetch_add(1, AtomicOrdering::Relaxed);
+        state.request_count.fetch_add(1, Ordering::Relaxed);
         tokio::time::sleep(state.response_delay).await;
-
-        let object_size = state.object.len() as u64;
-        if requested_start >= object_size {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                http::header::CONTENT_RANGE,
-                format!("bytes */{object_size}")
-                    .parse()
-                    .expect("content-range"),
-            );
-            return (StatusCode::RANGE_NOT_SATISFIABLE, headers, Bytes::new());
-        }
-
-        let response_end = requested_end.min(object_size.saturating_sub(1));
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_RANGE,
-            format!("bytes {requested_start}-{response_end}/{object_size}")
-                .parse()
-                .expect("content-range"),
-        );
-        headers.insert(
-            http::header::LAST_MODIFIED,
-            "Tue, 15 Nov 1994 08:12:31 GMT"
-                .parse()
-                .expect("last-modified"),
-        );
-        let data = state
-            .object
-            .slice((requested_start as usize)..=(response_end as usize));
-        (StatusCode::PARTIAL_CONTENT, headers, data)
+        (
+            StatusCode::PARTIAL_CONTENT,
+            [(
+                "content-range",
+                format!("bytes {start}-{}/{}", end - 1, state.object.len()),
+            )],
+            state.object.slice(start..end),
+        )
     }
 
     async fn spawn_mock_s3_server(
@@ -491,36 +461,6 @@ mod tests {
                 assert!(result.is_ok());
             }
         }
-    }
-
-    fn metric_page_request_total(kind: &ObjectKind, typ: &str) -> u64 {
-        prometheus::gather()
-            .into_iter()
-            .find(|family| family.name() == "cachey_page_request_total")
-            .and_then(|family| {
-                family.metric.iter().find_map(|metric| {
-                    let mut metric_kind = None;
-                    let mut metric_type = None;
-                    for label in &metric.label {
-                        match label.name() {
-                            "kind" => metric_kind = Some(label.value()),
-                            "type" => metric_type = Some(label.value()),
-                            _ => {}
-                        }
-                    }
-                    if metric_kind == Some(&**kind) && metric_type == Some(typ) {
-                        Some(metric.counter.value().round() as u64)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap_or(0)
-    }
-
-    fn unique_name(prefix: &str) -> String {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        format!("{prefix}-{}", NEXT_ID.fetch_add(1, AtomicOrdering::Relaxed))
     }
 
     #[test]
@@ -609,9 +549,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_service_reads_share_one_download() {
-        let kind = ObjectKind::new(unique_name("kind")).expect("kind");
-        let object = ObjectKey::new(unique_name("object")).expect("object");
-        let bucket = BucketName::new(unique_name("bucket")).expect("bucket");
+        let kind = ObjectKind::new("coalesced-reads").unwrap();
+        let object = ObjectKey::new("object").unwrap();
+        let bucket = BucketName::new("bucket").unwrap();
         let buckets = BucketNameSet::from(bucket.clone());
         let object_data = Bytes::from(vec![7_u8; 4096]);
 
@@ -652,18 +592,29 @@ mod tests {
         };
         let (left, right) = tokio::join!(read(), read());
 
-        assert_eq!(request_count.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
         for chunks in [left, right] {
             let chunks = chunks.expect("read");
             assert_eq!(chunks.len(), 1);
             assert_eq!(chunks[0].data, object_data);
             assert_eq!(chunks[0].cached_at, None);
         }
-        assert_eq!(metric_page_request_total(&kind, "access"), 2);
-        assert_eq!(metric_page_request_total(&kind, "success"), 2);
-        assert_eq!(metric_page_request_total(&kind, "download"), 1);
-        assert_eq!(metric_page_request_total(&kind, "coalesced"), 1);
-        assert_eq!(metric_page_request_total(&kind, "cache_hit"), 0);
+        let snapshot = super::metrics::gather();
+        let text = std::str::from_utf8(&snapshot).unwrap();
+        for (typ, expected) in [
+            ("access", 2),
+            ("success", 2),
+            ("download", 1),
+            ("coalesced", 1),
+            ("cache_hit", 0),
+        ] {
+            let prefix = format!("cachey_page_request_total{{kind=\"{kind}\",type=\"{typ}\"}} ");
+            let value = text
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .unwrap_or("0");
+            assert_eq!(value.parse::<u64>().unwrap(), expected, "{typ}");
+        }
 
         server_handle.abort();
     }

@@ -8,19 +8,8 @@ use cachey::{
     service::{PAGE_SIZE, SlidingThroughput},
     types::{BucketName, BucketNameSet, ObjectKey},
 };
-use common::setup_rustfs;
+use common::{setup_rustfs, upload_test_object};
 use parking_lot::Mutex;
-
-async fn upload_test_object(client: &aws_sdk_s3::Client, bucket: &str, key: &str, data: Bytes) {
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(data.into())
-        .send()
-        .await
-        .expect("Failed to upload object");
-}
 
 fn make_downloader(client: aws_sdk_s3::Client) -> Downloader {
     let throughput = Arc::new(Mutex::new(SlidingThroughput::default()));

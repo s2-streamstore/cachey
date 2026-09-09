@@ -6,21 +6,17 @@ use cachey::{
     cache::CacheConfig,
     service::{CacheyService, PAGE_SIZE, ServiceConfig},
 };
-use common::RustfsTestContext;
+use common::{RustfsTestContext, upload_test_object};
 use http_body_util::BodyExt;
 use tokio::net::TcpListener;
 
 struct TestContext {
-    _rustfs: RustfsTestContext,
-    s3_client: aws_sdk_s3::Client,
-    bucket_name: String,
+    rustfs: RustfsTestContext,
     server_url: String,
 }
 
 async fn setup_test_server() -> TestContext {
     let rustfs = common::setup_rustfs().await;
-    let s3_client = rustfs.client.clone();
-    let bucket_name = rustfs.bucket_name.clone();
     let service_config = ServiceConfig {
         cache: CacheConfig {
             memory_size: ByteSize::mib(256),
@@ -31,7 +27,7 @@ async fn setup_test_server() -> TestContext {
     };
 
     let server_handle = axum_server::Handle::new();
-    let cachey = CacheyService::new(service_config, s3_client.clone(), server_handle)
+    let cachey = CacheyService::new(service_config, rustfs.client.clone(), server_handle)
         .await
         .expect("Failed to create cache service");
 
@@ -49,23 +45,7 @@ async fn setup_test_server() -> TestContext {
             .expect("Failed to start server");
     });
 
-    TestContext {
-        _rustfs: rustfs,
-        s3_client,
-        bucket_name,
-        server_url,
-    }
-}
-
-async fn upload_test_object(client: &aws_sdk_s3::Client, bucket: &str, key: &str, data: Bytes) {
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(data.into())
-        .send()
-        .await
-        .expect("Failed to upload object");
+    TestContext { rustfs, server_url }
 }
 
 async fn scrape_metrics(client: &reqwest::Client, server_url: &str) -> String {
@@ -90,8 +70,8 @@ async fn test_fetch_endpoint_head_request() {
     let test_data = test_data.freeze();
     let object_key = "head-test.txt";
     upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
         object_key,
         test_data.clone(),
     )
@@ -101,7 +81,7 @@ async fn test_fetch_endpoint_head_request() {
     let response = client
         .head(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
+            ctx.server_url, ctx.rustfs.bucket_name, object_key
         ))
         .header("Range", "bytes=0-499")
         .send()
@@ -110,16 +90,7 @@ async fn test_fetch_endpoint_head_request() {
 
     assert_eq!(response.status(), 206);
 
-    let content_length = response
-        .headers()
-        .get("content-length")
-        .expect("Missing content-length header")
-        .to_str()
-        .expect("Invalid content-length")
-        .parse::<usize>()
-        .expect("Failed to parse content-length");
-
-    assert_eq!(content_length, 500);
+    assert_eq!(response.headers()["content-length"], "500");
 
     let body = response
         .bytes()
@@ -167,7 +138,7 @@ async fn test_fetch_endpoint_not_found() {
     let response = client
         .get(format!(
             "{}/fetch/{}/non-existent-object",
-            ctx.server_url, ctx.bucket_name
+            ctx.server_url, ctx.rustfs.bucket_name
         ))
         .header("Range", "bytes=0-100")
         .send()
@@ -188,8 +159,8 @@ async fn test_fetch_metrics_record_success_for_ranged_get() {
     let test_data = test_data.freeze();
     let object_key = "metrics-success-object.bin";
     upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
         object_key,
         test_data.clone(),
     )
@@ -203,7 +174,7 @@ async fn test_fetch_metrics_record_success_for_ranged_get() {
             ctx.server_url, metric_kind, object_key
         ))
         .header("Range", "bytes=0-4095")
-        .header("c0-bucket", &ctx.bucket_name)
+        .header("c0-bucket", &ctx.rustfs.bucket_name)
         .send()
         .await
         .expect("Failed to send request");
@@ -232,9 +203,15 @@ async fn cached_object_serves_ranges_after_backend_deletion() {
     let ctx = setup_test_server().await;
     let data = Bytes::from_static(b"0123456789abcdefghijklmnopqrstuvwxyz");
     let key = "cached-object";
-    upload_test_object(&ctx.s3_client, &ctx.bucket_name, key, data.clone()).await;
+    upload_test_object(
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
+        key,
+        data.clone(),
+    )
+    .await;
     let client = reqwest::Client::new();
-    let url = format!("{}/fetch/{}/{key}", ctx.server_url, ctx.bucket_name);
+    let url = format!("{}/fetch/{}/{key}", ctx.server_url, ctx.rustfs.bucket_name);
 
     for (index, range) in [0..data.len(), 10..20, 10..PAGE_SIZE as usize]
         .into_iter()
@@ -266,9 +243,10 @@ async fn cached_object_serves_ranges_after_backend_deletion() {
         );
 
         if index == 0 {
-            ctx.s3_client
+            ctx.rustfs
+                .client
                 .delete_object()
-                .bucket(&ctx.bucket_name)
+                .bucket(&ctx.rustfs.bucket_name)
                 .key(key)
                 .send()
                 .await
@@ -300,8 +278,8 @@ async fn test_fetch_endpoint_range_ending_at_page_boundary() {
     let test_data = test_data.freeze();
     let object_key = "exact-page-size.bin";
     upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
         object_key,
         test_data.clone(),
     )
@@ -311,7 +289,7 @@ async fn test_fetch_endpoint_range_ending_at_page_boundary() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
+            ctx.server_url, ctx.rustfs.bucket_name, object_key
         ))
         .header("Range", format!("bytes=0-{}", PAGE_SIZE - 1))
         .send()
@@ -333,7 +311,13 @@ async fn test_small_object_range_start_beyond_end_returns_416() {
 
     let test_data = Bytes::from(vec![42u8; 100 * 1024]);
     let object_key = "small-object-range-beyond-end.bin";
-    upload_test_object(&ctx.s3_client, &ctx.bucket_name, object_key, test_data).await;
+    upload_test_object(
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
+        object_key,
+        test_data,
+    )
+    .await;
 
     let start = PAGE_SIZE;
     let end = PAGE_SIZE + 1000;
@@ -341,7 +325,7 @@ async fn test_small_object_range_start_beyond_end_returns_416() {
     let response = client
         .get(format!(
             "{}/fetch/{}/{}",
-            ctx.server_url, ctx.bucket_name, object_key
+            ctx.server_url, ctx.rustfs.bucket_name, object_key
         ))
         .header("Range", format!("bytes={start}-{end}"))
         .send()
@@ -360,14 +344,20 @@ async fn test_fetch_endpoint_multi_page_range() {
             .collect::<Vec<_>>(),
     );
     let key = "multi-page-object.bin";
-    upload_test_object(&ctx.s3_client, &ctx.bucket_name, key, data.clone()).await;
+    upload_test_object(
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
+        key,
+        data.clone(),
+    )
+    .await;
 
     let start = PAGE_SIZE / 2;
     let end = 2 * PAGE_SIZE + PAGE_SIZE / 2;
     let response = reqwest::Client::new()
         .get(format!(
             "{}/fetch/{}/{key}",
-            ctx.server_url, ctx.bucket_name
+            ctx.server_url, ctx.rustfs.bucket_name
         ))
         .header("Range", format!("bytes={start}-{}", end - 1))
         .send()
@@ -393,8 +383,8 @@ async fn test_fetch_endpoint_multi_page_trailers_past_eof() {
     let test_data = test_data.freeze();
     let object_key = "multi-page-trailers.bin";
     upload_test_object(
-        &ctx.s3_client,
-        &ctx.bucket_name,
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
         object_key,
         test_data.clone(),
     )
@@ -402,7 +392,7 @@ async fn test_fetch_endpoint_multi_page_trailers_past_eof() {
 
     let uri = format!(
         "{}/fetch/{}/{}",
-        ctx.server_url, ctx.bucket_name, object_key
+        ctx.server_url, ctx.rustfs.bucket_name, object_key
     )
     .parse::<hyper::Uri>()
     .expect("Failed to parse URI");
@@ -432,7 +422,7 @@ async fn test_fetch_endpoint_multi_page_trailers_past_eof() {
     );
     assert_eq!(
         response.headers()["c0-status"],
-        format!("0-{}; {}; 0", PAGE_SIZE - 1, ctx.bucket_name)
+        format!("0-{}; {}; 0", PAGE_SIZE - 1, ctx.rustfs.bucket_name)
     );
 
     let (_parts, body) = response.into_parts();
@@ -457,7 +447,7 @@ async fn test_fetch_endpoint_multi_page_trailers_past_eof() {
                 "{}-{}; {}; 0",
                 page * PAGE_SIZE,
                 ((page + 1) * PAGE_SIZE).min(object_size as u64) - 1,
-                ctx.bucket_name
+                ctx.rustfs.bucket_name
             )
         })
         .collect();

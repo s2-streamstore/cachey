@@ -97,22 +97,6 @@ mod tests {
     use crate::types::BucketName;
 
     #[test]
-    fn startup_and_earned_hedges_are_shared_across_buckets_and_clones() {
-        let budget = AttemptBudget::new(5);
-        let first = BucketName::new("first").unwrap();
-        let second = BucketName::new("second").unwrap();
-        drop(budget.try_hedge(&first).unwrap());
-        assert!(budget.clone().try_hedge(&second).is_none());
-        for _ in 0..19 {
-            budget.observe_success();
-        }
-        assert!(budget.try_hedge(&first).is_none());
-        budget.observe_success();
-        drop(budget.clone().try_hedge(&second).unwrap());
-        assert!(budget.try_hedge(&first).is_none());
-    }
-
-    #[test]
     fn concurrency_caps_apply_even_when_more_successes_replenish_credits() {
         for names in [
             (0..17).map(|index| format!("bucket-{index}")).collect(),
@@ -151,24 +135,28 @@ mod tests {
     }
 
     #[test]
-    fn hedges_and_overload_retries_keep_separate_allowances() {
+    fn clones_share_credits_but_hedges_and_retries_keep_separate_allowances() {
         let budget = AttemptBudget::new(5);
-        let bucket = BucketName::new("bucket").unwrap();
-        drop(budget.try_hedge(&bucket).unwrap());
+        let first = BucketName::new("first").unwrap();
+        let second = BucketName::new("second").unwrap();
+        drop(budget.try_hedge(&first).unwrap());
+        assert!(budget.clone().try_hedge(&second).is_none());
         assert!(budget.clone().try_retry());
         assert!(!budget.try_retry());
         for _ in 0..10 {
             budget.observe_success();
         }
-        assert!(budget.try_hedge(&bucket).is_none());
+        assert!(budget.try_hedge(&first).is_none());
         assert!(budget.try_retry());
         assert!(!budget.try_retry());
-        for _ in 0..10 {
+        for _ in 0..9 {
             budget.observe_success();
         }
-        drop(budget.try_hedge(&bucket).unwrap());
+        assert!(budget.try_hedge(&first).is_none());
+        budget.observe_success();
+        drop(budget.clone().try_hedge(&second).unwrap());
         assert!(budget.try_retry());
-        assert!(budget.try_hedge(&bucket).is_none());
+        assert!(budget.try_hedge(&first).is_none());
         assert!(!budget.try_retry());
     }
 }
