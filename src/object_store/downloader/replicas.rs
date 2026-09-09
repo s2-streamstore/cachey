@@ -250,31 +250,24 @@ impl Downloader {
         routing: &RoutingSnapshot,
     ) -> PrimaryAttempt {
         let (mut index, mut probe) = routing.primary(remaining);
-        let mut backup_admission = None;
-        let permits = if probe.is_some() {
-            let pair = self.admission.try_acquire(bytes).and_then(|first| {
-                self.admission
-                    .try_acquire(bytes)
-                    .map(|backup| (first, backup))
-            });
-            if let Some((first, backup)) = pair {
-                backup_admission = Some(backup);
-                Some(AttemptPermits {
-                    admission: first,
-                    hedge: None,
-                })
-            } else {
-                probe = None;
-                index = routing.best(&[], remaining).unwrap_or(index);
-                None
-            }
-        } else {
-            None
-        };
+        let reservations = probe.as_ref().and_then(|_| {
+            Some((
+                self.admission.try_acquire(bytes)?,
+                self.admission.try_acquire(bytes)?,
+            ))
+        });
+        if probe.is_some() && reservations.is_none() {
+            probe = None;
+            index = routing.best(&[], remaining).unwrap_or(index);
+        }
+        let (admission, backup_admission) = reservations.unzip();
         PrimaryAttempt {
             index,
             probe,
-            permits,
+            permits: admission.map(|admission| AttemptPermits {
+                admission,
+                hedge: None,
+            }),
             backup_admission,
         }
     }

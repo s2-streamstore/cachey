@@ -1,7 +1,7 @@
 use std::{ops::Range, sync::Arc, time::Duration};
 
 use aws_sdk_s3::{
-    error::ProvideErrorMetadata,
+    error::{ProvideErrorMetadata, SdkError},
     operation::get_object::{GetObjectError, GetObjectOutput},
 };
 use bytes::{Bytes, BytesMut};
@@ -101,25 +101,18 @@ impl DownloadError {
     }
 }
 
-type GetObjectResult = Result<GetObjectOutput, Box<aws_sdk_s3::error::SdkError<GetObjectError>>>;
+type GetObjectResult = Result<GetObjectOutput, Box<SdkError<GetObjectError>>>;
 
-fn invalid_range_object_size(error: &aws_sdk_s3::error::SdkError<GetObjectError>) -> Option<u64> {
-    error
+fn map_get_object_error(req_range: &Range<u64>, error: SdkError<GetObjectError>) -> DownloadError {
+    let object_size = error
         .raw_response()
         .and_then(|response| response.headers().get("content-range"))
         .and_then(ContentRange::parse)
         .and_then(|content_range| match content_range {
             ContentRange::Unsatisfied(range) => Some(range.complete_length),
             ContentRange::Bytes(_) | ContentRange::UnboundBytes(_) => None,
-        })
-}
-
-fn map_get_object_error(
-    req_range: &Range<u64>,
-    object_size: Option<u64>,
-    error: GetObjectError,
-) -> DownloadError {
-    match error {
+        });
+    match error.into_service_error() {
         GetObjectError::InvalidObjectState(invalid_object_state) => {
             DownloadError::InvalidObjectState(invalid_object_state.message.unwrap_or_default())
         }
@@ -420,10 +413,7 @@ impl Downloader {
         req_range: &Range<u64>,
         result: GetObjectResult,
     ) -> Result<ObjectPiece, DownloadError> {
-        let output = result.map_err(|error| {
-            let object_size = invalid_range_object_size(&error);
-            map_get_object_error(req_range, object_size, error.into_service_error())
-        })?;
+        let output = result.map_err(|error| map_get_object_error(req_range, *error))?;
         let invalid_range = || {
             DownloadError::InvalidResponse(format!(
                 "Expected range {req_range:?}, received Content-Range {:?}",
