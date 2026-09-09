@@ -188,20 +188,19 @@ impl Downloader {
                     (true, None)
                 },
             };
-            let routing = self.bucketed_stats.snapshot(buckets);
-            let overloaded = routing.all_overloaded();
-            let allowed = Instant::now() < deadline
-                && active.len() < MAX_CONCURRENT_COPIES
-                && !(early && overloaded);
-            let next = scheduled
-                .or_else(|| {
-                    routing.best(&tried, deadline.saturating_duration_since(Instant::now()))
-                })
-                .filter(|index| !tried[*index]);
-            if !allowed {
+            if active.len() >= MAX_CONCURRENT_COPIES || scheduled.is_some_and(|index| tried[index])
+            {
                 continue;
             }
-            let Some(index) = next else { continue };
+            let routing = self.bucketed_stats.snapshot(buckets);
+            let overloaded = routing.all_overloaded();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || (early && overloaded) {
+                continue;
+            }
+            let Some(index) = scheduled.or_else(|| routing.best(&tried, remaining)) else {
+                continue;
+            };
             if overloaded && !self.attempt_budget.try_retry() {
                 if matches!(last_error, None | Some(DownloadError::NoSuchKey)) {
                     last_error = Some(DownloadError::Overloaded(
