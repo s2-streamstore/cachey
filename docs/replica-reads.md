@@ -10,7 +10,7 @@ A backend failure immediately deprioritizes that bucket. Missing objects, invali
 
 Each distinct copy gets its own operation deadline after admission, including SDK retries, body transfer, and validation. Defaults are 5 seconds per copy (`--bucket-timeout-ms`) and 10 seconds for the entire page (`--page-timeout-ms`). Recoverable errors immediately advance to an untried copy. Timed rescue attempts reserve part of the page budget using the alternatives' recent successful p99 durations. Each reservation stays attached to its destination even if preferences change; rescue attempts do not cancel an otherwise viable earlier read. At most three copies are active per page, and each supplied copy is tried at most once at this layer. Backend SDK retries are contained within those operations. The first fully validated result wins and cancels the remaining work.
 
-With multiple buckets, early hedges use another copy. With one bucket, the existing same-bucket primary/hedge race remains. Early hedges use the configured successful-latency quantile (`--hedge-quantile`, zero disables early hedging). They require a shared success-funded allowance: one startup hedge plus one per 20 successful page downloads by default (`--hedge-budget-percent 5`). Credits and concurrent early hedges are capped globally at 16 (`--max-concurrent-hedges`); each destination allows at most two concurrent early hedges. Early hedges use one SDK attempt. Ordinary fallback and deadline rescue do not require early-hedge credits. When every supplied bucket has recently reported explicit overload, early hedges stop and extra attempts share a separate bounded retry allowance, replenished by successful pages.
+With multiple buckets, early hedges use another copy. With one bucket, the primary and hedge race against the same bucket. Early hedges use the configured successful-latency quantile (`--hedge-quantile`, zero disables early hedging). They require a shared success-funded allowance: one startup hedge plus one per 20 successful page downloads by default (`--hedge-budget-percent 5`). Credits and concurrent early hedges are capped globally at 16 (`--max-concurrent-hedges`); each destination allows at most two concurrent early hedges. Early hedges use one SDK attempt. Ordinary fallback and deadline rescue do not require early-hedge credits. When every supplied bucket has recently reported explicit overload, early hedges stop and extra attempts share a separate bounded retry allowance, replenished by successful pages.
 
 ## Admission
 
@@ -27,7 +27,7 @@ Successful full-operation durations populate the bucket latency histogram. A sep
 | `cachey_bucket_latency_mean_seconds` | Mean successful complete bucket-operation duration. |
 | `cachey_bucket_latency_hedge_seconds` | Successful bucket-operation quantile used for early hedging. |
 | `cachey_bucket_error_rate` / `cachey_bucket_consecutive_failures` | Backend health outcomes; object-specific and local failures are excluded. |
-| `cachey_bucket_deprioritized` | Soft health priority; replaces `cachey_bucket_circuit_breaker_open`. |
+| `cachey_bucket_deprioritized` | Soft health priority. |
 | `cachey_page_download_latency_seconds` | Successful page download, including admission and every attempted copy. |
 | `cachey_first_chunk_latency_seconds` | HTTP handler time to its first available chunk, including cache lookup or coalesced-fill waiting. |
 

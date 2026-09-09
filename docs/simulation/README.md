@@ -109,13 +109,8 @@ completion/rescue boundaries; their transport attempt still counts.
 
 ## Comparing changes
 
-Use the same harness and fixtures on both revisions, never a second implementation
-of the routing policy. For a before/after fix, commit the harness first, record that
-revision, apply the production fix, and rerun with identical environment variables.
-Use separate worktrees for older revisions. If they predate the harness, port only
-the connector, fixtures, test-only observation hooks, and dev dependency; review that
-patch to ensure it does not include the policy under test. Record both the base
-revision and harness patch. Do not overwrite newer fixtures with historical ones.
+Run both revisions with the same harness, fixtures, and environment variables in
+separate worktrees. Record each revision and any harness patch with its results.
 
 Compare all-arrival completion first, then latency, attempt amplification, occupied
 service time, bytes, concurrency, and recovery. Separate deterministic regression

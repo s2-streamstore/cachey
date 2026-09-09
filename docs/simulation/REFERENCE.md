@@ -1,13 +1,12 @@
 # Replica simulation reference
 
-The real-code campaign supports keeping deadline feasibility and health ahead of
-latency/locality, while retaining every copy as a fallback. It also found and fixed
-two availability regressions that the earlier Python model missed. Resource limits,
-correlated faults, and an insufficient page deadline still constrain availability.
+This campaign measures replica selection under errors, stalls, recovery, and
+limited capacity. Results include completion rates, latency, retry amplification,
+and server work after cancellation.
 
 ## Revisions and reproduction
 
-- Before: `8d3ed8814085dfb8a8a388ab84efa2484828d048` (harness, original PR policy).
+- Before: `8d3ed8814085dfb8a8a388ab84efa2484828d048` (comparison revision).
 - Production fixes: `5b4339c79c2399aaaf74063486bbcb799644f805`.
 - Reference harness: `d564189d88272443a49878b1e878ff665b751f35`.
 - All recorded runs used clean working trees. No production traffic was used.
@@ -54,7 +53,7 @@ where the campaign includes healthy periods.
 | Fully correlated faults | 1,728/1,800 | All 72 failures occur among 900 fault-window arrivals. Another copy cannot repair a fault shared by all copies. |
 | First two copies return errors | 1,800/1,800 | The third copy remains usable. |
 | First two copies stall in headers or bodies | 1,800/1,800 in each case | Some initial reads take **5.006 s** despite a healthy 6 ms copy. Availability within the 10 s page budget does not imply fast failover for every read. |
-| Two stalled regions; third needs 150 ms, deadline 500 ms | 1,800/1,800 | Maximum read latency is 412 ms after the reservation fix. |
+| Two stalled regions; third needs 150 ms, deadline 500 ms | 1,800/1,800 | Maximum read latency is 412 ms. |
 | Healthy distant copy needs 150 ms, deadline 100 ms; near copies each fail 10% | 1,792/1,800 | Eight failures among 900 fault-window arrivals. The distant copy cannot provide availability inside this deadline. |
 | Preferred copy recovers while both peers become unavailable | 3,000/3,000 | Recovery remains possible, but the transition reaches **9.983 s** against a 10 s deadline. |
 
@@ -102,19 +101,3 @@ client future would have hidden this work.
 The ordinary finite-capacity scenario has identical results with zero and 100 ms
 cancellation delay because accepted work finishes before cancellation matters.
 The separate cancellation storm is needed to expose that dimension.
-
-## Relation to the Python exploration
-
-The Rust results reproduce the qualitative findings: a third independent copy
-reduces residual errors, correlated failures remain, deadline feasibility matters,
-and low resource limits reject legitimate reads. They replace the earlier regional
-availability claim with a measured before/after fix. The Rust model additionally
-executes actual SDK retries, admission waiting, completion races, and delayed server
-cancellation. Python counts and latency deltas are not carried over as Rust results,
-and the historical two-copy routing implementation is not embedded in this harness.
-
-Keep the current bounded policy with these fixes. The experiments justify its
-failure handling and identify limits; they do not justify an adaptive concurrency
-controller, more ranking constants, or a universal availability claim. A future
-Capacitor backend should reuse the scenario contracts while exercising its own
-transport and retry implementation.
