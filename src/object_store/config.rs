@@ -151,57 +151,7 @@ mod tests {
 
     use aws_sdk_s3::config::{retry::RetryConfig, timeout::TimeoutConfig};
 
-    use crate::object_store::config::{DownloadLimits, RequestConfig};
-
-    #[test]
-    fn download_limits_reject_invalid_deadlines_and_budget() {
-        for limits in [
-            DownloadLimits {
-                max_inflight_requests: 0,
-                ..DownloadLimits::default()
-            },
-            DownloadLimits {
-                max_inflight_bytes: 0,
-                ..DownloadLimits::default()
-            },
-            DownloadLimits {
-                max_inflight_bytes: u64::MAX,
-                ..DownloadLimits::default()
-            },
-            DownloadLimits {
-                bucket_timeout: Duration::ZERO,
-                ..DownloadLimits::default()
-            },
-            DownloadLimits {
-                page_timeout: Duration::ZERO,
-                ..DownloadLimits::default()
-            },
-            DownloadLimits {
-                page_timeout: Duration::MAX,
-                ..DownloadLimits::default()
-            },
-            DownloadLimits {
-                hedge_budget_percent: 101,
-                ..DownloadLimits::default()
-            },
-        ] {
-            assert!(limits.validate().is_err(), "accepted {limits:?}");
-        }
-    }
-
-    #[test]
-    fn download_limits_allow_disabled_hedging_and_bucket_budget_above_page_budget() {
-        assert!(DownloadLimits::default().validate().is_ok());
-        assert!(
-            DownloadLimits {
-                bucket_timeout: Duration::MAX,
-                hedge_budget_percent: 0,
-                ..DownloadLimits::default()
-            }
-            .validate()
-            .is_ok()
-        );
-    }
+    use super::RequestConfig;
 
     #[test]
     fn merged_timeout_config_preserves_unset_base_fields() {

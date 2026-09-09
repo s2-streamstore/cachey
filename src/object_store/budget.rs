@@ -99,30 +99,17 @@ mod tests {
     use crate::types::BucketName;
 
     #[test]
-    fn successful_fetches_fund_hedges_and_drops_only_release_concurrency() {
-        let budget = AttemptBudget::new(16, 5);
-        let bucket = BucketName::new("bucket").unwrap();
-        drop(budget.try_hedge(&bucket).unwrap());
-        assert!(budget.state.lock().active_by_bucket.is_empty());
-        for _ in 0..19 {
-            budget.observe_success();
-        }
-        assert!(budget.try_hedge(&bucket).is_none());
-        budget.observe_success();
-        drop(budget.try_hedge(&bucket).unwrap());
-        assert!(budget.try_hedge(&bucket).is_none());
-    }
-
-    #[test]
-    fn startup_allowance_is_shared_across_buckets_and_clones() {
+    fn startup_and_earned_hedges_are_shared_across_buckets_and_clones() {
         let budget = AttemptBudget::new(16, 5);
         let first = BucketName::new("first").unwrap();
         let second = BucketName::new("second").unwrap();
         drop(budget.try_hedge(&first).unwrap());
         assert!(budget.clone().try_hedge(&second).is_none());
-        for _ in 0..20 {
+        for _ in 0..19 {
             budget.observe_success();
         }
+        assert!(budget.try_hedge(&first).is_none());
+        budget.observe_success();
         drop(budget.clone().try_hedge(&second).unwrap());
         assert!(budget.try_hedge(&first).is_none());
     }

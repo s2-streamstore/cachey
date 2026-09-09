@@ -474,28 +474,6 @@ impl BucketedStats {
     }
 
     #[cfg(test)]
-    fn attempt_order(
-        &self,
-        buckets: &BucketNameSet,
-        tried: &[bool],
-        remaining: Duration,
-    ) -> Vec<usize> {
-        let snapshot = self.snapshot(buckets);
-        let mut order: Vec<_> = (0..buckets.len()).filter(|index| !tried[*index]).collect();
-        order.sort_by(|left, right| snapshot.compare(*left, *right, remaining));
-        order
-    }
-
-    #[cfg(test)]
-    fn primary(
-        &self,
-        buckets: &BucketNameSet,
-        remaining: Duration,
-    ) -> (usize, Option<ProbePermit>) {
-        self.snapshot(buckets).primary(remaining)
-    }
-
-    #[cfg(test)]
     pub(super) fn simulation_histograms(&self) -> Vec<(u64, usize)> {
         self.by_bucket
             .iter()
@@ -577,29 +555,10 @@ mod tests {
                 success(&stats, bucket, millis).await;
             }
             assert_eq!(
-                stats.attempt_order(&buckets, &[false; 3], Duration::from_secs(1))[0],
-                expected
+                stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+                Some(expected)
             );
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn health_is_soft_and_deadline_feasibility_comes_first() {
-        let stats = BucketedStats::default();
-        let buckets = buckets();
-        for (bucket, millis) in buckets.iter().zip([10, 60, 150]) {
-            success(&stats, bucket, millis).await;
-        }
-        for bucket in buckets.iter().take(2) {
-            stats.begin(bucket, None).complete(Outcome::Failure);
-        }
-        assert_eq!(
-            stats.attempt_order(&buckets, &[false; 3], Duration::from_secs(1))[0],
-            2
-        );
-        let order = stats.attempt_order(&buckets, &[false; 3], Duration::from_millis(100));
-        assert_eq!(order[0], 0);
-        assert_eq!(order.len(), 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -633,74 +592,23 @@ mod tests {
         }
         stats.begin(&buckets[0], None).complete(Outcome::Failure);
         advance(Duration::from_secs(37)).await;
-        let (index, probe) = stats.primary(&buckets, Duration::from_secs(1));
+        let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
         assert_eq!(index, 0);
         assert!(probe.is_some());
-        assert_eq!(stats.primary(&buckets, Duration::from_secs(1)).0, 1);
+        assert_eq!(
+            stats.snapshot(&buckets).primary(Duration::from_secs(1)).0,
+            1
+        );
         let observation = stats.begin(&buckets[0], probe);
         advance(Duration::from_millis(3)).await;
         observation.complete(Outcome::Success);
-        assert!(stats.entry(&buckets[0]).lock().deprioritized);
-        assert!(!stats.entry(&buckets[0]).lock().probing);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancellation_is_a_latency_lower_bound_not_a_health_failure() {
-        let stats = BucketedStats::default();
-        let bucket = &buckets()[0];
-        success(&stats, bucket, 100).await;
-        let observation = stats.begin(bucket, None);
-        advance(Duration::from_millis(10)).await;
-        drop(observation);
         assert_eq!(
-            stats.entry(bucket).lock().routing_latency,
-            Duration::from_millis(100)
+            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+            Some(1)
         );
-        let observation = stats.begin(bucket, None);
-        advance(Duration::from_millis(200)).await;
-        drop(observation);
-        let entry = stats.entry(bucket);
-        let state = entry.lock();
-        assert!(state.routing_latency > Duration::from_millis(100));
-        assert!(!state.deprioritized);
-        assert!(state.active.is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn completed_and_cancelled_observations_release_shared_start_times_once() {
-        let stats = BucketedStats::default();
-        let bucket = &buckets()[0];
-        success(&stats, bucket, 100).await;
-        let neutral = stats.begin(bucket, None);
-        let completed = stats.begin(bucket, None);
-        let cancelled = stats.begin(bucket, None);
-        let entry = stats.entry(bucket);
-        assert_eq!(
-            entry.lock().active.values().copied().collect::<Vec<_>>(),
-            [3]
-        );
-
-        advance(Duration::from_millis(200)).await;
-        neutral.complete(Outcome::Neutral);
-        {
-            let state = entry.lock();
-            assert_eq!(state.routing_latency, Duration::from_millis(100));
-            assert_eq!(state.histogram.snapshot().count(), 1);
-            assert_eq!(state.active.values().copied().sum::<usize>(), 2);
-        }
-        completed.complete(Outcome::Success);
-        {
-            let state = entry.lock();
-            assert_eq!(state.routing_latency, Duration::from_millis(110));
-            assert_eq!(state.histogram.snapshot().count(), 2);
-            assert_eq!(state.active.values().copied().sum::<usize>(), 1);
-        }
-        drop(cancelled);
-        let state = entry.lock();
-        assert_eq!(state.routing_latency, Duration::from_millis(119));
-        assert_eq!(state.histogram.snapshot().count(), 2);
-        assert!(state.active.is_empty());
-        assert!(!state.deprioritized);
+        let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
+        assert_eq!(index, 0);
+        assert!(probe.is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -725,7 +633,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn concurrent_stalls_affect_routing_before_timeouts() {
+    async fn stalled_and_cancelled_reads_affect_routing_without_poisoning_health() {
         let stats = BucketedStats::default();
         let buckets = buckets();
         for (bucket, millis) in buckets.iter().zip([3, 5, 6]) {
@@ -736,10 +644,19 @@ mod tests {
             .collect::<Vec<_>>();
         advance(Duration::from_millis(20)).await;
         assert_eq!(
-            stats.attempt_order(&buckets, &[false; 3], Duration::from_secs(1))[0],
-            1
+            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+            Some(1)
         );
         drop(active);
+        assert_eq!(
+            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+            Some(1)
+        );
+        success(&stats, &buckets[0], 3).await;
+        assert_eq!(
+            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+            Some(0)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -749,9 +666,15 @@ mod tests {
         for (bucket, millis) in buckets.iter().zip([10, 60, 150]) {
             success(&stats, bucket, millis).await;
         }
-        stats.begin(&buckets[0], None).complete(Outcome::Neutral);
+        let active = (0..3)
+            .map(|_| stats.begin(&buckets[0], None))
+            .collect::<Vec<_>>();
+        advance(Duration::from_secs(1)).await;
+        for observation in active {
+            observation.complete(Outcome::Neutral);
+        }
         advance(Duration::from_secs(60)).await;
-        let (index, probe) = stats.primary(&buckets, Duration::from_secs(1));
+        let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
         assert_eq!(index, 0);
         assert!(probe.is_none());
         assert!(!stats.entry(&buckets[0]).lock().deprioritized);

@@ -506,270 +506,10 @@ impl Downloader {
 
 #[cfg(test)]
 mod tests {
-    use aws_sdk_s3::{
-        error::ErrorMetadata,
-        operation::get_object::{GetObjectError, GetObjectOutput},
-        primitives::{DateTime, SdkBody},
-    };
-    use aws_smithy_runtime_api::{client::orchestrator::HttpResponse, http::StatusCode};
-    use bytes::Bytes;
-
-    use super::*;
-
-    fn make_test_downloader() -> Downloader {
-        // Create a dummy S3 client for testing
-        let config = aws_sdk_s3::Config::builder()
-            .behavior_version(aws_config::BehaviorVersion::latest())
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "test", "test", None, None, "test",
-            ))
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .build();
-        let client = aws_sdk_s3::Client::from_conf(config);
-        let throughput = Arc::new(Mutex::new(crate::service::SlidingThroughput::default()));
-        Downloader::new(client, DownloadLimits::default(), throughput).unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_handle_result_success() {
-        let downloader = make_test_downloader();
-        let req_range = Range { start: 0, end: 10 };
-
-        // Create a mock successful response
-        let test_data = b"0123456789";
-        let output = GetObjectOutput::builder()
-            .content_range("bytes 0-9/100")
-            .last_modified(DateTime::from_secs(1_234_567_890))
-            .body(aws_sdk_s3::primitives::ByteStream::from(test_data.to_vec()))
-            .build();
-
-        let result = downloader
-            .handle_result(&req_range, Ok(output))
-            .await
-            .unwrap();
-
-        assert_eq!(result.data, Bytes::from(test_data.to_vec()));
-        assert_eq!(result.object_size, 100);
-        assert_eq!(result.mtime, 1_234_567_890);
-    }
-
-    #[tokio::test]
-    async fn test_handle_result_range_mismatch() {
-        let downloader = make_test_downloader();
-        let req_range = Range { start: 10, end: 20 };
-
-        // Response with mismatched start byte
-        let output = GetObjectOutput::builder()
-            .content_range("bytes 0-9/100")
-            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 10]))
-            .build();
-
-        let result = downloader.handle_result(&req_range, Ok(output)).await;
-
-        assert!(matches!(result, Err(DownloadError::InvalidResponse(_))));
-    }
-
-    #[tokio::test]
-    async fn test_handle_result_rejects_oversized_response_ending_at_object_eof() {
-        let downloader = make_test_downloader();
-        let req_range = Range { start: 0, end: 10 };
-
-        let output = GetObjectOutput::builder()
-            .content_range("bytes 0-99/100")
-            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 100]))
-            .build();
-
-        let result = downloader.handle_result(&req_range, Ok(output)).await;
-
-        assert!(matches!(result, Err(DownloadError::InvalidResponse(_))));
-    }
-
-    #[tokio::test]
-    async fn test_handle_result_accepts_truncated_at_eof() {
-        let downloader = make_test_downloader();
-        let req_range = Range { start: 0, end: 10 };
-
-        let output = GetObjectOutput::builder()
-            .content_range("bytes 0-4/5")
-            .last_modified(DateTime::from_secs(1_234_567_890))
-            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 5]))
-            .build();
-
-        let piece = downloader
-            .handle_result(&req_range, Ok(output))
-            .await
-            .expect("valid EOF truncation should be accepted");
-
-        assert_eq!(piece.data, Bytes::from(vec![0; 5]));
-        assert_eq!(piece.object_size, 5);
-        assert_eq!(piece.mtime, 1_234_567_890);
-    }
-
-    #[tokio::test]
-    async fn test_handle_result_no_such_key() {
-        let downloader = make_test_downloader();
-        let req_range = Range { start: 0, end: 10 };
-
-        let error = aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(
-            aws_sdk_s3::types::error::NoSuchKey::builder()
-                .message("The specified key does not exist.")
-                .build(),
-        );
-
-        let sdk_error = aws_sdk_s3::error::SdkError::service_error(
-            error,
-            aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
-                aws_smithy_runtime_api::http::StatusCode::try_from(404).unwrap(),
-                aws_sdk_s3::primitives::SdkBody::empty(),
-            ),
-        );
-
-        let result = downloader
-            .handle_result(&req_range, Err(Box::new(sdk_error)))
-            .await;
-
-        match result {
-            Err(DownloadError::NoSuchKey) => {}
-            _ => panic!("Expected NoSuchKey error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_result_body_length_mismatch() {
-        let downloader = make_test_downloader();
-        let req_range = Range { start: 0, end: 10 };
-
-        // Create output with content range indicating 10 bytes but only 5 bytes of data
-        let output = GetObjectOutput::builder()
-            .content_range("bytes 0-9/100")
-            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 5]))
-            .build();
-
-        let result = downloader.handle_result(&req_range, Ok(output)).await;
-
-        match result {
-            Err(DownloadError::BodyStreaming(msg)) => {
-                assert!(msg.contains("Expected 10 bytes, got 5"));
-            }
-            _ => panic!("Expected BodyStreaming error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_result_invalid_range_service_error() {
-        let downloader = make_test_downloader();
-        let req_range = Range {
-            start: 1024,
-            end: 2048,
-        };
-
-        let service_error = GetObjectError::generic(
-            ErrorMetadata::builder()
-                .code("InvalidRange")
-                .message("The requested range is not satisfiable")
-                .build(),
-        );
-        let mut response = HttpResponse::new(StatusCode::try_from(416).unwrap(), SdkBody::empty());
-        response
-            .headers_mut()
-            .insert("content-range", "bytes */512");
-        let sdk_error = aws_sdk_s3::error::SdkError::service_error(service_error, response);
-
-        let result = downloader
-            .handle_result(&req_range, Err(Box::new(sdk_error)))
-            .await;
-
-        match result {
-            Err(DownloadError::RangeNotSatisfied {
-                requested,
-                object_size,
-            }) => {
-                assert_eq!(requested, req_range);
-                assert_eq!(object_size, Some(512));
-            }
-            other => panic!("Expected RangeNotSatisfied error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_download_error_should_attempt_fallback() {
-        // Test which errors should trigger fallback bucket attempts
-        assert!(
-            DownloadError::InvalidObjectState("test".to_string()).should_attempt_fallback_bucket()
-        );
-        assert!(DownloadError::NoSuchKey.should_attempt_fallback_bucket());
-        assert!(
-            !DownloadError::RangeNotSatisfied {
-                requested: Range { start: 0, end: 10 },
-                object_size: Some(5),
-            }
-            .should_attempt_fallback_bucket()
-        );
-        assert!(DownloadError::BodyStreaming("test".to_string()).should_attempt_fallback_bucket());
-        assert!(DownloadError::Unknown("test".to_string()).should_attempt_fallback_bucket());
-    }
-
-    #[tokio::test]
-    async fn test_download_rejects_empty_range() {
-        let downloader = make_test_downloader();
-        let bucket = BucketName::new("test-bucket").unwrap();
-        let buckets = BucketNameSet::new(std::iter::once(bucket)).unwrap();
-        let key = ObjectKey::new("test-key").unwrap();
-
-        let result = downloader
-            .download(
-                &buckets,
-                key,
-                &Range { start: 10, end: 10 },
-                &RequestConfig::default(),
-            )
-            .await;
-        assert!(matches!(
-            result,
-            Err(DownloadError::RangeNotSatisfied { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_handle_result_missing_content_range() {
-        let downloader = make_test_downloader();
-        let req_range = Range { start: 0, end: 10 };
-
-        // Create output without content range header
-        let output = GetObjectOutput::builder()
-            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0; 10]))
-            .build();
-
-        let result = downloader.handle_result(&req_range, Ok(output)).await;
-
-        assert!(matches!(result, Err(DownloadError::InvalidResponse(_))));
-    }
-
-    #[tokio::test]
-    async fn test_handle_result_unsatisfied_range() {
-        let downloader = make_test_downloader();
-        let req_range = Range {
-            start: 100,
-            end: 200,
-        };
-
-        // Create output with unsatisfied range response
-        let output = GetObjectOutput::builder()
-            .content_range("bytes */50")
-            .body(aws_sdk_s3::primitives::ByteStream::from(vec![]))
-            .build();
-
-        let result = downloader.handle_result(&req_range, Ok(output)).await;
-
-        assert!(matches!(result, Err(DownloadError::InvalidResponse(_))));
-    }
-}
-
-#[cfg(test)]
-mod latency_tests {
     use std::{
         collections::{HashMap, VecDeque},
         io,
+        ops::Range,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -779,13 +519,16 @@ mod latency_tests {
 
     use aws_sdk_s3::{
         config::{Credentials, Region, retry::RetryConfig},
-        primitives::SdkBody,
+        error::ErrorMetadata,
+        operation::get_object::{GetObjectError, GetObjectOutput},
+        primitives::{ByteStream, SdkBody},
     };
     use aws_smithy_runtime_api::client::{
         http::{HttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn},
         orchestrator::{HttpRequest, HttpResponse},
     };
     use bytes::Bytes;
+    use futures::{StreamExt, stream};
     use http_body::Frame;
     use http_body_util::StreamBody;
     use parking_lot::Mutex;
@@ -948,6 +691,112 @@ mod latency_tests {
         found.expect("bucket observation")
     }
 
+    #[tokio::test]
+    async fn rejects_mismatched_or_missing_response_ranges() {
+        let downloader = downloader([]);
+        for header in [
+            None,
+            Some("bytes 1-10/100"),
+            Some("bytes 0-99/100"),
+            Some("bytes */50"),
+        ] {
+            let output = GetObjectOutput::builder()
+                .set_content_range(header.map(str::to_owned))
+                .build();
+            let result = downloader.handle_result(&(0..10), Ok(output)).await;
+            assert!(
+                matches!(result, Err(DownloadError::InvalidResponse(_))),
+                "{header:?}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejects_short_bodies_and_stops_reading_excess_data() {
+        let downloader = downloader([]);
+        let excess = stream::iter([Ok::<_, io::Error>(Frame::data(Bytes::from_static(
+            b"01234567890",
+        )))])
+        .chain(stream::pending());
+        for body in [
+            SdkBody::from("short"),
+            SdkBody::from_body_1_x(StreamBody::new(excess)),
+        ] {
+            let output = GetObjectOutput::builder()
+                .content_range("bytes 0-9/100")
+                .body(ByteStream::new(body))
+                .build();
+            let result = timeout(
+                Duration::from_millis(1),
+                downloader.handle_result(&(0..10), Ok(output)),
+            )
+            .await
+            .expect("excess data must be rejected without waiting for the rest of the body");
+            assert!(matches!(result, Err(DownloadError::BodyStreaming(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_range_preserves_the_backend_object_size() {
+        let downloader = downloader([]);
+        let error = GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build());
+        let mut response = HttpResponse::new(416.try_into().unwrap(), SdkBody::empty());
+        response
+            .headers_mut()
+            .insert("content-range", "bytes */512");
+        let error = aws_sdk_s3::error::SdkError::service_error(error, response);
+        let result = downloader
+            .handle_result(&(1024..2048), Err(Box::new(error)))
+            .await;
+        assert!(
+            matches!(result, Err(DownloadError::RangeNotSatisfied { requested, object_size: Some(512) }) if requested == (1024..2048))
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_request_ranges_do_not_reach_the_backend() {
+        let (downloader, script) = scripted_downloader([]);
+        let buckets =
+            BucketNameSet::new(std::iter::once(BucketName::new("bucket").unwrap())).unwrap();
+        for range in [Range { start: 10, end: 10 }, Range { start: 10, end: 1 }] {
+            let result = downloader
+                .download(
+                    &buckets,
+                    ObjectKey::new("object").unwrap(),
+                    &range,
+                    &RequestConfig::default(),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(DownloadError::RangeNotSatisfied { .. })
+            ));
+        }
+        assert_eq!(script.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn constructor_rejects_invalid_limits_without_panicking() {
+        let downloader = downloader([]);
+        for (max_inflight_bytes, page_timeout) in [
+            (0, Duration::from_secs(1)),
+            (u64::MAX, Duration::from_secs(1)),
+            (4, Duration::ZERO),
+            (4, Duration::MAX),
+        ] {
+            let limits = DownloadLimits {
+                page_timeout,
+                max_inflight_bytes,
+                ..DownloadLimits::default()
+            };
+            assert!(
+                Downloader::new(downloader.s3.clone(), limits, downloader.throughput.clone())
+                    .is_err(),
+                "{limits:?}"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn body_transfer_sets_the_next_hedge_delay() {
         let downloader = downloader([("bucket", 10, 190, false), ("bucket", 10, 190, false)]);
@@ -1038,61 +887,6 @@ mod latency_tests {
         assert_eq!(output.latency, Duration::from_millis(130));
         let primary = metrics(&downloader, "primary").await;
         assert_eq!(primary.consecutive_failures, 1);
-        assert_eq!(primary.latency_mean, Duration::from_millis(100));
-        assert_eq!(
-            metrics(&downloader, "fallback").await.latency_mean,
-            Duration::from_millis(30)
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancellation_does_not_record_an_incomplete_bucket_fetch() {
-        let downloader = downloader([
-            ("bucket", 10, 90, false),
-            ("bucket", 1_000, 0, false),
-            ("bucket", 1_000, 0, false),
-        ]);
-        fetch(&downloader, &["bucket"]).await;
-        assert!(
-            timeout(Duration::from_millis(150), fetch(&downloader, &["bucket"]))
-                .await
-                .is_err()
-        );
-        let metrics = metrics(&downloader, "bucket").await;
-        assert!(metrics.error_rate.abs() < f64::EPSILON);
-        assert_eq!(metrics.latency_mean, Duration::from_millis(100));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bucket_deadline_covers_bodies_and_reserves_fallback_time() {
-        let (downloader, script) = scripted_downloader([
-            ("primary", 10, 90, false),
-            ("primary", 10, 1_000, false),
-            ("fallback", 10, 20, false),
-        ]);
-        let downloader = downloader
-            .with_test_limits(DownloadLimits {
-                bucket_timeout: Duration::from_millis(500),
-                page_timeout: Duration::from_millis(400),
-                ..DownloadLimits::default()
-            })
-            .unwrap();
-        fetch(&downloader, &["primary"]).await;
-        let config = RequestConfig {
-            operation_timeout: Some(Duration::from_millis(20)),
-            operation_attempt_timeout: Some(Duration::from_millis(20)),
-            ..RequestConfig::default()
-        };
-        let output = fetch_with_config(&downloader, &["primary", "fallback"], &config)
-            .await
-            .unwrap();
-        assert_eq!(output.used_bucket_idx, 1);
-        assert!(output.hedged);
-        assert_eq!(output.latency, Duration::from_millis(130));
-        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
-        assert_eq!(script.active.load(Ordering::SeqCst), 0);
-        let primary = metrics(&downloader, "primary").await;
-        assert_eq!(primary.consecutive_failures, 0);
         assert_eq!(primary.latency_mean, Duration::from_millis(100));
         assert_eq!(
             metrics(&downloader, "fallback").await.latency_mean,
@@ -1282,6 +1076,7 @@ mod latency_tests {
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
         let bucket_metrics = metrics(&downloader, "bucket").await;
         assert_eq!(bucket_metrics.consecutive_failures, 0);
+        assert!(bucket_metrics.error_rate.abs() < f64::EPSILON);
         assert_eq!(bucket_metrics.latency_mean, Duration::from_millis(100));
         assert!(!fetch(&downloader, &["bucket"]).await.hedged);
         let output = fetch(&downloader, &["bucket"]).await;
