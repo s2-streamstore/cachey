@@ -1,3 +1,8 @@
+#![expect(
+    clippy::unused_async_trait_impl,
+    reason = "Axum extractors require futures; async keeps fallible parsing in place."
+)]
+
 use std::{
     num::{NonZeroU32, NonZeroUsize},
     ops::Range,
@@ -76,9 +81,15 @@ fn on_chunk_error(
 #[derive(Debug)]
 pub struct RangeHeader(pub Range<u64>);
 
-impl RangeHeader {
-    fn parse(headers: &HeaderMap) -> Result<Self, (StatusCode, &'static str)> {
-        let range_header = headers
+impl<S> FromRequestParts<S> for RangeHeader
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let range_header = parts
+            .headers
             .get(header::RANGE)
             .ok_or((StatusCode::BAD_REQUEST, "Range header is required"))?
             .to_str()
@@ -106,108 +117,73 @@ impl RangeHeader {
     }
 }
 
-impl<S> FromRequestParts<S> for RangeHeader
-where
-    S: Send + Sync,
-{
-    type Rejection = (StatusCode, &'static str);
-
-    fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready(Self::parse(&parts.headers))
-    }
-}
-
-fn parse_request_config(headers: &HeaderMap) -> Result<RequestConfig, (StatusCode, &'static str)> {
-    let Some(header_value) = headers.get(&C0_CONFIG_HEADER) else {
-        return Ok(RequestConfig::default());
-    };
-
-    let header_str = header_value
-        .to_str()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid C0-Config header encoding"))?;
-
-    let mut config = RequestConfig::default();
-
-    let parse_duration = |v: &str| -> Result<Duration, (StatusCode, &'static str)> {
-        v.parse::<u64>().map(Duration::from_millis).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Invalid duration value in C0-Config header",
-            )
-        })
-    };
-
-    for pair in header_str.split_whitespace() {
-        let Some((key, value)) = pair.split_once('=') else {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Malformed C0-Config header: missing '=' in key-value pair",
-            ));
-        };
-
-        match key {
-            "ct" => config.connect_timeout = Some(parse_duration(value)?),
-            "rt" => config.read_timeout = Some(parse_duration(value)?),
-            "ot" => config.operation_timeout = Some(parse_duration(value)?),
-            "oat" => config.operation_attempt_timeout = Some(parse_duration(value)?),
-            "ma" => {
-                config.max_attempts = Some(value.parse().map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "Invalid value for ma in C0-Config header",
-                    )
-                })?);
-            }
-            "ib" => config.initial_backoff = Some(parse_duration(value)?),
-            "mb" => config.max_backoff = Some(parse_duration(value)?),
-            "fps" => {
-                config.force_path_style = Some(value.parse().map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "Invalid value for fps in C0-Config header",
-                    )
-                })?);
-            }
-            _ => {} // Ignore unrecognized keys
-        }
-    }
-
-    Ok(config)
-}
-
 impl<S> FromRequestParts<S> for RequestConfig
 where
     S: Send + Sync,
 {
     type Rejection = (StatusCode, &'static str);
 
-    fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready(parse_request_config(&parts.headers))
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let Some(header_value) = parts.headers.get(&C0_CONFIG_HEADER) else {
+            return Ok(RequestConfig::default());
+        };
+
+        let header_str = header_value
+            .to_str()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid C0-Config header encoding"))?;
+
+        let mut config = RequestConfig::default();
+
+        let parse_duration = |v: &str| -> Result<Duration, (StatusCode, &'static str)> {
+            v.parse::<u64>().map(Duration::from_millis).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid duration value in C0-Config header",
+                )
+            })
+        };
+
+        for pair in header_str.split_whitespace() {
+            let Some((key, value)) = pair.split_once('=') else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Malformed C0-Config header: missing '=' in key-value pair",
+                ));
+            };
+
+            match key {
+                "ct" => config.connect_timeout = Some(parse_duration(value)?),
+                "rt" => config.read_timeout = Some(parse_duration(value)?),
+                "ot" => config.operation_timeout = Some(parse_duration(value)?),
+                "oat" => config.operation_attempt_timeout = Some(parse_duration(value)?),
+                "ma" => {
+                    config.max_attempts = Some(value.parse().map_err(|_| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            "Invalid value for ma in C0-Config header",
+                        )
+                    })?);
+                }
+                "ib" => config.initial_backoff = Some(parse_duration(value)?),
+                "mb" => config.max_backoff = Some(parse_duration(value)?),
+                "fps" => {
+                    config.force_path_style = Some(value.parse().map_err(|_| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            "Invalid value for fps in C0-Config header",
+                        )
+                    })?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(config)
     }
 }
 
 #[derive(Debug)]
 pub struct BucketHeaders(pub Vec<BucketName>);
-
-impl BucketHeaders {
-    fn parse(headers: &HeaderMap) -> Result<Self, (StatusCode, &'static str)> {
-        let mut names = Vec::with_capacity(3);
-        for value in headers.get_all(&C0_BUCKET_HEADER) {
-            let s = value
-                .to_str()
-                .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid bucket header encoding"))?;
-            let bucket = BucketName::new(s).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-            names.push(bucket);
-        }
-        Ok(Self(names))
-    }
-}
 
 impl<S> FromRequestParts<S> for BucketHeaders
 where
@@ -215,11 +191,16 @@ where
 {
     type Rejection = (StatusCode, &'static str);
 
-    fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready(Self::parse(&parts.headers))
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let mut names = Vec::with_capacity(3);
+        for value in parts.headers.get_all(&C0_BUCKET_HEADER) {
+            let s = value
+                .to_str()
+                .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid bucket header encoding"))?;
+            let bucket = BucketName::new(s).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+            names.push(bucket);
+        }
+        Ok(Self(names))
     }
 }
 
