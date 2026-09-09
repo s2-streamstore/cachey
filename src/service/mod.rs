@@ -116,10 +116,14 @@ impl CacheyService {
         s3: aws_sdk_s3::Client,
         server_handle: axum_server::Handle<SocketAddr>,
     ) -> Result<Self> {
-        let cache = build_cache(config.cache).await?;
+        eyre::ensure!(
+            config.download_limits.max_inflight_bytes >= PAGE_SIZE,
+            "download memory must hold at least one cache page ({PAGE_SIZE} bytes)"
+        );
         let ingress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
         let egress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
         let downloader = Downloader::new(s3, config.download_limits, ingress_throughput.clone())?;
+        let cache = build_cache(config.cache).await?;
         Ok(Self {
             cache,
             downloader,
@@ -483,6 +487,36 @@ mod tests {
             .region(Region::new("us-east-1"))
             .build();
         aws_sdk_s3::Client::from_conf(config)
+    }
+
+    #[tokio::test]
+    async fn service_requires_download_memory_for_a_full_page() {
+        for max_inflight_bytes in [PAGE_SIZE - 1, PAGE_SIZE] {
+            let result = CacheyService::new(
+                ServiceConfig {
+                    cache: CacheConfig {
+                        memory_size: ByteSize::mib(16),
+                        disk_cache: None,
+                        metrics_registry: None,
+                    },
+                    download_limits: DownloadLimits {
+                        max_inflight_bytes,
+                        ..DownloadLimits::default()
+                    },
+                },
+                mock_s3_client("http://unused.invalid"),
+                axum_server::Handle::new(),
+            )
+            .await;
+            if max_inflight_bytes < PAGE_SIZE {
+                assert!(
+                    result
+                        .is_err_and(|error| error.to_string().contains("at least one cache page"))
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+        }
     }
 
     fn metric_page_request_total(kind: &ObjectKind, typ: &str) -> u64 {
