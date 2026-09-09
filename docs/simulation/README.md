@@ -102,7 +102,8 @@ produced, delivered, and useful body bytes. Service work is occupied service-slo
 it excludes queued time and the modeled rejection delay, and is not CPU cost.
 Post-read work sums service time after each originating read finished, including
 canceled losers. Queue/concurrency peaks and observed health restorations are
-reported. Recovery timestamps are sampled at logical read completion, not continuous
+reported. Completion sequence numbers preserve observation order when reads finish at
+the same virtual timestamp. Recovery timestamps are sampled at logical read completion, not continuous
 health-transition instrumentation. Zero-duration copies can occur at equal-time
 completion/rescue boundaries; their transport attempt still counts.
 
