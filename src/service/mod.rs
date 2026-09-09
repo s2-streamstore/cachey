@@ -178,17 +178,17 @@ impl CacheyService {
         metrics::fetch_request_bytes(&kind, byterange.end - byterange.start);
         metrics::fetch_request_pages(&kind, pagerange.end() - pagerange.start() + 1);
 
-        let executor = PageGetExecutor {
-            cache: self.cache,
+        let executor = Arc::new(PageGetExecutor {
             downloader: self.downloader,
             kind,
             object,
             buckets,
             req_config,
-        };
+        });
         let mut object_size = None;
 
-        futures::stream::iter(pagerange.map(move |page_id| executor.clone().execute(page_id)))
+        futures::stream::iter(pagerange)
+            .map(move |page_id| executor.clone().execute(page_id, self.cache.clone()))
             .buffered(concurrency)
             .map(move |result| {
                 let (page_id, value) = result?;
@@ -239,9 +239,8 @@ fn now() -> u32 {
         .as_secs() as u32
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PageGetExecutor {
-    cache: foyer::HybridCache<CacheKey, CacheValue>,
     downloader: Downloader,
     kind: ObjectKind,
     object: ObjectKey,
@@ -250,7 +249,11 @@ struct PageGetExecutor {
 }
 
 impl PageGetExecutor {
-    async fn execute(self, page_id: PageId) -> Result<(PageId, CacheValue), ServiceError> {
+    async fn execute(
+        self: Arc<Self>,
+        page_id: PageId,
+        cache: foyer::HybridCache<CacheKey, CacheValue>,
+    ) -> Result<(PageId, CacheValue), ServiceError> {
         metrics::page_request_count(&self.kind, metrics::PageRequestType::Access);
 
         let cache_key = CacheKey {
@@ -259,8 +262,7 @@ impl PageGetExecutor {
             page_id,
         };
         let fetched_by_current_request = Arc::new(AtomicBool::new(false));
-        let entry = self
-            .cache
+        let entry = cache
             .get_or_fetch(&cache_key, {
                 let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
                 move || async move {
@@ -271,7 +273,12 @@ impl PageGetExecutor {
                     let end = start + PAGE_SIZE;
                     let out = self
                         .downloader
-                        .download(&self.buckets, self.object, &(start..end), &self.req_config)
+                        .download(
+                            &self.buckets,
+                            self.object.clone(),
+                            &(start..end),
+                            &self.req_config,
+                        )
                         .await?;
                     metrics::page_download_latency(&self.kind, out.latency);
                     if out.hedged {
@@ -680,15 +687,17 @@ mod tests {
         let before_coalesced = metric_page_request_total(&kind, "coalesced");
         let before_cache_hit = metric_page_request_total(&kind, "cache_hit");
 
-        let executor = PageGetExecutor {
-            cache,
+        let executor = Arc::new(PageGetExecutor {
             downloader,
             kind: kind.clone(),
             object: object.clone(),
             buckets,
             req_config: RequestConfig::default(),
-        };
-        let (left, right) = tokio::join!(executor.clone().execute(0), executor.execute(0));
+        });
+        let (left, right) = tokio::join!(
+            executor.clone().execute(0, cache.clone()),
+            executor.execute(0, cache)
+        );
         let left_value = left.expect("left request").1;
         let right_value = right.expect("right request").1;
 
