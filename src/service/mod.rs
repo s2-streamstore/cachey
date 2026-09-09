@@ -553,7 +553,11 @@ mod tests {
         let object = ObjectKey::new("object").unwrap();
         let bucket = BucketName::new("bucket").unwrap();
         let buckets = BucketNameSet::from(bucket.clone());
-        let object_data = Bytes::from(vec![7_u8; 4096]);
+        let object_data = Bytes::from(
+            (0..4096)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
 
         let (endpoint, request_count, server_handle) = spawn_mock_s3_server(
             &bucket,
@@ -577,26 +581,31 @@ mod tests {
         .await
         .expect("service");
 
-        let read = || {
+        let read = |range| {
             service
                 .clone()
                 .get(
                     kind.clone(),
                     object.clone(),
                     buckets.clone(),
-                    0..object_data.len() as u64,
+                    range,
                     NonZeroUsize::MIN,
                     RequestConfig::default(),
                 )
                 .try_collect::<Vec<_>>()
         };
-        let (left, right) = tokio::join!(read(), read());
+        let ranges = [10..100, 50..200];
+        let (left, right) = tokio::join!(read(ranges[0].clone()), read(ranges[1].clone()));
 
         assert_eq!(request_count.load(Ordering::Relaxed), 1);
-        for chunks in [left, right] {
+        for (range, chunks) in ranges.into_iter().zip([left, right]) {
             let chunks = chunks.expect("read");
             assert_eq!(chunks.len(), 1);
-            assert_eq!(chunks[0].data, object_data);
+            assert_eq!(
+                chunks[0].data,
+                object_data.slice(range.start as usize..range.end as usize)
+            );
+            assert_eq!(chunks[0].range, range);
             assert_eq!(chunks[0].cached_at, None);
         }
         let snapshot = super::metrics::gather();

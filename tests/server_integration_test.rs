@@ -213,7 +213,7 @@ async fn cached_object_serves_ranges_after_backend_deletion() {
     let client = reqwest::Client::new();
     let url = format!("{}/fetch/{}/{key}", ctx.server_url, ctx.rustfs.bucket_name);
 
-    for (index, range) in [0..data.len(), 10..20, 10..PAGE_SIZE as usize]
+    for (index, range) in [10..20, 0..data.len(), 10..PAGE_SIZE as usize]
         .into_iter()
         .enumerate()
     {
@@ -353,22 +353,22 @@ async fn test_fetch_endpoint_multi_page_range() {
     .await;
 
     let start = PAGE_SIZE / 2;
-    let end = 2 * PAGE_SIZE + PAGE_SIZE / 2;
-    let response = reqwest::Client::new()
-        .get(format!(
-            "{}/fetch/{}/{key}",
-            ctx.server_url, ctx.rustfs.bucket_name
-        ))
-        .header("Range", format!("bytes={start}-{}", end - 1))
-        .send()
-        .await
-        .unwrap();
+    let client = reqwest::Client::new();
+    let url = format!("{}/fetch/{}/{key}", ctx.server_url, ctx.rustfs.bucket_name);
+    for end in [PAGE_SIZE + PAGE_SIZE / 2, 2 * PAGE_SIZE + PAGE_SIZE / 2] {
+        let response = client
+            .get(&url)
+            .header("Range", format!("bytes={start}-{}", end - 1))
+            .send()
+            .await
+            .unwrap();
 
-    assert_eq!(response.status(), 206);
-    assert_eq!(
-        response.bytes().await.unwrap(),
-        data.slice(start as usize..end as usize)
-    );
+        assert_eq!(response.status(), 206);
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            data.slice(start as usize..end as usize)
+        );
+    }
 }
 
 #[tokio::test]
