@@ -6,7 +6,6 @@ use tokio::time::Instant;
 pub struct SlidingThroughput<const NUM_BUCKETS: usize = 60> {
     // TODO: Switch back to `[u64; NUM_BUCKETS + 1]` once generic const exprs are available.
     buckets: Vec<u64>,
-    head_idx: usize,
     head_tick: u64,
     base: Instant,
 }
@@ -15,7 +14,6 @@ impl<const NUM_BUCKETS: usize> Default for SlidingThroughput<NUM_BUCKETS> {
     fn default() -> Self {
         Self {
             buckets: vec![0; NUM_BUCKETS + 1],
-            head_idx: 0,
             head_tick: 0,
             base: Instant::now(),
         }
@@ -27,19 +25,14 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
         if now_tick <= self.head_tick {
             return;
         }
-        let steps_u64 = now_tick - self.head_tick;
+        let steps = now_tick - self.head_tick;
         let len = self.buckets.len();
-        if steps_u64 as usize >= len {
-            // Long gap: clear all buckets and jump head to the correct index
+        if steps >= len as u64 {
             self.buckets.fill(0);
-            self.head_idx = ((self.head_idx as u64 + steps_u64) % len as u64) as usize;
-            self.head_tick = now_tick;
-            return;
-        }
-        let steps = steps_u64 as usize;
-        for _ in 0..steps {
-            self.head_idx = (self.head_idx + 1) % len;
-            self.buckets[self.head_idx] = 0;
+        } else {
+            for tick in self.head_tick + 1..=now_tick {
+                self.buckets[(tick % len as u64) as usize] = 0;
+            }
         }
         self.head_tick = now_tick;
     }
@@ -47,7 +40,8 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
     pub fn record(&mut self, bytes: usize) {
         let now_tick = self.now_secs();
         self.advance_to(now_tick);
-        self.buckets[self.head_idx] = self.buckets[self.head_idx].saturating_add(bytes as u64);
+        let index = (self.head_tick % self.buckets.len() as u64) as usize;
+        self.buckets[index] = self.buckets[index].saturating_add(bytes as u64);
     }
 
     /// Returns average bytes per second over the last `lookback` seconds using
@@ -66,15 +60,12 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
 
         let len = self.buckets.len();
         let window_secs = lookback_secs.min(NUM_BUCKETS as u64) as usize;
-        if window_secs == 0 {
-            return 0.0;
-        }
 
         let mut sum: u64 = 0;
-        let mut idx = (self.head_idx + len - 1) % len;
+        let mut index = (self.head_tick % len as u64) as usize;
         for _ in 0..window_secs {
-            sum = sum.saturating_add(self.buckets[idx]);
-            idx = (idx + len - 1) % len;
+            index = (index + len - 1) % len;
+            sum = sum.saturating_add(self.buckets[index]);
         }
 
         sum as f64 / lookback_seconds_f64
@@ -90,7 +81,7 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
 mod tests {
     use std::time::Duration;
 
-    use super::*;
+    use super::SlidingThroughput;
 
     fn assert_close(actual: f64, expected: f64) {
         let epsilon = 1e-9;
