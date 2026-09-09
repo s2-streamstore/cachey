@@ -35,10 +35,8 @@ HEAD|GET /fetch/{kind}/{object}
 `C0-Bucket` behavior:
 - Multiple headers specify redundant buckets, with the preferred bucket first
 - If omitted, `kind` is used as the singular bucket name
-- Selection considers the remaining deadline, bucket health, and download latency
-- Any supplied bucket may be attempted, with up to three copies active per page
 
-See [replica reads](docs/replica-reads.md) for fallback, hedging, and download limits.
+See [replica reads](docs/replica-reads.md) for selection, fallback, hedging, and download limits.
 
 `C0-Config` overrides:
 Space-separated key-value pairs to override S3 request configuration per page miss.

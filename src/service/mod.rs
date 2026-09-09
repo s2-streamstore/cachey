@@ -90,13 +90,10 @@ pub struct Chunk {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
-    /// 500
     #[error("Cache error: {0}")]
     Cache(#[from] foyer::Error),
-    /// `NoSuchKey` 404; `RangeNotSatisfied` 416; timeout 504; otherwise 500
     #[error("Object store: {0}")]
     Download(#[from] DownloadError),
-    /// 409
     #[error("Object size was inconsistent across downloads: {new} != {prev}")]
     ObjectSizeInconsistency { prev: u64, new: u64 },
 }
