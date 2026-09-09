@@ -33,10 +33,12 @@ HEAD|GET /fetch/{kind}/{object}
 | `C0-Config` | no | Override S3 request config |
 
 `C0-Bucket` behavior:
-- Multiple headers indicate bucket preference order
+- Multiple headers specify redundant buckets, with the preferred bucket first
 - If omitted, `kind` is used as the singular bucket name
-- Client preference may be overridden based on internal latency/error stats
-- At most 2 buckets attempted per page miss
+- Selection considers the remaining deadline, bucket health, and download latency
+- Any supplied bucket may be attempted, with up to three copies active per page
+
+See [replica reads](docs/replica-reads.md) for fallback, hedging, and download limits.
 
 `C0-Config` overrides:
 Space-separated key-value pairs to override S3 request configuration per page miss.
@@ -49,7 +51,7 @@ Space-separated key-value pairs to override S3 request configuration per page mi
 - `mb=<ms>` Maximum backoff duration
 - `fps=<bool>` Force path-style addressing
 
-SDK overrides apply within the server's bucket and page download deadlines. A hedge uses the same overrides with one SDK attempt, so retries cannot multiply speculative requests.
+SDK overrides are bounded by the server's download deadlines; early hedges use one SDK attempt.
 
 #### Example Request
 
@@ -97,33 +99,6 @@ C0-Status: 16777216-18874367; us-west-videos; 0
 `GET /stats` returns throughput stats as JSON for load balancing and health checking.
 
 `GET /metrics` returns a more comprehensive set of metrics in Prometheus text format.
-
-### Replica selection, deadlines, and hedging
-
-Cachey prefers copies likely to finish within the remaining page deadline, then healthy copies, then recent complete-read latency. The first client-supplied bucket has a locality preference: its latency is compared with 1.5 times each alternative's latency. Other buckets have equal preference. Unknown alternatives initially use the preferred bucket's latency as an estimate. Every supplied bucket remains eligible for fallback.
-
-A backend failure immediately deprioritizes that bucket. Missing objects, invalid ranges, caller cancellation, and local admission failures do not count as backend health failures. The error fraction decays over time, but health recovers through evidence: 20 consecutive successful operations started after the latest failure restore normal preference. After 24–36 seconds, a previously competitive bucket can receive one recovery probe at a time. A working alternative protects that probe if it is slow. Probing requires reserving admission for both copies; otherwise the healthy route keeps the request. Idle time permits a recheck; it does not declare recovery.
-
-Each distinct copy gets its own operation deadline after admission, including SDK retries, body transfer, and validation. Defaults are 5 seconds per copy (`--bucket-timeout-ms`) and 10 seconds for the entire page (`--page-timeout-ms`). Recoverable errors immediately advance to an untried copy. Timed rescue attempts reserve part of the page budget using the alternatives' recent successful p99 durations. Each reservation stays attached to its destination even if preferences change; rescue attempts do not cancel an otherwise viable earlier read. At most three copies are active per page, and each supplied copy is tried at most once at this layer. Backend SDK retries are contained within those operations. The first fully validated result wins and cancels the remaining work.
-
-With multiple buckets, early hedges use another copy. With one bucket, the existing same-bucket primary/hedge race remains. Early hedges use the configured successful-latency quantile (`--hedge-quantile`, zero disables early hedging). They require a shared success-funded allowance: one startup hedge plus one per 20 successful page downloads by default (`--hedge-budget-percent 5`). Credits and concurrent early hedges are capped globally at 16 (`--max-concurrent-hedges`); each destination allows at most two concurrent early hedges. Early hedges use one SDK attempt. Ordinary fallback and deadline rescue do not require early-hedge credits. When every supplied bucket has recently reported explicit overload, early hedges stop and extra attempts share a separate bounded retry allowance, replenished by successful pages.
-
-Admission limits are shared by downloader clones and cover primaries, retries within their operations, and speculative copies: 1,024 backend requests (`--max-inflight-requests`) and 1 GiB of requested body bytes (`--max-download-memory`) by default. Waiting consumes the original page deadline and does not count as backend failure; the backend operation timeout starts when admission is granted. These limits cover active downloads, separately from cache capacity and total process memory. Body collection rejects excess data as soon as it exceeds the validated response range. Early hedges skip unavailable admission; ordinary copy operations can wait until their deadline. Admission exhaustion and explicit backend overload return HTTP 503 for the first chunk; a timeout returns HTTP 504. Later failures terminate the response body.
-
-Successful full-operation durations populate the bucket latency histogram. A separate routing EWMA reacts to latency changes; several concurrent stalled operations also affect routing before their hard timeouts. Cancellation can raise a too-optimistic routing estimate, but cannot count as a successful latency sample or a health failure. Snapshots refresh at most once per second, with immediate initialization from the first success. For the single-bucket race, a success is measured from the original primary start, including the hedge delay. Multi-copy operations each use their own start time; page latency includes all elapsed selection, admission, and fallback time.
-
-| Measurement | Boundary |
-|-------------|----------|
-| `cachey_bucket_latency_mean_seconds` | Mean successful complete bucket-operation duration. |
-| `cachey_bucket_latency_hedge_seconds` | Successful bucket-operation quantile used for early hedging. |
-| `cachey_bucket_error_rate` / `cachey_bucket_consecutive_failures` | Backend health outcomes; object-specific and local failures are excluded. |
-| `cachey_bucket_deprioritized` | Soft health priority; replaces `cachey_bucket_circuit_breaker_open`. |
-| `cachey_page_download_latency_seconds` | Successful page download, including admission and every attempted copy. |
-| `cachey_first_chunk_latency_seconds` | HTTP handler time to its first available chunk, including cache lookup or coalesced-fill waiting. |
-
-`DownloadOutput::secondary_bucket_idx` identifies the first additional copy actually started; `used_bucket_idx` can identify any supplied copy. Its `hedged` flag reports overlapping requests, including timed rescue and protected recovery probes. The page `fallback` metric counts successes from a copy other than the initially selected one. Successful latency histograms exclude failed pages and client response-body transmission.
-
-Rust callers configure `DownloadLimits` through `Downloader::with_limits` before sharing clones, or through `ServiceConfig::download_limits`. Deadlines and admission capacities must be positive, and the hedge budget percentage must be in `0..=100`. Adaptive concurrency control is not enabled.
 
 ## Command line
 
@@ -175,6 +150,7 @@ Options:
 
 - [justfile](./justfile) contains commands for [just](https://just.systems/man/en/) doing things
 - [AGENTS.md](./AGENTS.md) and symlinks for your favorite coding buddies
+- [Replica simulation harness](docs/simulation/README.md)
 
 Use the nightly Cargo dependency commands so that the seven-day publication cooldown applies:
 
@@ -187,5 +163,3 @@ cargo +nightly generate-lockfile
 ```
 
 Use `--locked` with normal build, check, test, run, document, fetch, and metadata commands. The pull request dependency gate verifies each proposed lockfile change before Rust build jobs start.
-
-The [replica simulation harness](docs/simulation/README.md) runs the actual downloader and SDK against modeled faults, finite service queues, and delayed cancellation. It includes reproducible regression cases and explicit statistical campaigns; no production traffic is used.
