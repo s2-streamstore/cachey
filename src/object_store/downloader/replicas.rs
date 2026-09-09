@@ -182,8 +182,9 @@ impl Downloader {
             &routing,
         );
         let threshold = routing.tail(primary).unwrap_or_default();
-        let mut hedge_at = (!threshold.is_zero() && probe.is_none())
-            .then(|| start + threshold.min(self.limits.page_timeout));
+        let mut hedge_at =
+            (self.limits.hedge_budget_percent > 0 && !threshold.is_zero() && probe.is_none())
+                .then(|| start + threshold.min(self.limits.page_timeout));
         let mut active: FuturesUnordered<BoxFuture<'_, Completion>> = FuturesUnordered::new();
         active.push(request.attempt(primary, probe, primary_permits).boxed());
         let mut last_error = None;
@@ -198,7 +199,9 @@ impl Downloader {
                             Ok(piece) => return Ok(request.output(piece, primary, index, start)),
                             Err(error) => {
                                 if !error.should_attempt_fallback_bucket() { return Err(error); }
-                                last_error = Some(error);
+                                if last_error.is_none() || !matches!(error, DownloadError::NoSuchKey) {
+                                    last_error = Some(error);
+                                }
                                 hedge_at = None;
                             }
                         }
@@ -225,6 +228,11 @@ impl Downloader {
                 .filter(|index| !tried[*index]);
             if allowed && let Some(index) = next {
                 if overloaded && !self.overload_retry_budget.try_retry() {
+                    if matches!(last_error, None | Some(DownloadError::NoSuchKey)) {
+                        last_error = Some(DownloadError::Overloaded(
+                            "Replica retry budget exhausted during widespread overload".to_owned(),
+                        ));
+                    }
                     if active.is_empty() {
                         break;
                     }

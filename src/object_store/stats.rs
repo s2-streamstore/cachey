@@ -317,7 +317,6 @@ impl RoutingSnapshot {
                 && locality_adjusted(stats.best_latency.unwrap_or_default(), index) < best.latency
             {
                 stats.probing = true;
-                stats.probe_after = now + recovery_delay();
                 return (
                     index,
                     Some(ProbePermit {
@@ -359,6 +358,9 @@ impl BucketedStats {
         let (started, generation) = {
             let mut stats = stats.lock();
             let started = Instant::now();
+            if probe.is_some() {
+                stats.probe_after = started + recovery_delay();
+            }
             *stats.active.entry(started).or_default() += 1;
             (started, stats.generation)
         };
@@ -404,14 +406,6 @@ impl BucketedStats {
 
     pub(super) fn tail_latency(&self, bucket: &BucketName) -> Option<Duration> {
         self.entry(bucket).lock().snapshot(Instant::now()).tail
-    }
-
-    pub fn hedging_threshold(&self, bucket: &BucketName, now: Instant) -> Duration {
-        self.entry(bucket)
-            .lock()
-            .snapshot(now)
-            .tail
-            .unwrap_or_default()
     }
 
     pub(super) fn overloaded(&self, bucket: &BucketName) -> bool {

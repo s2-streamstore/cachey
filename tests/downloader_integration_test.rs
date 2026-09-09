@@ -353,7 +353,6 @@ async fn test_download_multiple_ranges_same_object() {
 async fn test_download_with_hedged_requests() {
     let ctx = setup_rustfs().await;
 
-    // Lower quantile for more aggressive hedging
     let downloader = make_downloader(ctx.client.clone());
 
     let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize);

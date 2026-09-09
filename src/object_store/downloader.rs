@@ -334,11 +334,23 @@ impl Downloader {
         config: &RequestConfig,
         deadline: Instant,
     ) -> Result<(ObjectPiece, bool), DownloadError> {
+        let Some(hedge_delay) = self
+            .bucketed_stats
+            .tail_latency(bucket)
+            .filter(|delay| !delay.is_zero() && self.limits.hedge_budget_percent > 0)
+        else {
+            return self
+                .fetch_piece(bucket, object, byterange, config)
+                .await
+                .map(|piece| (piece, false));
+        };
+        let now = Instant::now();
+        let hedge_at = now + hedge_delay.min(deadline.saturating_duration_since(now));
         let mut primary = Box::pin(self.fetch_piece(bucket, object, byterange, config));
         select! {
             biased;
             result = &mut primary => return result.map(|piece| (piece, false)),
-            _ = self.hedge_trigger(bucket, Instant::now()) => {},
+            () = sleep_until(hedge_at) => {},
         }
         let mut hedged = false;
         let mut hedge = Box::pin(async {
@@ -490,21 +502,6 @@ impl Downloader {
             data: data.freeze(),
             object_size,
         })
-    }
-
-    async fn hedge_trigger(&self, bucket: &BucketName, start_time: Instant) -> Option<Duration> {
-        let threshold = self.bucketed_stats.hedging_threshold(bucket, start_time);
-        if threshold > Duration::ZERO {
-            let wait_time = threshold.saturating_sub(start_time.elapsed());
-            if wait_time > Duration::ZERO {
-                tokio::time::sleep(wait_time).await;
-            }
-            Some(threshold)
-        } else {
-            // No data yet, no backup request
-            std::future::pending::<()>().await;
-            None
-        }
     }
 }
 
@@ -714,22 +711,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hedge_trigger_no_data() {
-        let downloader = make_test_downloader();
-        let bucket = BucketName::new("test-bucket").unwrap();
-        let start_time = Instant::now();
-
-        // When there's no data, hedge_trigger should wait forever
-        let hedge_future = downloader.hedge_trigger(&bucket, start_time);
-        let timeout_future = tokio::time::sleep(Duration::from_millis(10));
-
-        tokio::select! {
-            _ = hedge_future => panic!("hedge_trigger should not complete when there's no data"),
-            () = timeout_future => {} // Expected: timeout completes first
-        }
-    }
-
-    #[tokio::test]
     async fn test_download_rejects_empty_range() {
         let downloader = make_test_downloader();
         let bucket = BucketName::new("test-bucket").unwrap();
@@ -864,9 +845,14 @@ mod latency_tests {
             HttpConnectorFuture::new(async move {
                 sleep(Duration::from_millis(headers_ms)).await;
                 if let Some(status) = service_error {
+                    let code = if status == 404 {
+                        "NoSuchKey"
+                    } else {
+                        "SlowDown"
+                    };
                     return Ok(HttpResponse::new(
                         status.try_into().unwrap(),
-                        SdkBody::from("<Error><Code>SlowDown</Code></Error>"),
+                        SdkBody::from(format!("<Error><Code>{code}</Code></Error>")),
                     ));
                 }
                 let body = StreamBody::new(futures::stream::once(async move {
@@ -1597,6 +1583,42 @@ mod latency_tests {
         assert_eq!(output.latency, Duration::from_millis(5));
         assert_eq!(script.requests.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_probe_denied_admission_can_use_the_next_opportunity() {
+        let (downloader, script) =
+            scripted_downloader([("peer", 0, 5, false), ("local", 0, 3, false)]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                max_inflight_requests: 2,
+                max_inflight_bytes: 8,
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        seed_latency(&downloader, "local", 3).await;
+        seed_latency(&downloader, "peer", 5).await;
+        downloader
+            .bucketed_stats
+            .begin(&BucketName::new("local").unwrap(), None)
+            .complete(crate::object_store::stats::Outcome::Failure);
+        advance(Duration::from_secs(37)).await;
+
+        let occupied = downloader.admission.try_acquire(4).unwrap();
+        assert_eq!(
+            fetch(&downloader, &["local", "peer"]).await.used_bucket_idx,
+            1
+        );
+        drop(occupied);
+
+        let output = fetch(&downloader, &["local", "peer"]).await;
+        assert_eq!(output.primary_bucket_idx, 0);
+        assert_eq!(output.used_bucket_idx, 0);
+        assert_eq!(output.latency, Duration::from_millis(3));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn queued_copies_that_never_start_are_not_reported_as_hedges() {
         let (downloader, script) = scripted_downloader([("local", 0, 90, false)]);
@@ -1650,6 +1672,64 @@ mod latency_tests {
         assert_eq!(output.used_bucket_idx, 1);
         assert_eq!(script.requests.load(Ordering::SeqCst), 2);
         assert!(metrics(&downloader, "local").await.deprioritized);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_replicas_do_not_hide_backend_failures() {
+        for missing in [&[0][..], &[1][..], &[0, 1][..]] {
+            let (downloader, script) =
+                scripted_downloader([("local", 1, 1, true), ("peer", 1, 1, true)]);
+            script
+                .service_errors
+                .lock()
+                .extend(missing.iter().map(|index| (*index, 404)));
+            let result =
+                fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
+            if missing.len() == 2 {
+                assert!(matches!(result, Err(DownloadError::NoSuchKey)));
+            } else {
+                assert!(
+                    matches!(result, Err(DownloadError::BodyStreaming(_))),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overload_retry_denial_does_not_report_a_partial_miss_as_absence() {
+        let (downloader, script) = scripted_downloader([
+            ("local", 1, 0, false),
+            ("local", 1, 0, false),
+            ("peer", 1, 0, false),
+        ]);
+        script
+            .service_errors
+            .lock()
+            .extend((0..3).map(|index| (index, 404)));
+        for bucket in ["local", "peer"] {
+            downloader
+                .bucketed_stats
+                .begin(&BucketName::new(bucket).unwrap(), None)
+                .complete(crate::object_store::stats::Outcome::Overload);
+        }
+        assert!(downloader.overload_retry_budget.try_retry());
+        let result =
+            fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
+        assert!(
+            matches!(result, Err(DownloadError::Overloaded(_))),
+            "{result:?}"
+        );
+        assert_eq!(script.requests.load(Ordering::SeqCst), 1);
+
+        advance(Duration::from_secs(1)).await;
+        let result =
+            fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
+        assert!(matches!(result, Err(DownloadError::NoSuchKey)));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
