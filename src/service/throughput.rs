@@ -4,8 +4,7 @@ use tokio::time::Instant;
 
 #[derive(Debug)]
 pub struct SlidingThroughput<const NUM_BUCKETS: usize = 60> {
-    // TODO: Switch back to `[u64; NUM_BUCKETS + 1]` once generic const exprs are available.
-    buckets: Vec<u64>,
+    buckets: Box<[u64]>,
     head_tick: u64,
     base: Instant,
 }
@@ -13,7 +12,7 @@ pub struct SlidingThroughput<const NUM_BUCKETS: usize = 60> {
 impl<const NUM_BUCKETS: usize> Default for SlidingThroughput<NUM_BUCKETS> {
     fn default() -> Self {
         Self {
-            buckets: vec![0; NUM_BUCKETS + 1],
+            buckets: vec![0; NUM_BUCKETS + 1].into_boxed_slice(),
             head_tick: 0,
             base: Instant::now(),
         }
@@ -21,7 +20,8 @@ impl<const NUM_BUCKETS: usize> Default for SlidingThroughput<NUM_BUCKETS> {
 }
 
 impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
-    fn advance_to(&mut self, now_tick: u64) {
+    fn advance(&mut self) {
+        let now_tick = self.base.elapsed().as_secs();
         if now_tick <= self.head_tick {
             return;
         }
@@ -38,8 +38,7 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
     }
 
     pub fn record(&mut self, bytes: usize) {
-        let now_tick = self.now_secs();
-        self.advance_to(now_tick);
+        self.advance();
         let index = (self.head_tick % self.buckets.len() as u64) as usize;
         self.buckets[index] = self.buckets[index].saturating_add(bytes as u64);
     }
@@ -55,8 +54,7 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
         let lookback_seconds_f64 = lookback.as_secs_f64().max(1.0);
         let lookback_secs = lookback.as_secs().max(1);
 
-        let now_tick = self.now_secs();
-        self.advance_to(now_tick);
+        self.advance();
 
         let len = self.buckets.len();
         let window_secs = lookback_secs.min(NUM_BUCKETS as u64) as usize;
@@ -69,11 +67,6 @@ impl<const NUM_BUCKETS: usize> SlidingThroughput<NUM_BUCKETS> {
         }
 
         sum as f64 / lookback_seconds_f64
-    }
-
-    #[inline]
-    fn now_secs(&self) -> u64 {
-        self.base.elapsed().as_secs()
     }
 }
 
