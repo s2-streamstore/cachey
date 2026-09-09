@@ -125,25 +125,20 @@ impl CacheyService {
 
         metrics::observe_jemalloc_metrics();
 
-        let mut egress_throughput = self.egress_throughput.lock();
-        metrics::observe_throughput(
-            "egress",
-            &[
-                ("10s", egress_throughput.bps(Duration::from_secs(10))),
-                ("30s", egress_throughput.bps(Duration::from_secs(30))),
-                ("1m", egress_throughput.bps(Duration::from_mins(1))),
-            ],
-        );
-
-        let mut ingress_throughput = self.ingress_throughput.lock();
-        metrics::observe_throughput(
-            "ingress",
-            &[
-                ("10s", ingress_throughput.bps(Duration::from_secs(10))),
-                ("30s", ingress_throughput.bps(Duration::from_secs(30))),
-                ("1m", ingress_throughput.bps(Duration::from_mins(1))),
-            ],
-        );
+        for (direction, throughput) in [
+            ("egress", &self.egress_throughput),
+            ("ingress", &self.ingress_throughput),
+        ] {
+            let windowed_bps = {
+                let mut throughput = throughput.lock();
+                [
+                    ("10s", throughput.bps(Duration::from_secs(10))),
+                    ("30s", throughput.bps(Duration::from_secs(30))),
+                    ("1m", throughput.bps(Duration::from_mins(1))),
+                ]
+            };
+            metrics::observe_throughput(direction, &windowed_bps);
+        }
 
         metrics::set_connection_count(self.server_handle.connection_count());
     }
