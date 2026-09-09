@@ -35,44 +35,41 @@ struct ChunkErrorResponse {
 
 impl ChunkErrorResponse {
     fn from_error(chunk_idx: usize, error: &ServiceError) -> Self {
-        match error {
-            ServiceError::Download(DownloadError::NoSuchKey) => Self {
-                status_code: StatusCode::NOT_FOUND,
-                metric_code: "not_found",
-                headers: HeaderMap::new(),
-            },
-            ServiceError::Download(DownloadError::RangeNotSatisfied { object_size, .. }) => Self {
-                status_code: StatusCode::RANGE_NOT_SATISFIABLE,
-                metric_code: "range_not_satisfiable",
-                headers: range_not_satisfied_headers(*object_size),
-            },
-            ServiceError::Download(DownloadError::Timeout { .. }) => Self {
-                status_code: StatusCode::GATEWAY_TIMEOUT,
-                metric_code: "timeout",
-                headers: HeaderMap::new(),
-            },
+        let mut headers = HeaderMap::new();
+        let (status_code, metric_code) = match error {
+            ServiceError::Download(DownloadError::NoSuchKey) => {
+                (StatusCode::NOT_FOUND, "not_found")
+            }
+            ServiceError::Download(DownloadError::RangeNotSatisfied { object_size, .. }) => {
+                if let Some(object_size) = object_size {
+                    headers.insert(
+                        header::CONTENT_RANGE,
+                        HeaderValue::from_str(&format!("bytes */{object_size}"))
+                            .expect("valid content-range"),
+                    );
+                }
+                (StatusCode::RANGE_NOT_SATISFIABLE, "range_not_satisfiable")
+            }
+            ServiceError::Download(DownloadError::Timeout { .. }) => {
+                (StatusCode::GATEWAY_TIMEOUT, "timeout")
+            }
             ServiceError::Download(
                 DownloadError::AdmissionTimeout
                 | DownloadError::AdmissionExhausted { .. }
                 | DownloadError::Overloaded(_),
-            ) => Self {
-                status_code: StatusCode::SERVICE_UNAVAILABLE,
-                metric_code: "overloaded",
-                headers: HeaderMap::new(),
-            },
-            ServiceError::ObjectSizeInconsistency { .. } => Self {
-                status_code: StatusCode::CONFLICT,
-                metric_code: "object_size_inconsistency",
-                headers: HeaderMap::new(),
-            },
+            ) => (StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
+            ServiceError::ObjectSizeInconsistency { .. } => {
+                (StatusCode::CONFLICT, "object_size_inconsistency")
+            }
             err => {
                 warn!(?err, ?chunk_idx, "chunk failed");
-                Self {
-                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                    metric_code: "internal",
-                    headers: HeaderMap::new(),
-                }
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }
+        };
+        Self {
+            status_code,
+            metric_code,
+            headers,
         }
     }
 
@@ -91,17 +88,6 @@ impl ChunkErrorResponse {
     fn into_response(self, body: String) -> Response {
         (self.status_code, self.headers, body).into_response()
     }
-}
-
-fn range_not_satisfied_headers(object_size: Option<u64>) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    if let Some(object_size) = object_size {
-        headers.insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_str(&format!("bytes */{object_size}")).expect("valid content-range"),
-        );
-    }
-    headers
 }
 
 fn on_chunk_error(

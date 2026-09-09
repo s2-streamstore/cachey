@@ -22,7 +22,6 @@ bytes = "1.12"
 bytesize = "2.7"
 clap = { version = "4.6", features = ["derive"] }
 compact_str = { version = "0.10", features = ["serde"] }
-crossbeam = "0.8"
 dashmap = "6.2"
 exponential-decay-histogram = "0.1"
 eyre = "0.6"
