@@ -81,24 +81,13 @@ impl RequestConfig {
         self == &Self::default()
     }
 
-    fn has_timeout_overrides(&self) -> bool {
-        self.connect_timeout.is_some()
-            || self.read_timeout.is_some()
-            || self.operation_timeout.is_some()
-            || self.operation_attempt_timeout.is_some()
-    }
-
     fn has_retry_overrides(&self) -> bool {
         self.max_attempts.is_some() || self.initial_backoff.is_some() || self.max_backoff.is_some()
     }
 
     #[must_use]
     pub fn merged_timeout_config(&self, base: Option<&TimeoutConfig>) -> Option<TimeoutConfig> {
-        if !self.has_timeout_overrides() {
-            return None;
-        }
-
-        let mut builder = base.map_or_else(TimeoutConfig::builder, TimeoutConfig::to_builder);
+        let mut builder = TimeoutConfig::builder();
 
         if let Some(connect_timeout) = self.connect_timeout {
             builder = builder.connect_timeout(connect_timeout);
@@ -113,7 +102,14 @@ impl RequestConfig {
             builder = builder.operation_attempt_timeout(attempt_timeout);
         }
 
-        Some(builder.build())
+        let mut config = builder.build();
+        if !config.has_timeouts() {
+            return None;
+        }
+        if let Some(base) = base {
+            config.take_defaults_from(base);
+        }
+        Some(config)
     }
 
     #[must_use]
@@ -147,24 +143,29 @@ mod tests {
     use super::RequestConfig;
 
     #[test]
-    fn merged_timeout_config_preserves_unset_base_fields() {
+    fn timeout_overrides_preserve_disabled_and_inherited_settings() {
         let base = TimeoutConfig::builder()
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
+            .disable_read_timeout()
             .operation_timeout(Duration::from_mins(1))
-            .operation_attempt_timeout(Duration::from_secs(20))
             .build();
         let request = RequestConfig {
-            connect_timeout: Some(Duration::from_secs(5)),
+            connect_timeout: Some(Duration::ZERO),
             ..RequestConfig::default()
         };
 
-        let merged = request
+        let mut merged = request
             .merged_timeout_config(Some(&base))
             .expect("timeout overrides are set");
+        merged.take_defaults_from(
+            &TimeoutConfig::builder()
+                .read_timeout(Duration::from_secs(30))
+                .operation_attempt_timeout(Duration::from_secs(20))
+                .build(),
+        );
 
-        assert_eq!(merged.connect_timeout(), Some(Duration::from_secs(5)));
-        assert_eq!(merged.read_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(merged.connect_timeout(), Some(Duration::ZERO));
+        assert_eq!(merged.read_timeout(), None);
         assert_eq!(merged.operation_timeout(), Some(Duration::from_mins(1)));
         assert_eq!(
             merged.operation_attempt_timeout(),
@@ -180,6 +181,10 @@ mod tests {
         };
 
         assert!(request.merged_timeout_config(None).is_none());
+        let base = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build();
+        assert!(request.merged_timeout_config(Some(&base)).is_none());
     }
 
     #[test]
