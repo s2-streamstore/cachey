@@ -306,7 +306,7 @@ pub async fn fetch(
                     }
                     yield Ok(Frame::data(chunk.data));
                     if is_last_chunk {
-                        // Cancel speculative reads beyond EOF before sending trailers.
+                        // Stop waiting for pages beyond EOF; shared cache fills can continue.
                         drop(chunks);
                         yield Ok(Frame::trailers(trailers));
                         break;
