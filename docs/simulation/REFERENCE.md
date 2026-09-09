@@ -6,10 +6,11 @@ under errors, stalls, recovery, and limited capacity. No production traffic is u
 ## Revisions and reproduction
 
 - Before: `0d3cd24778407ed3d3f47938b7fd7e9969443c3a`.
-- After: `d0754d6fbeda059a97c7de2ff604a6caba4851b2`, with a clean working tree.
-- Both use the after revision's simulation and fixtures. The baseline harness adapts
-  the constructor and limits API and omits the new error variant; its routing and
-  execution code are unchanged. The report records its dirty flag and patch digest.
+- After: `dc85f8e8b29029d1ad4d944c978a66d3fe05f049`, with a clean working tree.
+- Both use the simulation and fixtures from `d0754d6`, unchanged in the after revision.
+  The baseline harness adapts the constructor and limits API and omits the new error
+  variant; its routing and execution code are unchanged. The report records its dirty
+  flag and patch digest.
 
 Each revision has **117 runs / 307,281 arrivals**: 99 exact-retention runs across all
 33 scenarios with seeds 7, 42, and 2026, plus 18 production-reservoir runs / 132,000
@@ -57,10 +58,11 @@ a universal guarantee about reservoir behavior or real service distributions.
 
 Unit tests also cover a measured 400 ms primary that stalls with a 150 ms peer and
 500 ms deadline, malformed successful responses permitting fallback, and page expiry
-recording timeout health. A 250 ms primary with 300 ms peers and a 400 ms deadline
-needs overlapping copies to make fallback possible: the healthy primary still wins
-at 250 ms, and a stalled primary can be rescued before expiry. Recent explicit
-overload preserves primary grace to limit added congestion.
+recording timeout health. Unstarted recovery probes remain eligible; missing copies
+cannot hide another copy's failure or a denied overload retry. A 250 ms primary with
+300 ms peers and a 400 ms deadline needs overlapping copies to make fallback possible:
+the healthy primary still wins at 250 ms, and a stalled primary can be rescued before
+expiry. Recent explicit overload preserves primary grace to limit added congestion.
 
 The server reserves 16 MiB per copy, so the default 1 GiB budget admits 64 copies.
 That bound explains the retained full-page regional failures; unconstrained small
