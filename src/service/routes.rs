@@ -1,5 +1,5 @@
 use std::{
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     ops::Range,
     time::{Duration, SystemTime},
 };
@@ -247,9 +247,9 @@ pub async fn fetch(
     metrics::fetch_request_count(&kind, &method, "start");
 
     let concurrency = if method == axum::http::Method::HEAD {
-        1
+        NonZeroUsize::MIN
     } else {
-        2
+        const { NonZeroUsize::new(2).unwrap() }
     };
 
     let mut chunks = Box::pin(

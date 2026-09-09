@@ -1,6 +1,6 @@
 use std::{
     net::SocketAddr,
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     ops::{Range, RangeInclusive},
     sync::{
         Arc,
@@ -153,8 +153,6 @@ impl CacheyService {
         self.egress_throughput.lock().bps(lookback)
     }
 
-    /// Zero concurrency is treated as one.
-    ///
     /// # Panics
     ///
     /// If `byterange.start >= byterange.end` or `byterange.end > MAX_RANGE_END`.
@@ -164,7 +162,7 @@ impl CacheyService {
         object: ObjectKey,
         buckets: BucketNameSet,
         byterange: Range<u64>,
-        concurrency: usize,
+        concurrency: NonZeroUsize,
         req_config: RequestConfig,
     ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
         assert!(byterange.start < byterange.end);
@@ -186,7 +184,7 @@ impl CacheyService {
 
         futures::stream::iter(pagerange)
             .map(move |page_id| executor.clone().execute(page_id, self.cache.clone()))
-            .buffered(concurrency.max(1))
+            .buffered(concurrency.get())
             .map(move |result| {
                 let (page_id, value) = result?;
                 let expected_size = *object_size.get_or_insert(value.object_size);
@@ -331,6 +329,7 @@ impl PageGetExecutor {
 #[cfg(test)]
 mod tests {
     use std::{
+        num::NonZeroUsize,
         sync::{
             Arc,
             atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
@@ -623,7 +622,7 @@ mod tests {
                 object.clone(),
                 buckets.clone(),
                 range,
-                2,
+                const { NonZeroUsize::new(2).unwrap() },
                 RequestConfig::default(),
             )
         };
@@ -653,7 +652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_and_serial_concurrency_reads_share_one_download() {
+    async fn concurrent_service_reads_share_one_download() {
         let kind = ObjectKind::new(unique_name("kind")).expect("kind");
         let object = ObjectKey::new(unique_name("object")).expect("object");
         let bucket = BucketName::new(unique_name("bucket")).expect("bucket");
@@ -682,7 +681,7 @@ mod tests {
         .await
         .expect("service");
 
-        let read = |concurrency| {
+        let read = || {
             service
                 .clone()
                 .get(
@@ -690,16 +689,12 @@ mod tests {
                     object.clone(),
                     buckets.clone(),
                     0..object_data.len() as u64,
-                    concurrency,
+                    NonZeroUsize::MIN,
                     RequestConfig::default(),
                 )
                 .try_collect::<Vec<_>>()
         };
-        let (left, right) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(read(0), read(1))
-        })
-        .await
-        .expect("both streams must make progress");
+        let (left, right) = tokio::join!(read(), read());
 
         assert_eq!(request_count.load(AtomicOrdering::Relaxed), 1);
         for chunks in [left, right] {
