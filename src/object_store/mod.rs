@@ -1,7 +1,12 @@
+mod admission;
+mod budget;
 mod config;
 mod downloader;
 mod stats;
 
-pub use config::RequestConfig;
+#[cfg(test)]
+mod simulation;
+
+pub use config::{DownloadLimits, RequestConfig};
 pub use downloader::{DownloadError, DownloadOutput, Downloader, ObjectPiece};
 pub use stats::BucketMetrics;

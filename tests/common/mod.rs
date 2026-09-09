@@ -1,5 +1,6 @@
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
+use bytes::Bytes;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{WaitFor, wait::HttpWaitStrategy},
@@ -58,4 +59,15 @@ pub async fn setup_rustfs() -> RustfsTestContext {
         client,
         bucket_name: bucket_name.to_string(),
     }
+}
+
+pub async fn upload_test_object(client: &aws_sdk_s3::Client, bucket: &str, key: &str, data: Bytes) {
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(data.into())
+        .send()
+        .await
+        .expect("Failed to upload object");
 }

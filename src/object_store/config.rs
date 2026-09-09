@@ -2,6 +2,67 @@ use std::time::Duration;
 
 use aws_sdk_s3::config::{retry::RetryConfig, timeout::TimeoutConfig};
 
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadLimits {
+    /// Maximum duration of a bucket operation, through body validation.
+    pub bucket_timeout: Duration,
+    /// Maximum duration across bucket selection and fallback.
+    pub page_timeout: Duration,
+    /// Hedge credits earned per successful page fetch, as a percentage (0–100).
+    pub hedge_budget_percent: u8,
+    /// Request-count guard for arbitrary ranges; fixed-size server pages are normally
+    /// memory-limited.
+    pub max_inflight_requests: u32,
+    /// Requested body bytes reserved by active backend requests, separate from the cache.
+    pub max_inflight_bytes: u64,
+}
+
+impl Default for DownloadLimits {
+    fn default() -> Self {
+        Self {
+            bucket_timeout: Duration::from_secs(5),
+            page_timeout: Duration::from_secs(10),
+            hedge_budget_percent: 5,
+            max_inflight_requests: 1024,
+            max_inflight_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl DownloadLimits {
+    pub(crate) fn validate(self) -> eyre::Result<()> {
+        eyre::ensure!(
+            self.max_inflight_requests > 0
+                && self.max_inflight_requests as usize <= tokio::sync::Semaphore::MAX_PERMITS,
+            "max_inflight_requests must fit a positive semaphore capacity"
+        );
+        eyre::ensure!(
+            self.max_inflight_bytes > 0
+                && self.max_inflight_bytes <= tokio::sync::Semaphore::MAX_PERMITS as u64,
+            "max_inflight_bytes must fit a positive semaphore capacity"
+        );
+        eyre::ensure!(
+            !self.bucket_timeout.is_zero(),
+            "bucket timeout must be positive"
+        );
+        eyre::ensure!(
+            !self.page_timeout.is_zero(),
+            "page timeout must be positive"
+        );
+        eyre::ensure!(
+            self.hedge_budget_percent <= 100,
+            "hedge budget must be between 0 and 100 percent"
+        );
+        eyre::ensure!(
+            std::time::Instant::now()
+                .checked_add(self.page_timeout)
+                .is_some(),
+            "page timeout exceeds the clock's supported range"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RequestConfig {
     pub connect_timeout: Option<Duration>,
@@ -17,21 +78,7 @@ pub struct RequestConfig {
 impl RequestConfig {
     #[must_use]
     pub fn is_noop(&self) -> bool {
-        self.connect_timeout.is_none()
-            && self.read_timeout.is_none()
-            && self.operation_timeout.is_none()
-            && self.operation_attempt_timeout.is_none()
-            && self.max_attempts.is_none()
-            && self.initial_backoff.is_none()
-            && self.max_backoff.is_none()
-            && self.force_path_style.is_none()
-    }
-
-    fn has_timeout_overrides(&self) -> bool {
-        self.connect_timeout.is_some()
-            || self.read_timeout.is_some()
-            || self.operation_timeout.is_some()
-            || self.operation_attempt_timeout.is_some()
+        self == &Self::default()
     }
 
     fn has_retry_overrides(&self) -> bool {
@@ -40,11 +87,7 @@ impl RequestConfig {
 
     #[must_use]
     pub fn merged_timeout_config(&self, base: Option<&TimeoutConfig>) -> Option<TimeoutConfig> {
-        if !self.has_timeout_overrides() {
-            return None;
-        }
-
-        let mut builder = base.map_or_else(TimeoutConfig::builder, TimeoutConfig::to_builder);
+        let mut builder = TimeoutConfig::builder();
 
         if let Some(connect_timeout) = self.connect_timeout {
             builder = builder.connect_timeout(connect_timeout);
@@ -59,7 +102,14 @@ impl RequestConfig {
             builder = builder.operation_attempt_timeout(attempt_timeout);
         }
 
-        Some(builder.build())
+        let mut config = builder.build();
+        if !config.has_timeouts() {
+            return None;
+        }
+        if let Some(base) = base {
+            config.take_defaults_from(base);
+        }
+        Some(config)
     }
 
     #[must_use]
@@ -90,27 +140,32 @@ mod tests {
 
     use aws_sdk_s3::config::{retry::RetryConfig, timeout::TimeoutConfig};
 
-    use crate::object_store::config::RequestConfig;
+    use super::RequestConfig;
 
     #[test]
-    fn merged_timeout_config_preserves_unset_base_fields() {
+    fn timeout_overrides_preserve_disabled_and_inherited_settings() {
         let base = TimeoutConfig::builder()
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
+            .disable_read_timeout()
             .operation_timeout(Duration::from_mins(1))
-            .operation_attempt_timeout(Duration::from_secs(20))
             .build();
         let request = RequestConfig {
-            connect_timeout: Some(Duration::from_secs(5)),
+            connect_timeout: Some(Duration::ZERO),
             ..RequestConfig::default()
         };
 
-        let merged = request
+        let mut merged = request
             .merged_timeout_config(Some(&base))
             .expect("timeout overrides are set");
+        merged.take_defaults_from(
+            &TimeoutConfig::builder()
+                .read_timeout(Duration::from_secs(30))
+                .operation_attempt_timeout(Duration::from_secs(20))
+                .build(),
+        );
 
-        assert_eq!(merged.connect_timeout(), Some(Duration::from_secs(5)));
-        assert_eq!(merged.read_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(merged.connect_timeout(), Some(Duration::ZERO));
+        assert_eq!(merged.read_timeout(), None);
         assert_eq!(merged.operation_timeout(), Some(Duration::from_mins(1)));
         assert_eq!(
             merged.operation_attempt_timeout(),
@@ -126,6 +181,10 @@ mod tests {
         };
 
         assert!(request.merged_timeout_config(None).is_none());
+        let base = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build();
+        assert!(request.merged_timeout_config(Some(&base)).is_none());
     }
 
     #[test]

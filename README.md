@@ -33,10 +33,10 @@ HEAD|GET /fetch/{kind}/{object}
 | `C0-Config` | no | Override S3 request config |
 
 `C0-Bucket` behavior:
-- Multiple headers indicate bucket preference order
+- Multiple headers specify redundant buckets, with the preferred bucket first
 - If omitted, `kind` is used as the singular bucket name
-- Client preference may be overridden based on internal latency/error stats
-- At most 2 buckets attempted per page miss
+
+See [replica reads](docs/replica-reads.md) for selection, fallback, hedging, and download limits.
 
 `C0-Config` overrides:
 Space-separated key-value pairs to override S3 request configuration per page miss.
@@ -44,10 +44,12 @@ Space-separated key-value pairs to override S3 request configuration per page mi
 - `rt=<ms>` Read timeout (time-to-first-byte)
 - `ot=<ms>` Operation timeout (across retries)
 - `oat=<ms>` Operation attempt timeout
-- `ma=<num>` Maximum attempts
+- `ma=<num>` Maximum attempts for each bucket's primary SDK operation
 - `ib=<ms>` Initial backoff duration
 - `mb=<ms>` Maximum backoff duration
 - `fps=<bool>` Force path-style addressing
+
+SDK overrides are bounded by the server's download deadlines; early hedges use one SDK attempt.
 
 #### Example Request
 
@@ -112,8 +114,16 @@ Options:
           Kind of disk cache, which may be a file system or block device [default: fs] [possible values: block, fs]
       --disk-capacity <DISK_CAPACITY>
           Maximum disk cache capacity (e.g., "100GiB") If not specified, up to 80% of the available space will be used
-      --hedge-quantile <HEDGE_QUANTILE>
-          Latency quantile for making hedged requests (0.0-1.0, use 0 to disable hedging) [default: 0.99]
+      --iouring
+          Use `io_uring` (if available) for disk IO
+      --bucket-timeout-ms <BUCKET_TIMEOUT_MS>
+          Maximum bucket download time through body validation, in milliseconds [default: 5000]
+      --page-timeout-ms <PAGE_TIMEOUT_MS>
+          Maximum page download time including fallback, in milliseconds [default: 10000]
+      --hedge-budget-percent <HEDGE_BUDGET_PERCENT>
+          Hedge allowance per successful page fetch, as a percentage (0 disables early hedging) [default: 5]
+      --max-download-memory <MAX_DOWNLOAD_MEMORY>
+          Body memory reserved by active downloads, separate from the cache [default: 1GiB]
       --tls-self
           Use a self-signed certificate for TLS
       --tls-cert <TLS_CERT>
@@ -132,6 +142,7 @@ Options:
 
 - [justfile](./justfile) contains commands for [just](https://just.systems/man/en/) doing things
 - [AGENTS.md](./AGENTS.md) and symlinks for your favorite coding buddies
+- [Replica simulation harness](docs/simulation/README.md)
 
 Use the nightly Cargo dependency commands so that the seven-day publication cooldown applies:
 

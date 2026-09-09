@@ -1,5 +1,10 @@
+#![expect(
+    clippy::unused_async_trait_impl,
+    reason = "Axum extractors require futures; async keeps fallible parsing in place."
+)]
+
 use std::{
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     ops::Range,
     time::{Duration, SystemTime},
 };
@@ -13,7 +18,7 @@ use axum::{
 use bytes::BytesMut;
 use futures::StreamExt;
 use http_body::Frame;
-use http_body_util::{BodyExt as _, StreamBody};
+use http_body_util::StreamBody;
 use tokio::time::Instant;
 use tracing::{debug, instrument, warn};
 
@@ -27,86 +32,64 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 static C0_BUCKET_HEADER: HeaderName = HeaderName::from_static("c0-bucket");
 static C0_CONFIG_HEADER: HeaderName = HeaderName::from_static("c0-config");
 
-struct ChunkErrorResponse {
-    status_code: StatusCode,
-    metric_code: &'static str,
-    headers: HeaderMap,
-}
-
-impl ChunkErrorResponse {
-    fn from_error(chunk_idx: usize, error: &ServiceError) -> Self {
-        match error {
-            ServiceError::Download(DownloadError::NoSuchKey) => Self {
-                status_code: StatusCode::NOT_FOUND,
-                metric_code: "not_found",
-                headers: HeaderMap::new(),
-            },
-            ServiceError::Download(DownloadError::RangeNotSatisfied { object_size, .. }) => Self {
-                status_code: StatusCode::RANGE_NOT_SATISFIABLE,
-                metric_code: "range_not_satisfiable",
-                headers: range_not_satisfied_headers(*object_size),
-            },
-            ServiceError::ObjectSizeInconsistency { .. } => Self {
-                status_code: StatusCode::CONFLICT,
-                metric_code: "object_size_inconsistency",
-                headers: HeaderMap::new(),
-            },
-            err => {
-                warn!(?err, ?chunk_idx, "chunk failed");
-                Self {
-                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                    metric_code: "internal",
-                    headers: HeaderMap::new(),
-                }
-            }
-        }
-    }
-
-    fn observe_metrics(&self, kind: &ObjectKind, method: &axum::http::Method, chunk_idx: usize) {
-        metrics::fetch_request_count(
-            kind,
-            method,
-            &format!(
-                "failed:{}:{}",
-                if chunk_idx == 0 { "init" } else { "later" },
-                self.metric_code
-            ),
-        );
-    }
-
-    fn into_response(self, body: String) -> Response {
-        (self.status_code, self.headers, body).into_response()
-    }
-}
-
-fn range_not_satisfied_headers(object_size: Option<u64>) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    if let Some(object_size) = object_size {
-        headers.insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_str(&format!("bytes */{object_size}")).expect("valid content-range"),
-        );
-    }
-    headers
-}
-
 fn on_chunk_error(
     kind: &ObjectKind,
     method: &axum::http::Method,
     chunk_idx: usize,
     error: &ServiceError,
-) -> ChunkErrorResponse {
-    let response = ChunkErrorResponse::from_error(chunk_idx, error);
-    response.observe_metrics(kind, method, chunk_idx);
-    response
+) -> (StatusCode, HeaderMap) {
+    let mut headers = HeaderMap::new();
+    let (status_code, metric_code) = match error {
+        ServiceError::Download(DownloadError::NoSuchKey) => (StatusCode::NOT_FOUND, "not_found"),
+        ServiceError::Download(DownloadError::RangeNotSatisfied { object_size, .. }) => {
+            if let Some(object_size) = object_size {
+                headers.insert(
+                    header::CONTENT_RANGE,
+                    HeaderValue::try_from(format!("bytes */{object_size}"))
+                        .expect("valid content-range"),
+                );
+            }
+            (StatusCode::RANGE_NOT_SATISFIABLE, "range_not_satisfiable")
+        }
+        ServiceError::Download(DownloadError::Timeout { .. }) => {
+            (StatusCode::GATEWAY_TIMEOUT, "timeout")
+        }
+        ServiceError::Download(
+            DownloadError::AdmissionTimeout
+            | DownloadError::AdmissionExhausted { .. }
+            | DownloadError::Overloaded(_),
+        ) => (StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
+        ServiceError::ObjectSizeInconsistency { .. } => {
+            (StatusCode::CONFLICT, "object_size_inconsistency")
+        }
+        err => {
+            warn!(?err, ?chunk_idx, "chunk failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    };
+    metrics::fetch_request_count(
+        kind,
+        method,
+        &format!(
+            "failed:{}:{metric_code}",
+            if chunk_idx == 0 { "init" } else { "later" },
+        ),
+    );
+    (status_code, headers)
 }
 
 #[derive(Debug)]
 pub struct RangeHeader(pub Range<u64>);
 
-impl RangeHeader {
-    fn parse(headers: &HeaderMap) -> Result<Self, (StatusCode, &'static str)> {
-        let range_header = headers
+impl<S> FromRequestParts<S> for RangeHeader
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let range_header = parts
+            .headers
             .get(header::RANGE)
             .ok_or((StatusCode::BAD_REQUEST, "Range header is required"))?
             .to_str()
@@ -134,108 +117,73 @@ impl RangeHeader {
     }
 }
 
-impl<S> FromRequestParts<S> for RangeHeader
-where
-    S: Send + Sync,
-{
-    type Rejection = (StatusCode, &'static str);
-
-    fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready(Self::parse(&parts.headers))
-    }
-}
-
-fn parse_request_config(headers: &HeaderMap) -> Result<RequestConfig, (StatusCode, &'static str)> {
-    let Some(header_value) = headers.get(&C0_CONFIG_HEADER) else {
-        return Ok(RequestConfig::default());
-    };
-
-    let header_str = header_value
-        .to_str()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid C0-Config header encoding"))?;
-
-    let mut config = RequestConfig::default();
-
-    let parse_duration = |v: &str| -> Result<Duration, (StatusCode, &'static str)> {
-        v.parse::<u64>().map(Duration::from_millis).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Invalid duration value in C0-Config header",
-            )
-        })
-    };
-
-    for pair in header_str.split_whitespace() {
-        let Some((key, value)) = pair.split_once('=') else {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Malformed C0-Config header: missing '=' in key-value pair",
-            ));
-        };
-
-        match key {
-            "ct" => config.connect_timeout = Some(parse_duration(value)?),
-            "rt" => config.read_timeout = Some(parse_duration(value)?),
-            "ot" => config.operation_timeout = Some(parse_duration(value)?),
-            "oat" => config.operation_attempt_timeout = Some(parse_duration(value)?),
-            "ma" => {
-                config.max_attempts = Some(value.parse().map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "Invalid value for ma in C0-Config header",
-                    )
-                })?);
-            }
-            "ib" => config.initial_backoff = Some(parse_duration(value)?),
-            "mb" => config.max_backoff = Some(parse_duration(value)?),
-            "fps" => {
-                config.force_path_style = Some(value.parse().map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "Invalid value for fps in C0-Config header",
-                    )
-                })?);
-            }
-            _ => {} // Ignore unrecognized keys
-        }
-    }
-
-    Ok(config)
-}
-
 impl<S> FromRequestParts<S> for RequestConfig
 where
     S: Send + Sync,
 {
     type Rejection = (StatusCode, &'static str);
 
-    fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready(parse_request_config(&parts.headers))
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let Some(header_value) = parts.headers.get(&C0_CONFIG_HEADER) else {
+            return Ok(RequestConfig::default());
+        };
+
+        let header_str = header_value
+            .to_str()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid C0-Config header encoding"))?;
+
+        let mut config = RequestConfig::default();
+
+        let parse_duration = |v: &str| -> Result<Duration, (StatusCode, &'static str)> {
+            v.parse::<u64>().map(Duration::from_millis).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid duration value in C0-Config header",
+                )
+            })
+        };
+
+        for pair in header_str.split_whitespace() {
+            let Some((key, value)) = pair.split_once('=') else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Malformed C0-Config header: missing '=' in key-value pair",
+                ));
+            };
+
+            match key {
+                "ct" => config.connect_timeout = Some(parse_duration(value)?),
+                "rt" => config.read_timeout = Some(parse_duration(value)?),
+                "ot" => config.operation_timeout = Some(parse_duration(value)?),
+                "oat" => config.operation_attempt_timeout = Some(parse_duration(value)?),
+                "ma" => {
+                    config.max_attempts = Some(value.parse().map_err(|_| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            "Invalid value for ma in C0-Config header",
+                        )
+                    })?);
+                }
+                "ib" => config.initial_backoff = Some(parse_duration(value)?),
+                "mb" => config.max_backoff = Some(parse_duration(value)?),
+                "fps" => {
+                    config.force_path_style = Some(value.parse().map_err(|_| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            "Invalid value for fps in C0-Config header",
+                        )
+                    })?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(config)
     }
 }
 
 #[derive(Debug)]
 pub struct BucketHeaders(pub Vec<BucketName>);
-
-impl BucketHeaders {
-    fn parse(headers: &HeaderMap) -> Result<Self, (StatusCode, &'static str)> {
-        let mut names = Vec::with_capacity(3);
-        for value in headers.get_all(&C0_BUCKET_HEADER) {
-            let s = value
-                .to_str()
-                .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid bucket header encoding"))?;
-            let bucket = BucketName::new(s).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-            names.push(bucket);
-        }
-        Ok(Self(names))
-    }
-}
 
 impl<S> FromRequestParts<S> for BucketHeaders
 where
@@ -243,11 +191,16 @@ where
 {
     type Rejection = (StatusCode, &'static str);
 
-    fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready(Self::parse(&parts.headers))
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let mut names = Vec::with_capacity(3);
+        for value in parts.headers.get_all(&C0_BUCKET_HEADER) {
+            let s = value
+                .to_str()
+                .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid bucket header encoding"))?;
+            let bucket = BucketName::new(s).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+            names.push(bucket);
+        }
+        Ok(Self(names))
     }
 }
 
@@ -264,20 +217,19 @@ pub async fn fetch(
     let start = Instant::now();
 
     let buckets = if buckets.is_empty() {
-        BucketNameSet::new(std::iter::once(kind.clone().into()))
+        BucketName::from(kind.clone()).into()
     } else {
-        BucketNameSet::new(buckets.into_iter())
-    }
-    .expect("non-empty set");
+        BucketNameSet::new(buckets.into_iter()).expect("non-empty set")
+    };
 
     debug!(%kind, %object, ?buckets, ?byterange, "processing");
 
     metrics::fetch_request_count(&kind, &method, "start");
 
     let concurrency = if method == axum::http::Method::HEAD {
-        1
+        NonZeroUsize::MIN
     } else {
-        2
+        const { NonZeroUsize::new(2).unwrap() }
     };
 
     let mut chunks = Box::pin(
@@ -312,16 +264,16 @@ pub async fn fetch(
             headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
             headers.insert(
                 header::CONTENT_LENGTH,
-                HeaderValue::from_str(&(last_byte - first_byte + 1).to_string()).unwrap(),
+                HeaderValue::from(last_byte - first_byte + 1),
             );
             headers.insert(
                 header::CONTENT_RANGE,
-                HeaderValue::from_str(&format!("bytes {first_byte}-{last_byte}/{object_size}"))
+                HeaderValue::try_from(format!("bytes {first_byte}-{last_byte}/{object_size}"))
                     .unwrap(),
             );
             headers.insert(
                 header::LAST_MODIFIED,
-                HeaderValue::from_str(&httpdate::fmt_http_date(
+                HeaderValue::try_from(httpdate::fmt_http_date(
                     SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(chunk.mtime)),
                 ))
                 .unwrap(),
@@ -329,8 +281,8 @@ pub async fn fetch(
             headers.insert("c0-status", c0_status(chunk));
         }
         Err(e) => {
-            let error_response = on_chunk_error(&kind, &method, 0, e);
-            return error_response.into_response(e.to_string());
+            let (status, headers) = on_chunk_error(&kind, &method, 0, e);
+            return (status, headers, e.to_string()).into_response();
         }
     }
 
@@ -339,10 +291,7 @@ pub async fn fetch(
         return (StatusCode::PARTIAL_CONTENT, headers).into_response();
     }
 
-    let (trailers_tx, trailers_rx) = tokio::sync::oneshot::channel::<HeaderMap>();
-
     let body = StreamBody::new(async_stream::stream! {
-        let mut trailers_tx = Some(trailers_tx);
         let mut trailers = HeaderMap::new();
         let mut chunk_idx = 0;
         while let Some(chunk) = chunks.next().await {
@@ -354,16 +303,12 @@ pub async fn fetch(
                     let is_last_chunk = chunk.range.end == byterange.end.min(chunk.object_size);
                     if is_last_chunk {
                         metrics::fetch_request_count(&kind, &method, "success");
-                        let trailers_tx = trailers_tx
-                            .take()
-                            .expect("final chunk should send trailers exactly once");
-                        let _ = trailers_tx.send(std::mem::take(&mut trailers));
                     }
                     yield Ok(Frame::data(chunk.data));
                     if is_last_chunk {
-                        // `service.get` can already have later requested pages in flight before
-                        // we learn the true object size. Once we've emitted the full valid
-                        // response range, ignore any speculative beyond-EOF page results.
+                        // Stop waiting for pages beyond EOF; shared cache fills can continue.
+                        drop(chunks);
+                        yield Ok(Frame::trailers(trailers));
                         break;
                     }
                 },
@@ -376,12 +321,6 @@ pub async fn fetch(
             }
             chunk_idx += 1;
         }
-    })
-    .with_trailers(async {
-        let Ok(trailers) = trailers_rx.await else {
-            return None;
-        };
-        Some(Ok(trailers))
     });
 
     (
@@ -496,169 +435,138 @@ pub async fn heap_flamegraph() -> impl IntoResponse {
 mod tests {
     use std::time::Duration;
 
-    use axum::http::{HeaderValue, Method, Request, header};
+    use axum::{
+        extract::FromRequestParts,
+        http::{HeaderValue, Method, Request, StatusCode},
+    };
 
-    use super::*;
+    use super::{C0_CONFIG_HEADER, on_chunk_error};
+    use crate::{
+        object_store::{DownloadError, RequestConfig},
+        service::{ServiceError, metrics},
+        types::{BucketName, ObjectKind},
+    };
 
     async fn parse_c0_config(
-        header_value: &str,
+        header_value: Option<HeaderValue>,
     ) -> Result<RequestConfig, (StatusCode, &'static str)> {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .header(&C0_CONFIG_HEADER, header_value)
-            .body(())
-            .unwrap();
-
-        let (mut parts, ()) = req.into_parts();
+        let mut request = Request::new(());
+        if let Some(value) = header_value {
+            request.headers_mut().insert(&C0_CONFIG_HEADER, value);
+        }
+        let (mut parts, ()) = request.into_parts();
         RequestConfig::from_request_parts(&mut parts, &()).await
     }
 
     #[tokio::test]
-    async fn test_c0_config_empty_returns_default() {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(())
-            .unwrap();
-
-        let (mut parts, ()) = req.into_parts();
-        let config = RequestConfig::from_request_parts(&mut parts, &())
-            .await
-            .unwrap();
-        assert_eq!(config, RequestConfig::default());
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_single_timeout() {
-        let config = parse_c0_config("ct=1000").await.unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
-        assert_eq!(config.read_timeout, None);
+    async fn c0_config_preserves_unspecified_settings() {
+        assert_eq!(
+            parse_c0_config(None).await.unwrap(),
+            RequestConfig::default()
+        );
+        assert_eq!(
+            parse_c0_config(Some(HeaderValue::from_static("ct=1000")))
+                .await
+                .unwrap(),
+            RequestConfig {
+                connect_timeout: Some(Duration::from_secs(1)),
+                ..RequestConfig::default()
+            }
+        );
     }
 
     #[test]
-    fn test_chunk_error_response_includes_content_range_for_unsatisfied_range() {
-        let error = ServiceError::Download(DownloadError::RangeNotSatisfied {
-            requested: 128..256,
-            object_size: Some(512),
+    fn download_timeout_returns_gateway_timeout() {
+        let error = ServiceError::Download(DownloadError::Timeout {
+            bucket: BucketName::new("bucket").unwrap(),
+            timeout: Duration::from_secs(5),
         });
+        let kind = ObjectKind::new("timeout-error").unwrap();
+        for (chunk_idx, phase) in [(0, "init"), (1, "later")] {
+            let (status, _) = on_chunk_error(&kind, &Method::GET, chunk_idx, &error);
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            let snapshot = metrics::gather();
+            assert!(std::str::from_utf8(&snapshot).unwrap().contains(&format!(
+                "cachey_fetch_request_total{{kind=\"timeout-error\",method=\"GET\",status=\"failed:{phase}:timeout\"}} 1\n"
+            )));
+        }
+    }
 
-        let response = ChunkErrorResponse::from_error(0, &error);
+    #[test]
+    fn download_admission_and_backend_overload_return_service_unavailable() {
+        for error in [
+            DownloadError::AdmissionTimeout,
+            DownloadError::AdmissionExhausted {
+                requested_bytes: 8,
+                limit_bytes: 4,
+            },
+            DownloadError::Overloaded("SlowDown".to_owned()),
+        ] {
+            let error = ServiceError::Download(error);
+            let (status, _) = on_chunk_error(
+                &ObjectKind::new("overload-error").unwrap(),
+                &Method::GET,
+                0,
+                &error,
+            );
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let snapshot = metrics::gather();
+        assert!(std::str::from_utf8(&snapshot).unwrap().contains(
+            "cachey_fetch_request_total{kind=\"overload-error\",method=\"GET\",status=\"failed:init:overloaded\"} 3\n"
+        ));
+    }
 
-        assert_eq!(response.status_code, StatusCode::RANGE_NOT_SATISFIABLE);
+    #[tokio::test]
+    async fn c0_config_parses_settings_and_ignores_unknown_keys() {
+        let config = parse_c0_config(Some(HeaderValue::from_static(
+            "ct=1000 rt=2000 ot=3000 oat=1500 unknown=123 ib=100 mb=5000 ma=3 fps=true",
+        )))
+        .await
+        .unwrap();
         assert_eq!(
-            response.headers.get(header::CONTENT_RANGE).unwrap(),
-            "bytes */512"
+            config,
+            RequestConfig {
+                connect_timeout: Some(Duration::from_secs(1)),
+                read_timeout: Some(Duration::from_secs(2)),
+                operation_timeout: Some(Duration::from_secs(3)),
+                operation_attempt_timeout: Some(Duration::from_millis(1500)),
+                initial_backoff: Some(Duration::from_millis(100)),
+                max_backoff: Some(Duration::from_secs(5)),
+                max_attempts: Some(3),
+                force_path_style: Some(true),
+            }
         );
     }
 
     #[tokio::test]
-    async fn test_c0_config_all_timeouts() {
-        let config = parse_c0_config("ct=1000 rt=2000 ot=3000 oat=1500")
-            .await
-            .unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
-        assert_eq!(config.read_timeout, Some(Duration::from_secs(2)));
-        assert_eq!(config.operation_timeout, Some(Duration::from_secs(3)));
-        assert_eq!(
-            config.operation_attempt_timeout,
-            Some(Duration::from_millis(1500))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_backoff_settings() {
-        let config = parse_c0_config("ib=100 mb=5000 ma=3").await.unwrap();
-        assert_eq!(config.initial_backoff, Some(Duration::from_millis(100)));
-        assert_eq!(config.max_backoff, Some(Duration::from_secs(5)));
-        assert_eq!(config.max_attempts, Some(3));
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_force_path_style() {
-        let config = parse_c0_config("fps=true").await.unwrap();
-        assert_eq!(config.force_path_style, Some(true));
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_mixed_settings() {
-        let config = parse_c0_config("ct=1000 ma=5 ib=10 oat=1500")
-            .await
-            .unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
-        assert_eq!(config.max_attempts, Some(5));
-        assert_eq!(config.initial_backoff, Some(Duration::from_millis(10)));
-        assert_eq!(
-            config.operation_attempt_timeout,
-            Some(Duration::from_millis(1500))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_ignores_unknown_keys() {
-        let config = parse_c0_config("ct=1000 unknown=123 rt=2000")
-            .await
-            .unwrap();
-        assert_eq!(config.connect_timeout, Some(Duration::from_secs(1)));
-        assert_eq!(config.read_timeout, Some(Duration::from_secs(2)));
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_missing_equals() {
-        let result = parse_c0_config("ct1000").await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().1,
-            "Malformed C0-Config header: missing '=' in key-value pair"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_invalid_duration() {
-        let result = parse_c0_config("ct=invalid").await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().1,
-            "Invalid duration value in C0-Config header"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_invalid_max_attempts() {
-        let result = parse_c0_config("ma=invalid").await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().1,
-            "Invalid value for ma in C0-Config header"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_invalid_force_path_style() {
-        let result = parse_c0_config("fps=1").await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().1,
-            "Invalid value for fps in C0-Config header"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_c0_config_invalid_header_encoding() {
-        let mut req = Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(())
-            .unwrap();
-
-        req.headers_mut().insert(
-            &C0_CONFIG_HEADER,
-            HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap(),
-        );
-
-        let (mut parts, ()) = req.into_parts();
-        let result = RequestConfig::from_request_parts(&mut parts, &()).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().1, "Invalid C0-Config header encoding");
+    async fn c0_config_rejects_invalid_headers() {
+        for (value, message) in [
+            (
+                HeaderValue::from_static("ct1000"),
+                "Malformed C0-Config header: missing '=' in key-value pair",
+            ),
+            (
+                HeaderValue::from_static("ct=invalid"),
+                "Invalid duration value in C0-Config header",
+            ),
+            (
+                HeaderValue::from_static("ma=invalid"),
+                "Invalid value for ma in C0-Config header",
+            ),
+            (
+                HeaderValue::from_static("fps=1"),
+                "Invalid value for fps in C0-Config header",
+            ),
+            (
+                HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+                "Invalid C0-Config header encoding",
+            ),
+        ] {
+            assert_eq!(
+                parse_c0_config(Some(value)).await.unwrap_err(),
+                (StatusCode::BAD_REQUEST, message)
+            );
+        }
     }
 }

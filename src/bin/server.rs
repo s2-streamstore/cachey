@@ -8,6 +8,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use bytesize::ByteSize;
 use cachey::{
     cache::{CacheConfig, DiskCacheConfig, DiskCacheKind},
+    object_store::DownloadLimits,
     service::{CacheyService, ServiceConfig},
 };
 use clap::{ArgAction, Args as ArgGroup, Parser};
@@ -62,9 +63,21 @@ struct Args {
     #[command(flatten)]
     disk_cache: DiskCacheGroup,
 
-    /// Latency quantile for making hedged requests (0.0-1.0, use 0 to disable hedging)
-    #[arg(long, default_value = "0.99", value_parser = parse_hedge_quantile)]
-    hedge_quantile: f64,
+    /// Maximum bucket download time through body validation, in milliseconds.
+    #[arg(long, default_value = "5000", value_parser = clap::value_parser!(u64).range(1..))]
+    bucket_timeout_ms: u64,
+
+    /// Maximum page download time including fallback, in milliseconds.
+    #[arg(long, default_value = "10000", value_parser = clap::value_parser!(u64).range(1..))]
+    page_timeout_ms: u64,
+
+    /// Hedge allowance per successful page fetch, as a percentage (0 disables early hedging).
+    #[arg(long, default_value = "5", value_parser = clap::value_parser!(u8).range(0..=100))]
+    hedge_budget_percent: u8,
+
+    /// Body memory reserved by active downloads, separate from the cache.
+    #[arg(long, value_parser = parse_bytes, default_value = "1GiB")]
+    max_download_memory: ByteSize,
 
     /// TLS configuration (defaults to plain HTTP if not specified).
     #[command(flatten)]
@@ -79,20 +92,6 @@ fn parse_bytes(s: &str) -> Result<ByteSize, String> {
     s.parse::<ByteSize>().map_err(|e| {
         format!("Invalid memory size: {e}. Use formats like '512MiB', '2GB', '1.5GiB'")
     })
-}
-
-fn parse_hedge_quantile(s: &str) -> Result<f64, String> {
-    let value = s.parse::<f64>().map_err(|e| {
-        format!("Invalid hedge quantile: {e}. Must be a number between 0.0 and 1.0")
-    })?;
-
-    if !(0.0..=1.0).contains(&value) {
-        return Err(format!(
-            "Invalid hedge quantile: {value}. Must be between 0.0 and 1.0 (use 0 to disable hedging)"
-        ));
-    }
-
-    Ok(value)
 }
 
 #[tokio::main]
@@ -117,7 +116,13 @@ async fn main() -> eyre::Result<()> {
             },
             metrics_registry: Some(prometheus::default_registry().clone()),
         },
-        hedge_quantile: args.hedge_quantile,
+        download_limits: DownloadLimits {
+            bucket_timeout: Duration::from_millis(args.bucket_timeout_ms),
+            page_timeout: Duration::from_millis(args.page_timeout_ms),
+            hedge_budget_percent: args.hedge_budget_percent,
+            max_inflight_bytes: args.max_download_memory.as_u64(),
+            ..DownloadLimits::default()
+        },
     };
 
     info!(?service_config);
