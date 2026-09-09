@@ -26,6 +26,7 @@ pub struct Health {
 #[derive(Debug, Clone, Serialize)]
 pub struct Read {
     pub id: u64,
+    pub completion_order: usize,
     pub arrival_us: u64,
     pub end_us: u64,
     pub error: Option<String>,
@@ -161,7 +162,7 @@ impl Report {
             .map(|transport| service_after(transport, reads[transport.read as usize].end_us))
             .sum();
         let mut chronological: Vec<_> = reads.iter().collect();
-        chronological.sort_by_key(|read| (read.end_us, read.id));
+        chronological.sort_by_key(|read| read.completion_order);
         let mut impaired = vec![None; scenario.replicas.len()];
         let mut recoveries = vec![];
         for read in chronological {

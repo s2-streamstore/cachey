@@ -496,5 +496,78 @@
         "queue": 4
       }
     ]
+  },
+  {
+    "name": "finite_capacity_sdk_retries",
+    "interval_ms": 4,
+    "page_timeout_ms": 500,
+    "bucket_timeout_ms": 500,
+    "replicas": [
+      {
+        "slots": 1,
+        "queue": 8,
+        "headers_ms": 1,
+        "body_ms": 2
+      },
+      {
+        "slots": 1,
+        "queue": 8,
+        "headers_ms": 1,
+        "body_ms": 4
+      },
+      {
+        "slots": 1,
+        "queue": 8,
+        "headers_ms": 1,
+        "body_ms": 5
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1,
+          2
+        ],
+        "kind": "slow",
+        "duration_ms": 49
+      }
+    ],
+    "sdk_attempts": 3
+  },
+  {
+    "name": "sdk_retry_with_hedges",
+    "duration_ms": 1000,
+    "interval_ms": 20,
+    "sdk_attempts": 3,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 2
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 4
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 5
+      }
+    ],
+    "faults": [
+      {
+        "start_ms": 0,
+        "end_ms": 1000,
+        "kind": "service_error",
+        "first_sdk_attempt_only": true,
+        "duration_ms": 1,
+        "replicas": [
+          0,
+          1,
+          2
+        ]
+      }
+    ],
+    "hedge_percent": 5
   }
 ]

@@ -32,6 +32,7 @@ struct ControlState {
     copies: Vec<Copy>,
     active_copies: usize,
     peak_copies: usize,
+    completed_reads: usize,
 }
 
 tokio::task_local! { static CONTROLS: Arc<Controls>; }
@@ -112,6 +113,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
             copies: vec![],
             active_copies: 0,
             peak_copies: 0,
+            completed_reads: 0,
         }),
     });
     CONTROLS
@@ -209,6 +211,12 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                         Some(operation.await)
                     };
                     let end_us = epoch.elapsed().as_micros() as u64;
+                    let completion_order = CONTROLS.with(|controls| {
+                        let mut state = controls.state.lock();
+                        let order = state.completed_reads;
+                        state.completed_reads += 1;
+                        order
+                    });
                     let (error, primary, winner, hedged) = match result {
                         Some(Ok(output)) => {
                             assert_eq!(output.piece.data.len(), scenario.body_bytes);
@@ -238,6 +246,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     health.sort_by_key(|health| health.replica);
                     Read {
                         id: id as u64,
+                        completion_order,
                         arrival_us: at_ms * 1000,
                         end_us,
                         error,
@@ -352,6 +361,19 @@ async fn simulation_repeatability_and_cancellation() {
     assert_eq!(
         serde_json::to_value(first).unwrap(),
         serde_json::to_value(second).unwrap()
+    );
+    let recovery = model::scenarios()
+        .into_iter()
+        .find(|scenario| scenario.name == "recovery_during_peer_outage")
+        .unwrap();
+    let recovery_report = simulate(recovery, 7, false, true).await;
+    assert_eq!(
+        recovery_report
+            .recoveries
+            .iter()
+            .filter(|recovery| recovery.replica == 0)
+            .count(),
+        1
     );
     let scenario = model::scenarios()
         .into_iter()
