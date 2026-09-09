@@ -8,11 +8,10 @@ pub struct DownloadLimits {
     pub bucket_timeout: Duration,
     /// Maximum duration across bucket selection and fallback.
     pub page_timeout: Duration,
-    /// Concurrent early hedges across this downloader and its clones; zero disables early hedges.
-    pub max_concurrent_hedges: u16,
     /// Hedge credits earned per successful page fetch, as a percentage (0–100).
     pub hedge_budget_percent: u8,
-    /// Active backend requests, including speculative copies, shared across clones.
+    /// Request-count guard for arbitrary ranges; fixed-size server pages are normally
+    /// memory-limited.
     pub max_inflight_requests: u32,
     /// Requested body bytes reserved by active backend requests, separate from the cache.
     pub max_inflight_bytes: u64,
@@ -23,7 +22,6 @@ impl Default for DownloadLimits {
         Self {
             bucket_timeout: Duration::from_secs(5),
             page_timeout: Duration::from_secs(10),
-            max_concurrent_hedges: 16,
             hedge_budget_percent: 5,
             max_inflight_requests: 1024,
             max_inflight_bytes: 1024 * 1024 * 1024,
@@ -197,7 +195,6 @@ mod tests {
         assert!(
             DownloadLimits {
                 bucket_timeout: Duration::MAX,
-                max_concurrent_hedges: 0,
                 hedge_budget_percent: 0,
                 ..DownloadLimits::default()
             }

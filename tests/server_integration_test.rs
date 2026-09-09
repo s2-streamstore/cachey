@@ -29,7 +29,6 @@ async fn setup_test_server() -> TestContext {
             disk_cache: None,
             metrics_registry: Some(prometheus::Registry::new()),
         },
-        hedge_quantile: 0.99,
         download_limits: cachey::object_store::DownloadLimits::default(),
     };
 

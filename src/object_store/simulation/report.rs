@@ -143,6 +143,7 @@ impl Report {
         }
         let completed = reads.iter().filter(|read| read.error.is_none()).count();
         assert!(peak_copies <= scenario.max_inflight_requests as usize);
+        assert!(peak_copies as u64 * scenario.request_bytes() <= scenario.max_inflight_bytes);
         let service_after = |transport: &Transport, time: u64| {
             transport.service_start_us.map_or(0, |start| {
                 transport
@@ -262,7 +263,7 @@ impl Report {
                 })
                 .max()
                 .unwrap_or(0),
-            requested_bytes: state.transports.len() as u64 * scenario.body_bytes as u64,
+            requested_bytes: state.transports.len() as u64 * scenario.request_bytes(),
             produced_bytes: state
                 .transports
                 .iter()
@@ -291,6 +292,7 @@ pub fn error_name(error: &DownloadError) -> &'static str {
         DownloadError::NoSuchKey => "missing",
         DownloadError::RangeNotSatisfied { .. } => "range",
         DownloadError::BodyStreaming(_) => "body",
+        DownloadError::InvalidResponse(_) => "invalid_response",
         DownloadError::Overloaded(_) => "overloaded",
         DownloadError::AdmissionTimeout => "admission_timeout",
         DownloadError::AdmissionExhausted { .. } => "admission_exhausted",

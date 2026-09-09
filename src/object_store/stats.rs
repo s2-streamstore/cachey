@@ -28,8 +28,7 @@ pub struct BucketMetrics {
 #[derive(Debug, Clone, Copy, Default)]
 struct LatencySnapshot {
     mean: Duration,
-    tail: Duration,
-    hedge: Duration,
+    tail: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -96,17 +95,14 @@ impl BucketStats {
             .exp()
     }
 
-    fn snapshot(&mut self, now: Instant, hedge_quantile: f64) -> LatencySnapshot {
+    fn snapshot(&mut self, now: Instant) -> LatencySnapshot {
         if now.duration_since(self.snapshot_at) >= LATENCY_SNAPSHOT_INTERVAL {
             let snapshot = self.histogram.snapshot();
             self.snapshot = LatencySnapshot {
                 mean: Duration::from_micros(snapshot.mean() as u64),
-                tail: Duration::from_micros(snapshot.value(0.99) as u64),
-                hedge: if hedge_quantile == 0.0 {
-                    Duration::ZERO
-                } else {
-                    Duration::from_micros(snapshot.value(hedge_quantile) as u64)
-                },
+                tail: self
+                    .best_latency
+                    .map(|_| Duration::from_micros(snapshot.value(0.99) as u64)),
             };
             self.snapshot_at = now;
         }
@@ -195,7 +191,7 @@ impl BucketObservation {
                     stats.error_rate = error_rate;
                 }
                 stats.last_outcome = now;
-                if stats.snapshot.tail.is_zero() || self.probe.is_some() {
+                if stats.snapshot.tail.is_none() || self.probe.is_some() {
                     stats.snapshot_at = now - LATENCY_SNAPSHOT_INTERVAL;
                 }
             }
@@ -249,21 +245,108 @@ fn recovery_delay() -> Duration {
     Duration::from_millis(24_000 + RandomState::new().hash_one(()) % 12_001)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BucketedStats {
     by_bucket: Arc<DashMap<BucketName, Arc<Mutex<BucketStats>>>>,
-    hedge_latency_quantile: f64,
+}
+
+struct BucketSnapshot {
+    stats: Arc<Mutex<BucketStats>>,
+    latency: Duration,
+    tail: Option<Duration>,
+    deprioritized: bool,
+    error_rate: f64,
+    overloaded: bool,
+}
+
+pub(super) struct RoutingSnapshot(Vec<BucketSnapshot>);
+
+impl RoutingSnapshot {
+    fn compare(&self, left: usize, right: usize, remaining: Duration) -> std::cmp::Ordering {
+        let left_stats = &self.0[left];
+        let right_stats = &self.0[right];
+        (
+            left_stats.tail.is_some_and(|tail| tail >= remaining),
+            left_stats.deprioritized,
+        )
+            .cmp(&(
+                right_stats.tail.is_some_and(|tail| tail >= remaining),
+                right_stats.deprioritized,
+            ))
+            .then_with(|| {
+                if left_stats.deprioritized {
+                    left_stats.error_rate.total_cmp(&right_stats.error_rate)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| (left_stats.latency, left).cmp(&(right_stats.latency, right)))
+    }
+
+    pub fn best(&self, tried: &[bool], remaining: Duration) -> Option<usize> {
+        (0..self.0.len())
+            .filter(|index| tried.get(*index) != Some(&true))
+            .min_by(|left, right| self.compare(*left, *right, remaining))
+    }
+
+    pub fn alternatives(&self, primary: usize, remaining: Duration) -> Vec<usize> {
+        let mut order: Vec<_> = (0..self.0.len())
+            .filter(|index| *index != primary)
+            .collect();
+        order.sort_by(|left, right| self.compare(*left, *right, remaining));
+        order
+    }
+
+    pub fn primary(&self, remaining: Duration) -> (usize, Option<ProbePermit>) {
+        let winner = self.best(&[], remaining).expect("nonempty bucket set");
+        let best = &self.0[winner];
+        if best.deprioritized || best.tail.is_some_and(|tail| tail >= remaining) {
+            return (winner, None);
+        }
+        let now = Instant::now();
+        for (index, bucket) in self.0.iter().enumerate() {
+            if index == winner {
+                continue;
+            }
+            let mut stats = bucket.stats.lock();
+            let stale = now.duration_since(stats.last_outcome) >= RECOVERY_INTERVAL;
+            if (stats.deprioritized || stale)
+                && !stats.probing
+                && stats.active.is_empty()
+                && now >= stats.probe_after
+                && locality_adjusted(stats.best_latency.unwrap_or_default(), index) < best.latency
+            {
+                stats.probing = true;
+                stats.probe_after = now + recovery_delay();
+                return (
+                    index,
+                    Some(ProbePermit {
+                        stats: bucket.stats.clone(),
+                    }),
+                );
+            }
+        }
+        (winner, None)
+    }
+
+    pub fn tail(&self, index: usize) -> Option<Duration> {
+        self.0[index].tail
+    }
+
+    pub fn any_overloaded(&self) -> bool {
+        self.0.iter().any(|bucket| bucket.overloaded)
+    }
+
+    pub fn all_overloaded(&self) -> bool {
+        self.0.iter().all(|bucket| bucket.overloaded)
+    }
 }
 
 impl BucketedStats {
-    pub fn new(hedge_latency_quantile: f64) -> Self {
-        Self {
-            by_bucket: Arc::default(),
-            hedge_latency_quantile,
-        }
-    }
-
     fn entry(&self, bucket: &BucketName) -> Arc<Mutex<BucketStats>> {
+        if let Some(stats) = self.by_bucket.get(bucket) {
+            return stats.clone();
+        }
         self.by_bucket.entry(bucket.clone()).or_default().clone()
     }
 
@@ -288,110 +371,73 @@ impl BucketedStats {
         }
     }
 
-    pub(super) fn attempt_order(
-        &self,
-        buckets: &BucketNameSet,
-        tried: &[bool],
-        remaining: Duration,
-    ) -> Vec<usize> {
+    pub(super) fn snapshot(&self, buckets: &BucketNameSet) -> RoutingSnapshot {
         let now = Instant::now();
-        let preferred_latency = self.entry(&buckets[0]).lock().routing_latency;
-        let mut choices: Vec<_> = buckets
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !tried[*index])
-            .map(|(index, bucket)| {
-                let entry = self.entry(bucket);
-                let mut stats = entry.lock();
-                let tail = stats.snapshot(now, self.hedge_latency_quantile).tail;
-                let mut latency = stats.routing_latency(now, tail);
-                if index > 0 && stats.best_latency.is_none() {
-                    latency = latency.max(preferred_latency);
-                }
-                let latency = locality_adjusted(latency, index);
-                (
-                    index,
-                    tail >= remaining,
-                    stats.deprioritized,
-                    stats.error_rate(now),
-                    latency,
-                )
-            })
-            .collect();
-        choices.sort_by(|left, right| {
-            (left.1, left.2)
-                .cmp(&(right.1, right.2))
-                .then_with(|| {
-                    if left.2 {
-                        left.3.total_cmp(&right.3)
-                    } else {
-                        std::cmp::Ordering::Equal
+        let mut preferred_latency = Duration::ZERO;
+        RoutingSnapshot(
+            buckets
+                .iter()
+                .enumerate()
+                .map(|(index, bucket)| {
+                    let entry = self.entry(bucket);
+                    let mut stats = entry.lock();
+                    if index == 0 {
+                        preferred_latency = stats.routing_latency;
+                    }
+                    let tail = stats.snapshot(now).tail;
+                    let mut latency = stats.routing_latency(now, tail.unwrap_or_default());
+                    if index > 0 && tail.is_none() {
+                        latency = latency.max(preferred_latency);
+                    }
+                    BucketSnapshot {
+                        stats: entry.clone(),
+                        latency: locality_adjusted(latency, index),
+                        tail,
+                        deprioritized: stats.deprioritized,
+                        error_rate: stats.error_rate(now),
+                        overloaded: now < stats.overload_until,
                     }
                 })
-                .then_with(|| (left.4, left.0).cmp(&(right.4, right.0)))
-        });
-        choices.into_iter().map(|choice| choice.0).collect()
+                .collect(),
+        )
     }
 
-    pub(super) fn primary(
-        &self,
-        buckets: &BucketNameSet,
-        remaining: Duration,
-    ) -> (usize, Option<ProbePermit>) {
-        let order = self.attempt_order(buckets, &vec![false; buckets.len()], remaining);
-        let winner = order[0];
-        let now = Instant::now();
-        let winner_entry = self.entry(&buckets[winner]);
-        let best = {
-            let mut stats = winner_entry.lock();
-            let tail = stats.snapshot(now, self.hedge_latency_quantile).tail;
-            if stats.deprioritized || tail >= remaining {
-                return (winner, None);
-            }
-            locality_adjusted(stats.routing_latency(now, tail), winner)
-        };
-        for (index, bucket) in buckets.iter().enumerate() {
-            if index == winner {
-                continue;
-            }
-            let entry = self.entry(bucket);
-            let mut stats = entry.lock();
-            let stale = now.duration_since(stats.last_outcome) >= RECOVERY_INTERVAL;
-            if (stats.deprioritized || stale)
-                && !stats.probing
-                && stats.active.is_empty()
-                && now >= stats.probe_after
-                && locality_adjusted(stats.best_latency.unwrap_or_default(), index) < best
-            {
-                stats.probing = true;
-                stats.probe_after = now + recovery_delay();
-                drop(stats);
-                return (index, Some(ProbePermit { stats: entry }));
-            }
-        }
-        (winner, None)
-    }
-
-    pub(super) fn tail_latency(&self, bucket: &BucketName) -> Duration {
-        self.entry(bucket)
-            .lock()
-            .snapshot(Instant::now(), self.hedge_latency_quantile)
-            .tail
+    pub(super) fn tail_latency(&self, bucket: &BucketName) -> Option<Duration> {
+        self.entry(bucket).lock().snapshot(Instant::now()).tail
     }
 
     pub fn hedging_threshold(&self, bucket: &BucketName, now: Instant) -> Duration {
         self.entry(bucket)
             .lock()
-            .snapshot(now, self.hedge_latency_quantile)
-            .hedge
-    }
-
-    pub(super) fn all_overloaded(&self, buckets: &BucketNameSet) -> bool {
-        buckets.iter().all(|bucket| self.overloaded(bucket))
+            .snapshot(now)
+            .tail
+            .unwrap_or_default()
     }
 
     pub(super) fn overloaded(&self, bucket: &BucketName) -> bool {
         Instant::now() < self.entry(bucket).lock().overload_until
+    }
+
+    #[cfg(test)]
+    fn attempt_order(
+        &self,
+        buckets: &BucketNameSet,
+        tried: &[bool],
+        remaining: Duration,
+    ) -> Vec<usize> {
+        let snapshot = self.snapshot(buckets);
+        let mut order: Vec<_> = (0..buckets.len()).filter(|index| !tried[*index]).collect();
+        order.sort_by(|left, right| snapshot.compare(*left, *right, remaining));
+        order
+    }
+
+    #[cfg(test)]
+    fn primary(
+        &self,
+        buckets: &BucketNameSet,
+        remaining: Duration,
+    ) -> (usize, Option<ProbePermit>) {
+        self.snapshot(buckets).primary(remaining)
     }
 
     #[cfg(test)]
@@ -409,7 +455,7 @@ impl BucketedStats {
         let now = Instant::now();
         for entry in self.by_bucket.iter() {
             let mut stats = entry.value().lock();
-            let snapshot = stats.snapshot(now, self.hedge_latency_quantile);
+            let snapshot = stats.snapshot(now);
             f(
                 entry.key(),
                 &BucketMetrics {
@@ -418,7 +464,7 @@ impl BucketedStats {
                     consecutive_failures: stats.consecutive_failures,
                     recovery_successes: stats.recovery_successes,
                     latency_mean: snapshot.mean,
-                    latency_hedge: snapshot.hedge,
+                    latency_hedge: snapshot.tail.unwrap_or_default(),
                 },
             );
         }
@@ -465,7 +511,7 @@ mod tests {
             ([20, 10, 4], 2),
             ([3, 2, 6], 0),
         ] {
-            let stats = BucketedStats::new(0.99);
+            let stats = BucketedStats::default();
             let buckets = buckets();
             for (bucket, millis) in buckets.iter().zip(latencies) {
                 success(&stats, bucket, millis).await;
@@ -479,7 +525,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn health_is_soft_and_deadline_feasibility_comes_first() {
-        let stats = BucketedStats::new(0.99);
+        let stats = BucketedStats::default();
         let buckets = buckets();
         for (bucket, millis) in buckets.iter().zip([10, 60, 150]) {
             success(&stats, bucket, millis).await;
@@ -498,7 +544,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn elapsed_time_and_pre_failure_completions_do_not_restore_health() {
-        let stats = BucketedStats::new(0.99);
+        let stats = BucketedStats::default();
         let bucket = &buckets()[0];
         let old = (0..RECOVERY_SUCCESSES)
             .map(|_| stats.begin(bucket, None))
@@ -520,7 +566,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn probing_is_exclusive_and_a_success_preserves_failure_history() {
-        let stats = BucketedStats::new(0.99);
+        let stats = BucketedStats::default();
         let buckets = buckets();
         for (bucket, millis) in buckets.iter().zip([3, 5, 6]) {
             success(&stats, bucket, millis).await;
@@ -540,7 +586,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancellation_is_a_latency_lower_bound_not_a_health_failure() {
-        let stats = BucketedStats::new(0.99);
+        let stats = BucketedStats::default();
         let bucket = &buckets()[0];
         success(&stats, bucket, 100).await;
         let observation = stats.begin(bucket, None);
@@ -562,7 +608,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn concurrent_stalls_affect_routing_before_timeouts() {
-        let stats = BucketedStats::new(0.99);
+        let stats = BucketedStats::default();
         let buckets = buckets();
         for (bucket, millis) in buckets.iter().zip([3, 5, 6]) {
             success(&stats, bucket, millis).await;
@@ -580,7 +626,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn neutral_outcomes_do_not_create_failures_and_idle_remote_regions_are_not_probed() {
-        let stats = BucketedStats::new(0.99);
+        let stats = BucketedStats::default();
         let buckets = buckets();
         for (bucket, millis) in buckets.iter().zip([10, 60, 150]) {
             success(&stats, bucket, millis).await;

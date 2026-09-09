@@ -143,17 +143,16 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 .build();
             let downloader = Downloader::new(
                 aws_sdk_s3::Client::from_conf(config),
-                0.99,
+                scenario.limits(),
                 Arc::new(Mutex::new(SlidingThroughput::default())),
             )
-            .with_limits(scenario.limits())
             .unwrap();
             let buckets = BucketNameSet::new(
                 (0..scenario.replicas.len())
                     .map(|index| BucketName::new(format!("replica-{index}")).unwrap()),
             )
             .unwrap();
-            let range = 0..scenario.body_bytes as u64;
+            let range = 0..scenario.request_bytes();
             for (replica, bucket) in buckets.iter().enumerate() {
                 let singleton = BucketNameSet::new(std::iter::once(bucket.clone())).unwrap();
                 for warm in 0..scenario.warmup_per_replica {
@@ -162,7 +161,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     // deadline.
                     let calibration = downloader
                         .clone()
-                        .with_limits(super::DownloadLimits {
+                        .with_test_limits(super::DownloadLimits {
                             page_timeout: Duration::from_secs(60),
                             bucket_timeout: Duration::from_secs(60),
                             hedge_budget_percent: 0,
@@ -294,6 +293,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
 async fn simulation_guarantees() {
     for name in [
         "healthy_zonal",
+        "cold_regional_failover",
         "third_after_errors",
         "third_after_header_stalls",
         "third_after_body_stalls",
@@ -385,6 +385,23 @@ async fn simulation_repeatability_and_cancellation() {
         Some(&report.arrivals)
     );
     assert!(report.cancelled_transports >= report.arrivals);
+}
+
+#[tokio::test(start_paused = true)]
+async fn simulation_rescue_preserves_availability_and_work_under_overload() {
+    for (name, completed, attempts) in [
+        ("finite_capacity", 1806, 3100),
+        ("finite_capacity_sdk_retries", 1807, 3550),
+    ] {
+        let scenario = model::scenarios()
+            .into_iter()
+            .find(|scenario| scenario.name == name)
+            .unwrap();
+        let report = simulate(scenario, 7, false, false).await;
+        assert!(report.completed >= completed, "{name}: {report:?}");
+        assert!(report.transport_attempts <= attempts, "{name}: {report:?}");
+        assert!(report.service_us <= 24_000_000, "{name}: {report:?}");
+    }
 }
 
 #[tokio::test(start_paused = true)]

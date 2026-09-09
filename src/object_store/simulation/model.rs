@@ -72,6 +72,7 @@ pub struct Scenario {
     pub interval_ms: u64,
     pub warmup_per_replica: u32,
     pub body_bytes: usize,
+    pub request_bytes: Option<u64>,
     pub chunks: u32,
     pub jitter_percent: u32,
     pub replicas: Vec<Replica>,
@@ -95,6 +96,7 @@ impl Default for Scenario {
             interval_ms: 20,
             warmup_per_replica: 16,
             body_bytes: 1024,
+            request_bytes: None,
             chunks: 4,
             jitter_percent: 0,
             replicas: vec![
@@ -151,6 +153,11 @@ impl Scenario {
                 "invalid fault"
             );
         }
+        eyre::ensure!(
+            self.request_bytes() >= self.body_bytes as u64
+                && self.request_bytes() <= 16 * 1024 * 1024,
+            "requested range must cover the response and fit a cache page"
+        );
         self.limits().validate()
     }
 
@@ -161,8 +168,11 @@ impl Scenario {
             hedge_budget_percent: self.hedge_percent,
             max_inflight_requests: self.max_inflight_requests,
             max_inflight_bytes: self.max_inflight_bytes,
-            ..DownloadLimits::default()
         }
+    }
+
+    pub fn request_bytes(&self) -> u64 {
+        self.request_bytes.unwrap_or(self.body_bytes as u64)
     }
 
     pub fn reads(&self) -> usize {

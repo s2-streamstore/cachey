@@ -75,7 +75,6 @@ fn slice_page_data(
 #[derive(Debug)]
 pub struct ServiceConfig {
     pub cache: CacheConfig,
-    pub hedge_quantile: f64,
     pub download_limits: DownloadLimits,
 }
 
@@ -120,8 +119,7 @@ impl CacheyService {
         let cache = build_cache(config.cache).await?;
         let ingress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
         let egress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
-        let downloader = Downloader::new(s3, config.hedge_quantile, ingress_throughput.clone())
-            .with_limits(config.download_limits)?;
+        let downloader = Downloader::new(s3, config.download_limits, ingress_throughput.clone())?;
         Ok(Self {
             cache,
             downloader,
@@ -581,8 +579,12 @@ mod tests {
         let (endpoint, request_count, server_handle) =
             spawn_mock_s3_server(&bucket, &object, object_data, Duration::from_millis(50)).await;
         let s3 = mock_s3_client(&endpoint);
-        let downloader =
-            Downloader::new(s3, 0.9, Arc::new(Mutex::new(SlidingThroughput::default())));
+        let downloader = Downloader::new(
+            s3,
+            DownloadLimits::default(),
+            Arc::new(Mutex::new(SlidingThroughput::default())),
+        )
+        .unwrap();
         let cache = build_cache(CacheConfig {
             memory_size: ByteSize::mib(16),
             disk_cache: None,

@@ -7,16 +7,11 @@ use crate::types::BucketName;
 const HEDGE_COST: u32 = 100;
 const MAX_BUCKET_HEDGES: u16 = 2;
 
-#[derive(Debug, Default)]
-struct BucketBudget {
-    active: u16,
-}
-
 #[derive(Debug)]
 struct BudgetState {
     credits: u32,
     active: u16,
-    buckets: HashMap<BucketName, BucketBudget>,
+    buckets: HashMap<BucketName, u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,10 +52,10 @@ impl HedgeBudget {
             return None;
         }
         let budget = state.buckets.entry(bucket.clone()).or_default();
-        if budget.active >= MAX_BUCKET_HEDGES {
+        if *budget >= MAX_BUCKET_HEDGES {
             return None;
         }
-        budget.active += 1;
+        *budget += 1;
         state.active += 1;
         state.credits -= HEDGE_COST;
         Some(HedgePermit {
@@ -105,7 +100,7 @@ impl Drop for HedgePermit {
         let mut state = self.state.lock();
         state.active -= 1;
         if let Some(budget) = state.buckets.get_mut(&self.bucket) {
-            budget.active -= 1;
+            *budget -= 1;
         }
     }
 }

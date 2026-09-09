@@ -569,5 +569,113 @@
       }
     ],
     "hedge_percent": 5
+  },
+  {
+    "name": "cold_regional_failover",
+    "duration_ms": 12000,
+    "interval_ms": 1000,
+    "warmup_per_replica": 0,
+    "bucket_timeout_ms": 500,
+    "page_timeout_ms": 500,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 9
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 59
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 149
+      }
+    ],
+    "faults": [
+      {
+        "start_ms": 0,
+        "end_ms": 12000,
+        "replicas": [
+          0,
+          1
+        ],
+        "kind": "header_stall"
+      }
+    ]
+  },
+  {
+    "name": "healthy_zonal_page_admission",
+    "request_bytes": 16777216,
+    "hedge_percent": 5,
+    "interval_ms": 5
+  },
+  {
+    "name": "third_after_header_stalls_page_admission",
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1
+        ],
+        "kind": "header_stall"
+      }
+    ],
+    "request_bytes": 16777216,
+    "hedge_percent": 5,
+    "interval_ms": 5
+  },
+  {
+    "name": "regional_deadline_page_admission",
+    "page_timeout_ms": 500,
+    "bucket_timeout_ms": 500,
+    "replicas": [
+      {
+        "headers_ms": 10,
+        "body_ms": 0
+      },
+      {
+        "headers_ms": 60,
+        "body_ms": 0
+      },
+      {
+        "headers_ms": 150,
+        "body_ms": 0
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1
+        ],
+        "kind": "header_stall"
+      }
+    ],
+    "request_bytes": 16777216,
+    "hedge_percent": 5,
+    "interval_ms": 5
+  },
+  {
+    "name": "long_bodies_page_admission",
+    "duration_ms": 6000,
+    "interval_ms": 100,
+    "body_bytes": 1048576,
+    "warmup_per_replica": 2,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 3999
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 3999
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 3999
+      }
+    ],
+    "request_bytes": 16777216,
+    "hedge_percent": 5
   }
 ]

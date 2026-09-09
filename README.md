@@ -118,18 +118,12 @@ Options:
           Maximum disk cache capacity (e.g., "100GiB") If not specified, up to 80% of the available space will be used
       --iouring
           Use `io_uring` (if available) for disk IO
-      --hedge-quantile <HEDGE_QUANTILE>
-          Latency quantile for early hedges (0.0-1.0, use 0 to disable early hedging) [default: 0.99]
       --bucket-timeout-ms <BUCKET_TIMEOUT_MS>
           Maximum bucket download time through body validation, in milliseconds [default: 5000]
       --page-timeout-ms <PAGE_TIMEOUT_MS>
           Maximum page download time including fallback, in milliseconds [default: 10000]
-      --max-concurrent-hedges <MAX_CONCURRENT_HEDGES>
-          Maximum concurrent early hedges across all buckets (0 disables early hedging) [default: 16]
       --hedge-budget-percent <HEDGE_BUDGET_PERCENT>
-          Hedge allowance earned per successful page fetch, as a percentage [default: 5]
-      --max-inflight-requests <MAX_INFLIGHT_REQUESTS>
-          Maximum active backend requests, including speculative copies [default: 1024]
+          Hedge allowance per successful page fetch, as a percentage (0 disables early hedging) [default: 5]
       --max-download-memory <MAX_DOWNLOAD_MEMORY>
           Body memory reserved by active downloads, separate from the cache [default: 1GiB]
       --tls-self

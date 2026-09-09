@@ -50,7 +50,10 @@ All arrivals are scheduled against paused Tokio time in a current-thread runtime
 Futures share a task so test-only task-local hooks reach the real statistics code.
 Each destination is calibrated with real, healthy singleton downloads; calibration
 uses a generous deadline and is excluded from arrival/work counters. No synthetic
-latency or health is inserted. Calibration can be disabled with zero warmup reads.
+latency or health is inserted. Calibration can be disabled with zero warmup reads;
+`cold_regional_failover` exercises that case. `request_bytes` can exceed `body_bytes`
+to model page-sized admission for a small object. The `*_page_admission` fixtures
+reserve 16 MiB per copy, matching the server.
 
 Fault draws are keyed by seed, logical read, destination, invocation ordinal, SDK
 attempt, and fault index. Fully correlated faults omit destination and attempt.

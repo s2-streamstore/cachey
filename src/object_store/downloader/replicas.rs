@@ -6,12 +6,14 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
-use super::{DownloadError, DownloadOutput, Downloader, ObjectPiece, RequestConfig};
+use super::{
+    BucketOperation, DownloadError, DownloadOutput, Downloader, ObjectPiece, RequestConfig,
+};
 use crate::{
     object_store::{
         admission::DownloadPermit,
         hedging::HedgePermit,
-        stats::{Outcome, ProbePermit},
+        stats::{ProbePermit, RoutingSnapshot},
     },
     types::{BucketNameSet, ObjectKey},
 };
@@ -20,7 +22,7 @@ const MAX_CONCURRENT_COPIES: usize = 3;
 
 type Completion = (usize, Result<ObjectPiece, DownloadError>);
 
-struct AttemptPermits {
+pub(super) struct AttemptPermits {
     admission: DownloadPermit,
     hedge: Option<HedgePermit>,
 }
@@ -59,20 +61,8 @@ struct ReplicaRequest<'a> {
 }
 
 impl ReplicaRequest<'_> {
-    fn next_copy(&self, tried: &[bool], scheduled: Option<usize>) -> Option<usize> {
-        scheduled
-            .or_else(|| {
-                self.downloader
-                    .bucketed_stats
-                    .attempt_order(
-                        self.buckets,
-                        tried,
-                        self.deadline.saturating_duration_since(Instant::now()),
-                    )
-                    .first()
-                    .copied()
-            })
-            .filter(|index| !tried[*index])
+    fn unknown_latency(&self) -> Duration {
+        self.downloader.limits.page_timeout / u32::try_from(self.buckets.len()).unwrap_or(u32::MAX)
     }
 
     fn output(
@@ -100,69 +90,58 @@ impl ReplicaRequest<'_> {
         permits: Option<AttemptPermits>,
     ) -> Completion {
         let bucket = &self.buckets[index];
-        let expected = self.downloader.bucketed_stats.tail_latency(bucket);
-        let speculative = permits
-            .as_ref()
-            .is_some_and(|permits| permits.hedge.is_some());
-        let (_hedge, admission) = match permits {
-            Some(permits) => (permits.hedge, Ok(permits.admission)),
-            None => (
-                None,
-                self.downloader
-                    .admission
-                    .acquire(self.range.end - self.range.start, self.deadline)
-                    .await,
-            ),
+        let (hedge, admission) = match permits {
+            Some(permits) => (permits.hedge, Some(permits.admission)),
+            None => (None, None),
         };
-        let _admission = match admission {
-            Ok(permit) => permit,
-            Err(error) => return (index, Err(error)),
-        };
-        let now = Instant::now();
-        let deadline = now
-            + self
-                .downloader
-                .limits
-                .bucket_timeout
-                .min(self.deadline.saturating_duration_since(now));
-        if now >= deadline {
-            return (index, Err(DownloadError::AdmissionTimeout));
-        }
-        let _active = {
-            let mut progress = self.progress.lock();
-            if progress.started == 1 {
-                progress.secondary = Some(index);
-            }
-            progress.started += 1;
-            progress.hedged |= progress.active > 0;
-            progress.active += 1;
-            ActiveCopy(&self.progress)
-        };
-        let observation = self.downloader.bucketed_stats.begin(bucket, probe);
-        let budget = deadline.saturating_duration_since(Instant::now());
-        let hedge_config = RequestConfig {
+        let hedge_config = hedge.as_ref().map(|_| RequestConfig {
             max_attempts: Some(1),
             ..self.config.clone()
-        };
-        let config = if speculative {
-            &hedge_config
-        } else {
-            self.config
-        };
-        let result = select! {
-            biased;
-            () = sleep_until(deadline) => Err(DownloadError::Timeout { bucket: bucket.clone(), timeout: budget }),
-            result = self.downloader.fetch_piece(bucket, self.object, self.range, config) => result,
-        };
-        observation.complete(result.as_ref().map_or_else(
-            |error| error.health_outcome(budget, expected),
-            |_| Outcome::Success,
-        ));
+        });
+        let _hedge = hedge;
+        let config = hedge_config.as_ref().unwrap_or(self.config);
+        let result = BucketOperation {
+            downloader: self.downloader,
+            bucket,
+            deadline: self.deadline,
+            unknown_latency: self.unknown_latency(),
+            probe,
+        }
+        .execute(
+            async {
+                match admission {
+                    Some(permit) => Ok(permit),
+                    None => {
+                        self.downloader
+                            .admission
+                            .acquire(self.range.end - self.range.start, self.deadline)
+                            .await
+                    }
+                }
+            },
+            |_| async {
+                let _active = {
+                    let mut progress = self.progress.lock();
+                    if progress.started == 1 {
+                        progress.secondary = Some(index);
+                    }
+                    progress.started += 1;
+                    progress.hedged |= progress.active > 0;
+                    progress.active += 1;
+                    ActiveCopy(&self.progress)
+                };
+                self.downloader
+                    .fetch_piece(bucket, self.object, self.range, config)
+                    .await
+            },
+        )
+        .await;
         (index, result)
     }
 }
 
 impl Downloader {
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -181,22 +160,28 @@ impl Downloader {
             deadline,
             progress: parking_lot::Mutex::default(),
         };
+        let routing = self.bucketed_stats.snapshot(buckets);
         let PrimaryAttempt {
             index: primary,
             probe,
             permits: primary_permits,
             mut backup_admission,
         } = self.prepare_primary(
-            buckets,
             range.end - range.start,
             deadline.saturating_duration_since(Instant::now()),
+            &routing,
         );
         let mut tried = vec![false; buckets.len()];
         tried[primary] = true;
-        let mut rescues = self.rescue_schedule(buckets, primary, start, deadline, probe.is_some());
-        let threshold = self
-            .bucketed_stats
-            .hedging_threshold(&buckets[primary], start);
+        let mut rescues = self.rescue_schedule(
+            buckets.len(),
+            primary,
+            start,
+            deadline,
+            probe.is_some(),
+            &routing,
+        );
+        let threshold = routing.tail(primary).unwrap_or_default();
         let mut hedge_at = (!threshold.is_zero() && probe.is_none())
             .then(|| start + threshold.min(self.limits.page_timeout));
         let mut active: FuturesUnordered<BoxFuture<'_, Completion>> = FuturesUnordered::new();
@@ -207,9 +192,6 @@ impl Downloader {
             let next_hedge = hedge_at.unwrap_or(deadline);
             let (early, scheduled) = select! {
                 biased;
-                () = sleep_until(deadline) => return Err(DownloadError::Timeout {
-                    bucket: buckets[primary].clone(), timeout: self.limits.page_timeout,
-                }),
                 completion = active.next(), if !active.is_empty() => {
                     if let Some((index, result)) = completion {
                         match result {
@@ -231,9 +213,16 @@ impl Downloader {
                     (true, None)
                 },
             };
-            let overloaded = self.bucketed_stats.all_overloaded(buckets);
-            let allowed = active.len() < MAX_CONCURRENT_COPIES && !(early && overloaded);
-            let next = request.next_copy(&tried, scheduled);
+            let routing = self.bucketed_stats.snapshot(buckets);
+            let overloaded = routing.all_overloaded();
+            let allowed = Instant::now() < deadline
+                && active.len() < MAX_CONCURRENT_COPIES
+                && !(early && overloaded);
+            let next = scheduled
+                .or_else(|| {
+                    routing.best(&tried, deadline.saturating_duration_since(Instant::now()))
+                })
+                .filter(|index| !tried[*index]);
             if allowed && let Some(index) = next {
                 if overloaded && !self.overload_retry_budget.try_retry() {
                     if active.is_empty() {
@@ -266,7 +255,7 @@ impl Downloader {
         }))
     }
 
-    fn hedge_permits(
+    pub(super) fn hedge_permits(
         &self,
         bucket: &crate::types::BucketName,
         bytes: u64,
@@ -281,11 +270,11 @@ impl Downloader {
 
     fn prepare_primary(
         &self,
-        buckets: &BucketNameSet,
         bytes: u64,
         remaining: Duration,
+        routing: &RoutingSnapshot,
     ) -> PrimaryAttempt {
-        let (mut index, mut probe) = self.bucketed_stats.primary(buckets, remaining);
+        let (mut index, mut probe) = routing.primary(remaining);
         let mut backup_admission = None;
         let permits = if probe.is_some() {
             let pair = self.admission.try_acquire(bytes).and_then(|first| {
@@ -301,11 +290,7 @@ impl Downloader {
                 })
             } else {
                 probe = None;
-                index = self.bucketed_stats.attempt_order(
-                    buckets,
-                    &vec![false; buckets.len()],
-                    remaining,
-                )[0];
+                index = routing.best(&[], remaining).unwrap_or(index);
                 None
             }
         } else {
@@ -321,60 +306,66 @@ impl Downloader {
 
     fn rescue_schedule(
         &self,
-        buckets: &BucketNameSet,
+        bucket_count: usize,
         primary: usize,
         start: Instant,
         deadline: Instant,
         probing: bool,
+        routing: &RoutingSnapshot,
     ) -> VecDeque<(Instant, usize)> {
         let page_budget = deadline.saturating_duration_since(start);
-        let mut excluded = vec![false; buckets.len()];
-        excluded[primary] = true;
-        let alternatives = self
-            .bucketed_stats
-            .attempt_order(buckets, &excluded, page_budget);
-        let mut reserves: Vec<_> = alternatives
+        let mut alternatives = routing.alternatives(primary, page_budget);
+        alternatives.retain(|index| routing.tail(*index).is_none_or(|tail| tail < page_budget));
+        let unknown_latency = page_budget / u32::try_from(bucket_count).unwrap_or(u32::MAX);
+        let reserve_budget = page_budget / 3 * 2;
+        let reserves: Vec<_> = alternatives
             .iter()
             .map(|index| {
-                self.bucketed_stats
-                    .tail_latency(&buckets[*index])
-                    .saturating_mul(2)
+                routing
+                    .tail(*index)
+                    .map_or(unknown_latency, |tail| {
+                        tail.saturating_mul(2)
+                            .min(reserve_budget)
+                            .max(tail.saturating_add(Duration::from_millis(1)))
+                    })
                     .max(Duration::from_millis(20))
                     .min(self.limits.bucket_timeout)
+                    .min(page_budget)
             })
             .collect();
         let total = reserves
             .iter()
             .copied()
             .fold(Duration::ZERO, Duration::saturating_add);
-        let reserve_budget = page_budget / 3 * 2;
-        if total > reserve_budget && !total.is_zero() {
-            let scale = reserve_budget.as_secs_f64() / total.as_secs_f64();
-            for reserve in &mut reserves {
-                *reserve = reserve.mul_f64(scale);
-            }
-        }
-        let primary_tail = self
-            .bucketed_stats
-            .tail_latency(&buckets[primary])
+        let scale = if total > reserve_budget && !total.is_zero() {
+            reserve_budget.as_secs_f64() / total.as_secs_f64()
+        } else {
+            1.0
+        };
+        let primary_tail = routing
+            .tail(primary)
+            .unwrap_or_default()
             .min(self.limits.bucket_timeout)
             .min(page_budget);
-        let mut remaining = reserves
-            .iter()
-            .copied()
-            .fold(Duration::ZERO, Duration::saturating_add);
+        let mut remaining = total.mul_f64(scale);
         let mut schedule = Vec::with_capacity(reserves.len() + 1);
         for (index, reserve) in alternatives.iter().copied().zip(reserves) {
-            schedule.push((
-                start + page_budget.saturating_sub(remaining).max(primary_tail),
-                index,
-            ));
-            remaining = remaining.saturating_sub(reserve);
+            let latest_start = page_budget.saturating_sub(reserve);
+            let planned = page_budget.saturating_sub(remaining).max(primary_tail);
+            let expected = routing.tail(index).unwrap_or(reserve);
+            let at = if !routing.any_overloaded() && planned.saturating_add(expected) >= page_budget
+            {
+                planned.min(latest_start)
+            } else {
+                planned
+            };
+            schedule.push((start + at, index));
+            remaining = remaining.saturating_sub(reserve.mul_f64(scale));
         }
         if probing && let Some(index) = alternatives.first() {
-            let grace = self
-                .bucketed_stats
-                .tail_latency(&buckets[*index])
+            let grace = routing
+                .tail(*index)
+                .unwrap_or(unknown_latency)
                 .saturating_mul(2)
                 .max(Duration::from_millis(1));
             schedule.push((start + grace.min(page_budget), *index));
