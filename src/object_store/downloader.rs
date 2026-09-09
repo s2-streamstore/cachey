@@ -236,13 +236,7 @@ impl Downloader {
         })?;
         let output = if buckets.len() == 1 {
             let attempt = self
-                .attempt(
-                    &buckets[0],
-                    &object,
-                    byterange,
-                    req_config,
-                    start + self.limits.bucket_timeout.min(self.limits.page_timeout),
-                )
+                .attempt(&buckets[0], &object, byterange, req_config, deadline)
                 .await;
             DownloadOutput {
                 piece: attempt.result?,
@@ -293,8 +287,14 @@ impl Downloader {
                 };
             }
         };
+        let now = Instant::now();
+        let timeout = self
+            .limits
+            .bucket_timeout
+            .min(deadline.saturating_duration_since(now));
+        let deadline = now + timeout;
         let expected = self.bucketed_stats.tail_latency(bucket);
-        if Instant::now() >= deadline {
+        if now >= deadline {
             return BucketAttempt {
                 result: Err(DownloadError::AdmissionTimeout),
                 hedged: false,

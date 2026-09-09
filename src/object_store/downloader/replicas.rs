@@ -59,6 +59,22 @@ struct ReplicaRequest<'a> {
 }
 
 impl ReplicaRequest<'_> {
+    fn next_copy(&self, tried: &[bool], scheduled: Option<usize>) -> Option<usize> {
+        scheduled
+            .or_else(|| {
+                self.downloader
+                    .bucketed_stats
+                    .attempt_order(
+                        self.buckets,
+                        tried,
+                        self.deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .first()
+                    .copied()
+            })
+            .filter(|index| !tried[*index])
+    }
+
     fn output(
         &self,
         piece: ObjectPiece,
@@ -84,13 +100,6 @@ impl ReplicaRequest<'_> {
         permits: Option<AttemptPermits>,
     ) -> Completion {
         let bucket = &self.buckets[index];
-        let now = Instant::now();
-        let deadline = now
-            + self
-                .downloader
-                .limits
-                .bucket_timeout
-                .min(self.deadline.saturating_duration_since(now));
         let expected = self.downloader.bucketed_stats.tail_latency(bucket);
         let speculative = permits
             .as_ref()
@@ -101,7 +110,7 @@ impl ReplicaRequest<'_> {
                 None,
                 self.downloader
                     .admission
-                    .acquire(self.range.end - self.range.start, deadline)
+                    .acquire(self.range.end - self.range.start, self.deadline)
                     .await,
             ),
         };
@@ -109,7 +118,14 @@ impl ReplicaRequest<'_> {
             Ok(permit) => permit,
             Err(error) => return (index, Err(error)),
         };
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        let deadline = now
+            + self
+                .downloader
+                .limits
+                .bucket_timeout
+                .min(self.deadline.saturating_duration_since(now));
+        if now >= deadline {
             return (index, Err(DownloadError::AdmissionTimeout));
         }
         let _active = {
@@ -187,9 +203,9 @@ impl Downloader {
         active.push(request.attempt(primary, probe, primary_permits).boxed());
         let mut last_error = None;
         loop {
-            let next_rescue = rescues.front().copied().unwrap_or(deadline);
+            let next_rescue = rescues.front().map_or(deadline, |(at, _)| *at);
             let next_hedge = hedge_at.unwrap_or(deadline);
-            let early = select! {
+            let (early, scheduled) = select! {
                 biased;
                 () = sleep_until(deadline) => return Err(DownloadError::Timeout {
                     bucket: buckets[primary].clone(), timeout: self.limits.page_timeout,
@@ -205,26 +221,20 @@ impl Downloader {
                             }
                         }
                     }
-                    false
+                    (false, None)
                 },
                 () = sleep_until(next_rescue), if !rescues.is_empty() => {
-                    rescues.pop_front();
-                    false
+                    (false, rescues.pop_front().map(|(_, index)| index))
                 },
                 () = sleep_until(next_hedge), if hedge_at.is_some() => {
                     hedge_at = None;
-                    true
+                    (true, None)
                 },
             };
-            let now = Instant::now();
             let overloaded = self.bucketed_stats.all_overloaded(buckets);
             let allowed = active.len() < MAX_CONCURRENT_COPIES && !(early && overloaded);
-            let order = self.bucketed_stats.attempt_order(
-                buckets,
-                &tried,
-                deadline.saturating_duration_since(now),
-            );
-            if allowed && let Some(index) = order.first().copied() {
+            let next = request.next_copy(&tried, scheduled);
+            if allowed && let Some(index) = next {
                 if overloaded && !self.overload_retry_budget.try_retry() {
                     if active.is_empty() {
                         break;
@@ -316,7 +326,7 @@ impl Downloader {
         start: Instant,
         deadline: Instant,
         probing: bool,
-    ) -> VecDeque<Instant> {
+    ) -> VecDeque<(Instant, usize)> {
         let page_budget = deadline.saturating_duration_since(start);
         let mut excluded = vec![false; buckets.len()];
         excluded[primary] = true;
@@ -354,8 +364,11 @@ impl Downloader {
             .copied()
             .fold(Duration::ZERO, Duration::saturating_add);
         let mut schedule = Vec::with_capacity(reserves.len() + 1);
-        for reserve in reserves {
-            schedule.push(start + page_budget.saturating_sub(remaining).max(primary_tail));
+        for (index, reserve) in alternatives.iter().copied().zip(reserves) {
+            schedule.push((
+                start + page_budget.saturating_sub(remaining).max(primary_tail),
+                index,
+            ));
             remaining = remaining.saturating_sub(reserve);
         }
         if probing && let Some(index) = alternatives.first() {
@@ -364,7 +377,7 @@ impl Downloader {
                 .tail_latency(&buckets[*index])
                 .saturating_mul(2)
                 .max(Duration::from_millis(1));
-            schedule.push(start + grace.min(page_budget));
+            schedule.push((start + grace.min(page_budget), *index));
         }
         schedule.sort_unstable();
         schedule.into()

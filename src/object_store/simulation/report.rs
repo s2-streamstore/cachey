@@ -125,6 +125,7 @@ impl Report {
         trace: bool,
         reads: Vec<Read>,
         copies: Vec<Copy>,
+        peak_copies: usize,
         state: &State,
         last_read_us: u64,
         mut histograms: Vec<(u64, usize)>,
@@ -140,18 +141,7 @@ impl Report {
             }
         }
         let completed = reads.iter().filter(|read| read.error.is_none()).count();
-        let mut copy_events: Vec<_> = copies
-            .iter()
-            .flat_map(|copy| [(copy.start_us, 1_i64), (copy.end_us, -1)])
-            .collect();
-        copy_events.sort_unstable();
-        let mut active = 0_i64;
-        let mut peak = 0;
-        for (_, delta) in copy_events {
-            active += delta;
-            peak = peak.max(active);
-        }
-        assert_eq!(active, 0);
+        assert!(peak_copies <= scenario.max_inflight_requests as usize);
         let service_after = |transport: &Transport, time: u64| {
             transport.service_start_us.map_or(0, |start| {
                 transport
@@ -239,7 +229,7 @@ impl Report {
                 .iter()
                 .filter(|transport| transport.attempt == 1)
                 .count(),
-            peak_copy_operations: peak as usize,
+            peak_copy_operations: peak_copies,
             peak_transport_concurrency: state.peak_client,
             peak_server_concurrency: state.peak_server,
             peak_server_queue: state.peak_queued,

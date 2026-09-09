@@ -469,5 +469,32 @@
         "queue": 4
       }
     ]
+  },
+  {
+    "name": "finite_capacity_cancel_immediate",
+    "duration_ms": 3000,
+    "interval_ms": 5,
+    "cancel_read_after_ms": 20,
+    "cancellation_lag_ms": 0,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 40,
+        "slots": 1,
+        "queue": 4
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 40,
+        "slots": 1,
+        "queue": 4
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 40,
+        "slots": 1,
+        "queue": 4
+      }
+    ]
   }
 ]

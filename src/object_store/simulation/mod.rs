@@ -30,6 +30,8 @@ struct ControlState {
     epoch: Instant,
     recovery_draw: u64,
     copies: Vec<Copy>,
+    active_copies: usize,
+    peak_copies: usize,
 }
 
 tokio::task_local! { static CONTROLS: Arc<Controls>; }
@@ -61,6 +63,7 @@ impl Drop for CopyGuard {
         let mut state = self.controls.state.lock();
         let now = state.epoch.elapsed().as_micros() as u64;
         state.copies[self.index].end_us = now;
+        state.active_copies -= 1;
     }
 }
 
@@ -80,6 +83,8 @@ pub(super) fn record_copy(object: &ObjectKey, bucket: &BucketName) -> Option<Cop
             let mut state = controls.state.lock();
             let index = state.copies.len();
             let start_us = state.epoch.elapsed().as_micros() as u64;
+            state.active_copies += 1;
+            state.peak_copies = state.peak_copies.max(state.active_copies);
             state.copies.push(Copy {
                 read,
                 replica,
@@ -105,6 +110,8 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
             epoch: Instant::now(),
             recovery_draw: 0,
             copies: vec![],
+            active_copies: 0,
+            peak_copies: 0,
         }),
     });
     CONTROLS
@@ -178,6 +185,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 let mut state = controls.state.lock();
                 state.epoch = epoch;
                 state.copies.clear();
+                state.peak_copies = 0;
             }
             let reads = futures::future::join_all((0..scenario.reads()).map(|id| {
                 let downloader = &downloader;
@@ -252,7 +260,11 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     "exact-retention histogram evicted samples"
                 );
             }
-            let copies = controls.state.lock().copies.clone();
+            let (copies, peak_copies) = {
+                let state = controls.state.lock();
+                assert_eq!(state.active_copies, 0);
+                (state.copies.clone(), state.peak_copies)
+            };
             Report::new(
                 (*scenario).clone(),
                 seed,
@@ -260,6 +272,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 trace,
                 reads,
                 copies,
+                peak_copies,
                 &backend.state.lock(),
                 client_finished_us,
                 histograms,
@@ -311,6 +324,18 @@ async fn simulation_guarantees() {
         if name == "delayed_cancellation" {
             assert!(report.post_read_service_us >= 40_000);
         }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn simulation_reservations_survive_reordering_and_admission_wait() {
+    for name in ["regional_deadline", "queued_long_read"] {
+        let scenario = model::scenarios()
+            .into_iter()
+            .find(|scenario| scenario.name == name)
+            .unwrap();
+        let report = simulate(scenario, 7, false, true).await;
+        assert_eq!(report.completed, report.arrivals, "{name}: {report:?}");
     }
 }
 

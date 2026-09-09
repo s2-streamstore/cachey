@@ -296,11 +296,13 @@ impl HttpConnector for Backend {
         if !rejected {
             state.outstanding[replica] += 1;
             state.queued += 1;
-            state.peak_queued = state.peak_queued.max(
-                state
-                    .queued
-                    .saturating_sub(self.slots[replica].available_permits()),
-            );
+            let queued = state
+                .outstanding
+                .iter()
+                .zip(&self.scenario.replicas)
+                .map(|(outstanding, replica)| outstanding.saturating_sub(replica.slots as usize))
+                .sum();
+            state.peak_queued = state.peak_queued.max(queued);
         }
         drop(state);
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
