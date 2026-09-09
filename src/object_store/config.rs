@@ -78,14 +78,7 @@ pub struct RequestConfig {
 impl RequestConfig {
     #[must_use]
     pub fn is_noop(&self) -> bool {
-        self.connect_timeout.is_none()
-            && self.read_timeout.is_none()
-            && self.operation_timeout.is_none()
-            && self.operation_attempt_timeout.is_none()
-            && self.max_attempts.is_none()
-            && self.initial_backoff.is_none()
-            && self.max_backoff.is_none()
-            && self.force_path_style.is_none()
+        self == &Self::default()
     }
 
     fn has_timeout_overrides(&self) -> bool {
