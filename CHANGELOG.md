@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/s2-streamstore/cachey/compare/0.10.15...0.11.0) - 2026-09-09
+
+### Fixed
+
+- allow reads from the final addressable page ([#140](https://github.com/s2-streamstore/cachey/pull/140))
+- [**breaking**] prioritize replica availability and bound downloads ([#139](https://github.com/s2-streamstore/cachey/pull/139))
+
+### Other
+
+- *(deps)* update dependencies within seven-day cooldown ([#141](https://github.com/s2-streamstore/cachey/pull/141))
+- add Rust dependency cooldown gate ([#135](https://github.com/s2-streamstore/cachey/pull/135))
+
 ## [0.10.15](https://github.com/s2-streamstore/cachey/compare/0.10.14...0.10.15) - 2026-08-22
 
 ### Other
