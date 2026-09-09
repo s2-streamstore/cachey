@@ -156,14 +156,33 @@ pub(super) struct BucketObservation {
     started: Instant,
     generation: u64,
     probe: Option<ProbePermit>,
-    completed: bool,
+    outcome: Option<Outcome>,
 }
 
 impl BucketObservation {
     pub fn complete(mut self, outcome: Outcome) {
+        self.outcome = Some(outcome);
+    }
+}
+
+impl Drop for BucketObservation {
+    fn drop(&mut self) {
         let mut stats = self.stats.lock();
+        if let Some(count) = stats.active.get_mut(&self.started) {
+            *count -= 1;
+            if *count == 0 {
+                stats.active.remove(&self.started);
+            }
+        }
         let now = Instant::now();
         let latency = now.duration_since(self.started);
+        let Some(outcome) = self.outcome else {
+            let increase = latency
+                .saturating_sub(stats.routing_latency)
+                .mul_f64(LATENCY_ALPHA);
+            stats.routing_latency += increase;
+            return;
+        };
         let error_rate = stats.error_rate(now);
         match outcome {
             Outcome::Success => {
@@ -215,28 +234,6 @@ impl BucketObservation {
                 }
             }
             Outcome::Neutral => {}
-        }
-        self.completed = true;
-    }
-}
-
-impl Drop for BucketObservation {
-    fn drop(&mut self) {
-        let mut stats = self.stats.lock();
-        if let Some(count) = stats.active.get_mut(&self.started) {
-            *count -= 1;
-            if *count == 0 {
-                stats.active.remove(&self.started);
-            }
-        }
-        if !self.completed {
-            let elapsed = self.started.elapsed();
-            if elapsed > stats.routing_latency {
-                let increase = elapsed
-                    .saturating_sub(stats.routing_latency)
-                    .mul_f64(LATENCY_ALPHA);
-                stats.routing_latency += increase;
-            }
         }
     }
 }
@@ -433,7 +430,7 @@ impl BucketedStats {
             started,
             generation,
             probe,
-            completed: false,
+            outcome: None,
         }
     }
 
@@ -511,20 +508,25 @@ impl BucketedStats {
 
     pub fn export_bucket_metrics(&self, mut f: impl FnMut(&BucketName, &BucketMetrics)) {
         let now = Instant::now();
-        for entry in self.by_bucket.iter() {
-            let mut stats = entry.value().lock();
-            let snapshot = stats.snapshot(now);
-            f(
-                entry.key(),
-                &BucketMetrics {
+        let metrics: Vec<_> = self
+            .by_bucket
+            .iter()
+            .map(|entry| {
+                let mut stats = entry.value().lock();
+                let snapshot = stats.snapshot(now);
+                let metrics = BucketMetrics {
                     error_rate: stats.error_rate(now),
                     deprioritized: stats.deprioritized,
                     consecutive_failures: stats.consecutive_failures,
                     recovery_successes: stats.recovery_successes,
                     latency_mean: snapshot.mean,
                     latency_hedge: snapshot.tail.unwrap_or_default(),
-                },
-            );
+                };
+                (entry.key().clone(), metrics)
+            })
+            .collect();
+        for (bucket, metrics) in metrics {
+            f(&bucket, &metrics);
         }
     }
 }
@@ -662,6 +664,64 @@ mod tests {
         assert!(state.routing_latency > Duration::from_millis(100));
         assert!(!state.deprioritized);
         assert!(state.active.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_and_cancelled_observations_release_shared_start_times_once() {
+        let stats = BucketedStats::default();
+        let bucket = &buckets()[0];
+        success(&stats, bucket, 100).await;
+        let neutral = stats.begin(bucket, None);
+        let completed = stats.begin(bucket, None);
+        let cancelled = stats.begin(bucket, None);
+        let entry = stats.entry(bucket);
+        assert_eq!(
+            entry.lock().active.values().copied().collect::<Vec<_>>(),
+            [3]
+        );
+
+        advance(Duration::from_millis(200)).await;
+        neutral.complete(Outcome::Neutral);
+        {
+            let state = entry.lock();
+            assert_eq!(state.routing_latency, Duration::from_millis(100));
+            assert_eq!(state.histogram.snapshot().count(), 1);
+            assert_eq!(state.active.values().copied().sum::<usize>(), 2);
+        }
+        completed.complete(Outcome::Success);
+        {
+            let state = entry.lock();
+            assert_eq!(state.routing_latency, Duration::from_millis(110));
+            assert_eq!(state.histogram.snapshot().count(), 2);
+            assert_eq!(state.active.values().copied().sum::<usize>(), 1);
+        }
+        drop(cancelled);
+        let state = entry.lock();
+        assert_eq!(state.routing_latency, Duration::from_millis(119));
+        assert_eq!(state.histogram.snapshot().count(), 2);
+        assert!(state.active.is_empty());
+        assert!(!state.deprioritized);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metrics_callbacks_run_without_holding_statistics_locks() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for bucket in buckets.iter() {
+            success(&stats, bucket, 3).await;
+        }
+        let mut exported = 0;
+        stats.export_bucket_metrics(|bucket, metrics| {
+            assert_eq!(metrics.latency_mean, Duration::from_millis(3));
+            let entry = stats
+                .by_bucket
+                .try_get_mut(bucket)
+                .try_unwrap()
+                .expect("metrics callbacks must not hold a map lock");
+            assert!(entry.value().try_lock().is_some());
+            exported += 1;
+        });
+        assert_eq!(exported, buckets.len());
     }
 
     #[tokio::test(start_paused = true)]

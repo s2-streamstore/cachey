@@ -179,10 +179,19 @@ struct BucketOperation<'a> {
 impl BucketOperation<'_> {
     async fn execute<T, F: Future<Output = Result<T, DownloadError>>>(
         self,
-        admission: impl Future<Output = Result<DownloadPermit, DownloadError>>,
+        bytes: u64,
+        admission: Option<DownloadPermit>,
         fetch: impl FnOnce(Instant) -> F,
     ) -> Result<T, DownloadError> {
-        let _admission = admission.await?;
+        let _admission = match admission {
+            Some(permit) => permit,
+            None => {
+                self.downloader
+                    .admission
+                    .acquire(bytes, self.deadline)
+                    .await?
+            }
+        };
         let now = Instant::now();
         let budget = self
             .downloader
@@ -315,11 +324,9 @@ impl Downloader {
             unknown_latency: self.limits.page_timeout,
             probe: None,
         }
-        .execute(
-            self.admission
-                .acquire(byterange.end - byterange.start, deadline),
-            |deadline| self.fetch_with_hedge(bucket, object, byterange, config, deadline),
-        )
+        .execute(byterange.end - byterange.start, None, |deadline| {
+            self.fetch_with_hedge(bucket, object, byterange, config, deadline)
+        })
         .await
     }
 

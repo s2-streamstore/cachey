@@ -107,34 +107,21 @@ impl ReplicaRequest<'_> {
             unknown_latency: self.unknown_latency(),
             probe,
         }
-        .execute(
-            async {
-                match admission {
-                    Some(permit) => Ok(permit),
-                    None => {
-                        self.downloader
-                            .admission
-                            .acquire(self.range.end - self.range.start, self.deadline)
-                            .await
-                    }
+        .execute(self.range.end - self.range.start, admission, |_| async {
+            let _active = {
+                let mut progress = self.progress.lock();
+                if progress.started == 1 {
+                    progress.secondary = Some(index);
                 }
-            },
-            |_| async {
-                let _active = {
-                    let mut progress = self.progress.lock();
-                    if progress.started == 1 {
-                        progress.secondary = Some(index);
-                    }
-                    progress.started += 1;
-                    progress.hedged |= progress.active > 0;
-                    progress.active += 1;
-                    ActiveCopy(&self.progress)
-                };
-                self.downloader
-                    .fetch_piece(bucket, self.object, self.range, config)
-                    .await
-            },
-        )
+                progress.started += 1;
+                progress.hedged |= progress.active > 0;
+                progress.active += 1;
+                ActiveCopy(&self.progress)
+            };
+            self.downloader
+                .fetch_piece(bucket, self.object, self.range, config)
+                .await
+        })
         .await;
         (index, result)
     }
