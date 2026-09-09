@@ -47,28 +47,18 @@ fn slice_page_data(
     value: &CacheValue,
 ) -> Result<(Bytes, Range<u64>), ServiceError> {
     let page_start = u64::from(page_id) * PAGE_SIZE;
-    let data_len = value.data.len();
-    let mut range_start = page_start;
-    let mut range_end = page_start + data_len as u64;
-    let mut start_offset = 0;
-    let mut end_offset = data_len;
-    let pagerange = pagerange(byterange);
-    if page_id == *pagerange.start() {
-        start_offset = (byterange.start - page_start) as usize;
-        if start_offset >= data_len {
-            return Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
-                requested: byterange.clone(),
-                object_size: Some(value.object_size),
-            }));
-        }
-        range_start = byterange.start;
+    let range =
+        byterange.start.max(page_start)..byterange.end.min(page_start + value.data.len() as u64);
+    if range.is_empty() {
+        return Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
+            requested: byterange.clone(),
+            object_size: Some(value.object_size),
+        }));
     }
-    if page_id == *pagerange.end() {
-        end_offset = ((byterange.end - page_start) as usize).min(end_offset);
-        range_end = page_start + end_offset as u64;
-    }
+    let start_offset = (range.start - page_start) as usize;
+    let end_offset = (range.end - page_start) as usize;
     let data = value.data.slice(start_offset..end_offset);
-    Ok((data, range_start..range_end))
+    Ok((data, range))
 }
 
 #[derive(Debug)]

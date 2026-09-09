@@ -425,14 +425,13 @@ impl Downloader {
         else {
             return Err(invalid_range());
         };
-        let requested_last_byte = req_range.end - 1;
-        let exact_end = content_range.last_byte == requested_last_byte;
-        let truncated_at_eof = content_range.last_byte < requested_last_byte
-            && content_range.last_byte == content_range.complete_length.saturating_sub(1);
-        if content_range.first_byte != req_range.start || !(exact_end || truncated_at_eof) {
+        let expected_end = req_range.end.min(content_range.complete_length);
+        if content_range.first_byte != req_range.start
+            || content_range.last_byte + 1 != expected_end
+        {
             return Err(invalid_range());
         }
-        let expected_data_len = content_range.last_byte - content_range.first_byte + 1;
+        let expected_data_len = expected_end - req_range.start;
         let object_size = content_range.complete_length;
         let mtime = output
             .last_modified()
@@ -662,6 +661,7 @@ mod tests {
         for header in [
             None,
             Some("bytes 1-10/100"),
+            Some("bytes 0-4/100"),
             Some("bytes 0-99/100"),
             Some("bytes */50"),
         ] {

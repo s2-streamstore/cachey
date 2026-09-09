@@ -777,7 +777,7 @@ async fn test_fetch_endpoint_multi_page_range() {
 async fn test_fetch_endpoint_multi_page_trailers_past_eof() {
     let ctx = setup_test_server().await;
 
-    let object_size = 3 * PAGE_SIZE as usize;
+    let object_size = 2 * PAGE_SIZE as usize + 123;
     let mut test_data = BytesMut::zeroed(object_size);
     for (i, byte) in test_data.iter_mut().enumerate() {
         *byte = (i % 256) as u8;
@@ -849,7 +849,7 @@ async fn test_fetch_endpoint_multi_page_trailers_past_eof() {
             format!(
                 "{}-{}; {}; 0",
                 page * PAGE_SIZE,
-                (page + 1) * PAGE_SIZE - 1,
+                ((page + 1) * PAGE_SIZE).min(object_size as u64) - 1,
                 ctx.bucket_name
             )
         })
