@@ -249,7 +249,7 @@ impl Downloader {
             bucketed_stats: BucketedStats::default(),
             throughput,
             limits,
-            attempt_budget: AttemptBudget::new(16, limits.hedge_budget_percent),
+            attempt_budget: AttemptBudget::new(limits.hedge_budget_percent),
             admission: Arc::new(DownloadAdmission::new(limits)),
         })
     }
@@ -288,9 +288,18 @@ impl Downloader {
             DownloadError::Unknown("Page timeout exceeds the clock's supported range".to_owned())
         })?;
         let output = if buckets.len() == 1 {
-            let (piece, hedged) = self
-                .attempt(&buckets[0], &object, byterange, req_config, deadline)
-                .await?;
+            let bucket = &buckets[0];
+            let (piece, hedged) = BucketOperation {
+                downloader: self,
+                bucket,
+                deadline,
+                unknown_latency: self.limits.page_timeout,
+                probe: None,
+            }
+            .execute(byterange.end - byterange.start, None, |deadline| {
+                self.fetch_with_hedge(bucket, &object, byterange, req_config, deadline)
+            })
+            .await?;
             DownloadOutput {
                 piece,
                 primary_bucket_idx: 0,
@@ -304,27 +313,6 @@ impl Downloader {
         };
         self.attempt_budget.observe_success();
         Ok(output)
-    }
-
-    async fn attempt(
-        &self,
-        bucket: &BucketName,
-        object: &ObjectKey,
-        byterange: &Range<u64>,
-        config: &RequestConfig,
-        deadline: Instant,
-    ) -> Result<(ObjectPiece, bool), DownloadError> {
-        BucketOperation {
-            downloader: self,
-            bucket,
-            deadline,
-            unknown_latency: self.limits.page_timeout,
-            probe: None,
-        }
-        .execute(byterange.end - byterange.start, None, |deadline| {
-            self.fetch_with_hedge(bucket, object, byterange, config, deadline)
-        })
-        .await
     }
 
     async fn fetch_with_hedge(
@@ -391,28 +379,15 @@ impl Downloader {
     ) -> Result<ObjectPiece, DownloadError> {
         #[cfg(test)]
         let _simulation_copy = crate::object_store::simulation::record_copy(object, bucket);
-        let result = self
-            .attempt_inner(bucket, object, byterange, req_config)
-            .await;
-        self.handle_result(byterange, result).await
-    }
-
-    async fn attempt_inner(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        byterange: &Range<u64>,
-        req_config: &RequestConfig,
-    ) -> GetObjectResult {
         let request = self
             .s3
             .get_object()
             .bucket(&**bucket)
-            .key(&**key)
+            .key(&**object)
             .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
 
-        if req_config.is_noop() {
+        let result = if req_config.is_noop() {
             request.send().await.map_err(Box::new)
         } else {
             let client_config = self.s3.config();
@@ -436,7 +411,8 @@ impl Downloader {
                 .send()
                 .await
                 .map_err(Box::new)
-        }
+        };
+        self.handle_result(byterange, result).await
     }
 
     async fn handle_result(
@@ -535,8 +511,7 @@ mod tests {
     use tokio::time::{advance, sleep, timeout};
 
     use super::{
-        AttemptBudget, BucketMetrics, DownloadError, DownloadLimits, DownloadOutput, Downloader,
-        RequestConfig,
+        BucketMetrics, DownloadError, DownloadLimits, DownloadOutput, Downloader, RequestConfig,
     };
     use crate::{
         service::SlidingThroughput,
@@ -1060,13 +1035,16 @@ mod tests {
             ("bucket", 10, 190, false),
             ("bucket", 10, 20, false),
         ]);
-        let mut downloader = downloader
+        let downloader = downloader
             .with_test_limits(DownloadLimits {
                 hedge_budget_percent: 100,
                 ..DownloadLimits::default()
             })
             .unwrap();
-        downloader.attempt_budget = AttemptBudget::new(1, 100);
+        let _occupied = downloader
+            .attempt_budget
+            .try_hedge(&BucketName::new("bucket").unwrap())
+            .unwrap();
         fetch(&downloader, &["bucket"]).await;
         assert!(
             timeout(Duration::from_millis(150), fetch(&downloader, &["bucket"]))

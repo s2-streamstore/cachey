@@ -5,7 +5,8 @@ use parking_lot::Mutex;
 use crate::types::BucketName;
 
 const ATTEMPT_COST: u32 = 100;
-const MAX_RETRY_CREDITS: u32 = 16 * ATTEMPT_COST;
+const MAX_HEDGES: u16 = 16;
+const MAX_CREDITS: u32 = MAX_HEDGES as u32 * ATTEMPT_COST;
 const MAX_BUCKET_HEDGES: u16 = 2;
 
 #[derive(Debug)]
@@ -19,12 +20,11 @@ struct BudgetState {
 #[derive(Debug, Clone)]
 pub(super) struct AttemptBudget {
     state: Arc<Mutex<BudgetState>>,
-    max_hedges: u16,
     hedge_credit: u8,
 }
 
 impl AttemptBudget {
-    pub fn new(max_hedges: u16, hedge_credit: u8) -> Self {
+    pub fn new(hedge_credit: u8) -> Self {
         Self {
             state: Arc::new(Mutex::new(BudgetState {
                 hedge_credits: ATTEMPT_COST,
@@ -32,24 +32,22 @@ impl AttemptBudget {
                 active_hedges: 0,
                 active_by_bucket: HashMap::new(),
             })),
-            max_hedges,
             hedge_credit,
         }
     }
 
     pub fn observe_success(&self) {
         let mut state = self.state.lock();
-        state.hedge_credits = (state.hedge_credits + u32::from(self.hedge_credit))
-            .min(u32::from(self.max_hedges) * ATTEMPT_COST);
-        state.retry_credits = (state.retry_credits + 10).min(MAX_RETRY_CREDITS);
+        state.hedge_credits = (state.hedge_credits + u32::from(self.hedge_credit)).min(MAX_CREDITS);
+        state.retry_credits = (state.retry_credits + 10).min(MAX_CREDITS);
     }
 
     pub fn try_hedge(&self, bucket: &BucketName) -> Option<HedgePermit> {
-        if self.max_hedges == 0 || self.hedge_credit == 0 {
+        if self.hedge_credit == 0 {
             return None;
         }
         let mut state = self.state.lock();
-        if state.active_hedges >= self.max_hedges || state.hedge_credits < ATTEMPT_COST {
+        if state.active_hedges >= MAX_HEDGES || state.hedge_credits < ATTEMPT_COST {
             return None;
         }
         let budget = state.active_by_bucket.entry(bucket.clone()).or_default();
@@ -100,7 +98,7 @@ mod tests {
 
     #[test]
     fn startup_and_earned_hedges_are_shared_across_buckets_and_clones() {
-        let budget = AttemptBudget::new(16, 5);
+        let budget = AttemptBudget::new(5);
         let first = BucketName::new("first").unwrap();
         let second = BucketName::new("second").unwrap();
         drop(budget.try_hedge(&first).unwrap());
@@ -116,49 +114,45 @@ mod tests {
 
     #[test]
     fn concurrency_caps_apply_even_when_more_successes_replenish_credits() {
-        for (global_limit, buckets) in [
-            (1, ["first", "second", "third"]),
-            (16, ["bucket", "bucket", "bucket"]),
+        for names in [
+            (0..17).map(|index| format!("bucket-{index}")).collect(),
+            vec!["bucket".to_owned(); 3],
         ] {
-            let budget = AttemptBudget::new(global_limit, 100);
-            let buckets = buckets.map(|name| BucketName::new(name).unwrap());
-            for _ in &buckets {
+            let budget = AttemptBudget::new(100);
+            let buckets: Vec<_> = names
+                .into_iter()
+                .map(|name| BucketName::new(name).unwrap())
+                .collect();
+            let (next, initial) = buckets.split_last().unwrap();
+            let mut permits = Vec::new();
+            for bucket in initial {
                 budget.observe_success();
+                permits.push(budget.try_hedge(bucket).unwrap());
             }
-            let first = budget.try_hedge(&buckets[0]).unwrap();
-            let second = if global_limit > 1 {
-                Some(budget.try_hedge(&buckets[1]).unwrap())
-            } else {
-                None
-            };
-            for _ in &buckets {
-                budget.observe_success();
-            }
-            assert!(budget.try_hedge(&buckets[2]).is_none());
-            drop(first);
-            assert!(budget.try_hedge(&buckets[2]).is_some());
-            drop(second);
+            budget.observe_success();
+            assert!(budget.try_hedge(next).is_none());
+            drop(permits.pop());
+            assert!(budget.try_hedge(next).is_some());
         }
     }
 
     #[test]
-    fn zero_hedge_limits_preserve_overload_retries() {
+    fn disabling_hedges_preserves_overload_retries() {
         let bucket = BucketName::new("bucket").unwrap();
-        for budget in [AttemptBudget::new(0, 5), AttemptBudget::new(16, 0)] {
-            assert!(budget.try_retry());
-            assert!(!budget.try_retry());
-            for _ in 0..10 {
-                budget.observe_success();
-            }
-            assert!(budget.try_hedge(&bucket).is_none());
-            assert!(budget.try_retry());
-            assert!(!budget.try_retry());
+        let budget = AttemptBudget::new(0);
+        assert!(budget.try_retry());
+        assert!(!budget.try_retry());
+        for _ in 0..10 {
+            budget.observe_success();
         }
+        assert!(budget.try_hedge(&bucket).is_none());
+        assert!(budget.try_retry());
+        assert!(!budget.try_retry());
     }
 
     #[test]
     fn hedges_and_overload_retries_keep_separate_allowances() {
-        let budget = AttemptBudget::new(16, 5);
+        let budget = AttemptBudget::new(5);
         let bucket = BucketName::new("bucket").unwrap();
         drop(budget.try_hedge(&bucket).unwrap());
         assert!(budget.clone().try_retry());
