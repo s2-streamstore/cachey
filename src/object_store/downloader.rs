@@ -101,8 +101,6 @@ impl DownloadError {
     }
 }
 
-type GetObjectResult = Result<GetObjectOutput, Box<SdkError<GetObjectError>>>;
-
 fn map_get_object_error(req_range: &Range<u64>, error: SdkError<GetObjectError>) -> DownloadError {
     let object_size = error
         .raw_response()
@@ -380,8 +378,8 @@ impl Downloader {
             .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
 
-        let result = if req_config.is_noop() {
-            request.send().await.map_err(Box::new)
+        let output = if req_config.is_noop() {
+            request.send().await
         } else {
             let client_config = self.s3.config();
             let mut config_override = client_config.to_builder();
@@ -403,17 +401,16 @@ impl Downloader {
                 .config_override(config_override)
                 .send()
                 .await
-                .map_err(Box::new)
-        };
-        self.handle_result(byterange, result).await
+        }
+        .map_err(|error| map_get_object_error(byterange, error))?;
+        self.read_response(byterange, output).await
     }
 
-    async fn handle_result(
+    async fn read_response(
         &self,
         req_range: &Range<u64>,
-        result: GetObjectResult,
+        output: GetObjectOutput,
     ) -> Result<ObjectPiece, DownloadError> {
-        let output = result.map_err(|error| map_get_object_error(req_range, *error))?;
         let invalid_range = || {
             DownloadError::InvalidResponse(format!(
                 "Expected range {req_range:?}, received Content-Range {:?}",
@@ -501,6 +498,7 @@ mod tests {
 
     use super::{
         BucketMetrics, DownloadError, DownloadLimits, DownloadOutput, Downloader, RequestConfig,
+        map_get_object_error,
     };
     use crate::{
         service::SlidingThroughput,
@@ -668,7 +666,7 @@ mod tests {
             let output = GetObjectOutput::builder()
                 .set_content_range(header.map(str::to_owned))
                 .build();
-            let result = downloader.handle_result(&(0..10), Ok(output)).await;
+            let result = downloader.read_response(&(0..10), output).await;
             assert!(
                 matches!(result, Err(DownloadError::InvalidResponse(_))),
                 "{header:?}: {result:?}"
@@ -693,7 +691,7 @@ mod tests {
                 .build();
             let result = timeout(
                 Duration::from_millis(1),
-                downloader.handle_result(&(0..10), Ok(output)),
+                downloader.read_response(&(0..10), output),
             )
             .await
             .expect("excess data must be rejected without waiting for the rest of the body");
@@ -701,20 +699,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn invalid_range_preserves_the_backend_object_size() {
-        let downloader = downloader([]);
+    #[test]
+    fn invalid_range_preserves_the_backend_object_size() {
         let error = GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build());
         let mut response = HttpResponse::new(416.try_into().unwrap(), SdkBody::empty());
         response
             .headers_mut()
             .insert("content-range", "bytes */512");
         let error = aws_sdk_s3::error::SdkError::service_error(error, response);
-        let result = downloader
-            .handle_result(&(1024..2048), Err(Box::new(error)))
-            .await;
+        let error = map_get_object_error(&(1024..2048), error);
         assert!(
-            matches!(result, Err(DownloadError::RangeNotSatisfied { requested, object_size: Some(512) }) if requested == (1024..2048))
+            matches!(error, DownloadError::RangeNotSatisfied { requested, object_size: Some(512) } if requested == (1024..2048))
         );
     }
 
