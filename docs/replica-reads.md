@@ -12,8 +12,9 @@ ranges, cancellation, and admission failures do not affect health. Timeouts coun
 against health when the copy had enough time for its expected latency. The error
 fraction decays, but restoring normal preference requires 20 successful operations
 started after the latest failure. After 24–36 seconds, a previously competitive
-bucket can receive an exclusive recovery probe, with admission reserved for a
-working alternative.
+bucket—or one that failed before its first successful read—can receive an exclusive
+recovery probe, with admission reserved for a working alternative. Successful probes
+can repeat immediately until recovery completes.
 
 ## Deadlines and hedging
 

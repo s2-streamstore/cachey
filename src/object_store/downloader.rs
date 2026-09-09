@@ -50,9 +50,10 @@ pub enum DownloadError {
         requested_bytes: u64,
         limit_bytes: u64,
     },
-    #[error("Bucket {bucket} download exceeded its {timeout:?} budget")]
+    #[error("Bucket {bucket} download timed out after {timeout:?}")]
     Timeout {
         bucket: BucketName,
+        /// Duration before timeout, excluding admission.
         timeout: Duration,
     },
     #[error("Unknown error: {0}")]
@@ -79,29 +80,44 @@ impl DownloadError {
             Self::InvalidResponse(_)
             | Self::BodyStreaming(_)
             | Self::Unknown(_)
+            | Self::Timeout { .. }
             | Self::Overloaded(_) => true,
             Self::InvalidObjectState(_)
             | Self::NoSuchKey
             | Self::RangeNotSatisfied { .. }
-            | Self::Timeout { .. }
             | Self::AdmissionTimeout
             | Self::AdmissionExhausted { .. } => false,
         }
     }
 
-    fn health_outcome(&self, budget: Duration, expected: Duration) -> Outcome {
+    fn health_outcome(&self, expected: Duration) -> Outcome {
         match self {
             Self::Overloaded(_) => Outcome::Overload,
             Self::InvalidResponse(_) | Self::BodyStreaming(_) | Self::Unknown(_) => {
                 Outcome::Failure
             }
-            Self::Timeout { .. } if budget >= expected => Outcome::Failure,
+            Self::Timeout { timeout, .. } if *timeout >= expected => Outcome::Failure,
             _ => Outcome::Neutral,
         }
     }
 }
 
-fn map_get_object_error(req_range: &Range<u64>, error: SdkError<GetObjectError>) -> DownloadError {
+fn map_get_object_error(
+    bucket: &BucketName,
+    req_range: &Range<u64>,
+    elapsed: Duration,
+    error: SdkError<GetObjectError>,
+) -> DownloadError {
+    if match &error {
+        SdkError::TimeoutError(_) => true,
+        SdkError::DispatchFailure(error) => error.is_timeout(),
+        _ => false,
+    } {
+        return DownloadError::Timeout {
+            bucket: bucket.clone(),
+            timeout: elapsed,
+        };
+    }
     let object_size = error
         .raw_response()
         .and_then(|response| response.headers().get("content-range"))
@@ -188,7 +204,10 @@ impl BucketOperation<'_> {
             .bucket_timeout
             .min(self.deadline.saturating_duration_since(now));
         if budget.is_zero() {
-            return Err(DownloadError::AdmissionTimeout);
+            return Err(DownloadError::Timeout {
+                bucket: self.bucket.clone(),
+                timeout: budget,
+            });
         }
         let expected = self
             .downloader
@@ -205,15 +224,16 @@ impl BucketOperation<'_> {
             .begin(self.bucket, self.probe);
         let result = select! {
             biased;
+            result = fetch(now + budget) => result,
             () = sleep_until(now + budget) => Err(DownloadError::Timeout {
                 bucket: self.bucket.clone(), timeout: budget,
             }),
-            result = fetch(now + budget) => result,
         };
-        observation.complete(result.as_ref().map_or_else(
-            |error| error.health_outcome(budget, expected),
-            |_| Outcome::Success,
-        ));
+        observation.complete(
+            result
+                .as_ref()
+                .map_or_else(|error| error.health_outcome(expected), |_| Outcome::Success),
+        );
         result
     }
 }
@@ -378,6 +398,7 @@ impl Downloader {
             .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
 
+        let started = Instant::now();
         let output = if req_config.is_noop() {
             request.send().await
         } else {
@@ -402,7 +423,7 @@ impl Downloader {
                 .send()
                 .await
         }
-        .map_err(|error| map_get_object_error(byterange, error))?;
+        .map_err(|error| map_get_object_error(bucket, byterange, started.elapsed(), error))?;
         self.read_response(byterange, output).await
     }
 
@@ -488,6 +509,7 @@ mod tests {
     use aws_smithy_runtime_api::client::{
         http::{HttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn},
         orchestrator::{HttpRequest, HttpResponse},
+        result::ConnectorError,
     };
     use bytes::Bytes;
     use futures::{StreamExt, stream};
@@ -699,10 +721,34 @@ mod tests {
             .headers_mut()
             .insert("content-range", "bytes */512");
         let error = aws_sdk_s3::error::SdkError::service_error(error, response);
-        let error = map_get_object_error(&(1024..2048), error);
+        let error = map_get_object_error(
+            &BucketName::new("bucket").unwrap(),
+            &(1024..2048),
+            Duration::ZERO,
+            error,
+        );
         assert!(
             matches!(error, DownloadError::RangeNotSatisfied { requested, object_size: Some(512) } if requested == (1024..2048))
         );
+    }
+
+    #[test]
+    fn sdk_and_connector_timeouts_preserve_bucket_and_duration() {
+        let bucket = BucketName::new("bucket").unwrap();
+        let elapsed = Duration::from_millis(10);
+        for error in [
+            aws_sdk_s3::error::SdkError::timeout_error(io::Error::from(io::ErrorKind::TimedOut)),
+            aws_sdk_s3::error::SdkError::dispatch_failure(ConnectorError::timeout(Box::new(
+                io::Error::from(io::ErrorKind::TimedOut),
+            ))),
+        ] {
+            let error = map_get_object_error(&bucket, &(0..4), elapsed, error);
+            assert!(matches!(
+                error,
+                DownloadError::Timeout { bucket: actual, timeout }
+                    if actual == bucket && timeout == elapsed
+            ));
+        }
     }
 
     #[tokio::test]
@@ -925,21 +971,84 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn bucket_deadline_does_not_launch_a_hedge_at_expiry() {
-        let (downloader, script) =
-            scripted_downloader([("bucket", 10, 90, false), ("bucket", 10, 200, false)]);
-        fetch(&downloader, &["bucket"]).await;
-        let downloader = downloader
-            .with_test_limits(DownloadLimits {
-                bucket_timeout: Duration::from_millis(100),
-                ..DownloadLimits::default()
-            })
+        for body_ms in [90, 200] {
+            let (downloader, script) =
+                scripted_downloader([("bucket", 10, 90, false), ("bucket", 10, body_ms, false)]);
+            fetch(&downloader, &["bucket"]).await;
+            let downloader = downloader
+                .with_test_limits(DownloadLimits {
+                    bucket_timeout: Duration::from_millis(100),
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            let result =
+                fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+            if body_ms == 90 {
+                assert_eq!(result.unwrap().latency, Duration::from_millis(100));
+            } else {
+                assert!(matches!(result, Err(DownloadError::Timeout { .. })));
+            }
+            assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sdk_timeouts_respect_elapsed_time_and_allow_fallback() {
+        for attempt_timeout in [false, true] {
+            for timeout_ms in [10, 100] {
+                let (downloader, script) =
+                    scripted_downloader([("local", 1000, 0, false), ("peer", 0, 2, false)]);
+                let downloader = downloader
+                    .with_test_limits(DownloadLimits {
+                        hedge_budget_percent: 0,
+                        ..DownloadLimits::default()
+                    })
+                    .unwrap();
+                seed_latency(&downloader, "local", 50).await;
+                let duration = Some(Duration::from_millis(timeout_ms));
+                let config = RequestConfig {
+                    operation_timeout: if attempt_timeout { None } else { duration },
+                    operation_attempt_timeout: if attempt_timeout { duration } else { None },
+                    ..RequestConfig::default()
+                };
+                let output = fetch_with_config(&downloader, &["local", "peer"], &config)
+                    .await
+                    .unwrap();
+                assert_eq!(output.used_bucket_idx, 1);
+                assert_eq!(output.latency, Duration::from_millis(timeout_ms + 2));
+                assert_eq!(
+                    metrics(&downloader, "local").await.deprioritized,
+                    timeout_ms >= 50
+                );
+                assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+                assert_eq!(script.active.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sdk_timeout_does_not_cancel_a_viable_hedged_peer() {
+        for (primary, hedge, elapsed_ms) in [
+            (("local", 100, 0, false), ("local", 7, 0, false), 12),
+            (("local", 0, 20, false), ("local", 100, 0, false), 20),
+        ] {
+            let downloader = downloader([primary, hedge]);
+            seed_latency(&downloader, "local", 5).await;
+            let output = fetch_with_config(
+                &downloader,
+                &["local"],
+                &RequestConfig {
+                    operation_timeout: Some(Duration::from_millis(10)),
+                    ..RequestConfig::default()
+                },
+            )
+            .await
             .unwrap();
-        assert!(matches!(
-            fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
-            Err(DownloadError::Timeout { .. })
-        ));
-        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
-        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+            assert_eq!(output.latency, Duration::from_millis(elapsed_ms));
+            assert!(output.hedged);
+            assert!(!metrics(&downloader, "local").await.deprioritized);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1236,7 +1345,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn local_admission_timeout_is_not_a_backend_failure() {
+    async fn admission_and_unstarted_expiry_do_not_affect_backend_health() {
         let (downloader, script) = scripted_downloader([]);
         let downloader = downloader
             .with_test_limits(DownloadLimits {
@@ -1249,11 +1358,20 @@ mod tests {
         let permit = downloader.admission.try_acquire(4).unwrap();
         let result = fetch_with_config(&downloader, &["local"], &RequestConfig::default()).await;
         assert!(matches!(result, Err(DownloadError::AdmissionTimeout)));
+        let result = super::BucketOperation {
+            downloader: &downloader,
+            bucket: &BucketName::new("local").unwrap(),
+            deadline: tokio::time::Instant::now(),
+            unknown_latency: Duration::from_millis(10),
+            probe: None,
+        }
+        .execute(4, Some(permit), |_| async { Ok(()) })
+        .await;
+        assert!(matches!(result, Err(DownloadError::Timeout { .. })));
         assert_eq!(script.requests.load(Ordering::SeqCst), 0);
         let mut count = 0;
         downloader.observe_bucket_metrics(|_, _| count += 1);
         assert_eq!(count, 0);
-        drop(permit);
         assert!(downloader.admission.try_acquire(4).is_some());
     }
     #[tokio::test(start_paused = true)]

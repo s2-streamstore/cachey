@@ -189,7 +189,9 @@ pub fn page_download_latency(kind: &ObjectKind, latency: std::time::Duration) {
             "cachey_page_download_latency_seconds",
             "Successful page download latency, including retries, hedging, and bucket fallback",
             &["kind"],
-            vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+            vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+            ]
         )
         .unwrap()
     });
@@ -232,7 +234,7 @@ pub fn first_chunk_latency(kind: &ObjectKind, hit: bool, latency: Duration) {
             "Time to first chunk",
             &["kind", "hit"],
             vec![
-                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
             ]
         )
         .unwrap()

@@ -374,7 +374,8 @@ impl RoutingSnapshot {
                 continue;
             }
             let mut stats = bucket.stats.lock();
-            let stale = now.duration_since(stats.last_outcome) >= RECOVERY_INTERVAL;
+            let stale = stats.best_latency.is_some()
+                && now.duration_since(stats.last_outcome) >= RECOVERY_INTERVAL;
             if (stats.deprioritized || stale)
                 && !stats.probing
                 && stats.active.is_empty()
@@ -585,30 +586,34 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn probing_is_exclusive_and_a_success_preserves_failure_history() {
-        let stats = BucketedStats::default();
-        let buckets = buckets();
-        for (bucket, millis) in buckets.iter().zip([3, 5, 6]) {
-            success(&stats, bucket, millis).await;
+        for local_latency in [None, Some(3)] {
+            let stats = BucketedStats::default();
+            let buckets = buckets();
+            for (bucket, millis) in buckets.iter().zip([local_latency, Some(5), Some(6)]) {
+                if let Some(millis) = millis {
+                    success(&stats, bucket, millis).await;
+                }
+            }
+            stats.begin(&buckets[0], None).complete(Outcome::Failure);
+            advance(Duration::from_secs(37)).await;
+            let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
+            assert_eq!(index, 0);
+            assert!(probe.is_some());
+            assert_eq!(
+                stats.snapshot(&buckets).primary(Duration::from_secs(1)).0,
+                1
+            );
+            let observation = stats.begin(&buckets[0], probe);
+            advance(Duration::from_millis(3)).await;
+            observation.complete(Outcome::Success);
+            assert_eq!(
+                stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+                Some(1)
+            );
+            let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
+            assert_eq!(index, 0);
+            assert!(probe.is_some());
         }
-        stats.begin(&buckets[0], None).complete(Outcome::Failure);
-        advance(Duration::from_secs(37)).await;
-        let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
-        assert_eq!(index, 0);
-        assert!(probe.is_some());
-        assert_eq!(
-            stats.snapshot(&buckets).primary(Duration::from_secs(1)).0,
-            1
-        );
-        let observation = stats.begin(&buckets[0], probe);
-        advance(Duration::from_millis(3)).await;
-        observation.complete(Outcome::Success);
-        assert_eq!(
-            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
-            Some(1)
-        );
-        let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
-        assert_eq!(index, 0);
-        assert!(probe.is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -660,23 +665,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn neutral_outcomes_do_not_create_failures_and_idle_remote_regions_are_not_probed() {
-        let stats = BucketedStats::default();
-        let buckets = buckets();
-        for (bucket, millis) in buckets.iter().zip([10, 60, 150]) {
-            success(&stats, bucket, millis).await;
+    async fn neutral_outcomes_and_idle_peers_preserve_local_preference() {
+        for peer_latencies in [None, Some([60, 150])] {
+            let stats = BucketedStats::default();
+            let buckets = buckets();
+            stats.snapshot(&buckets);
+            success(&stats, &buckets[0], 10).await;
+            if let Some(latencies) = peer_latencies {
+                for (bucket, millis) in buckets.iter().skip(1).zip(latencies) {
+                    success(&stats, bucket, millis).await;
+                }
+            }
+            let active = (0..3)
+                .map(|_| stats.begin(&buckets[0], None))
+                .collect::<Vec<_>>();
+            advance(Duration::from_secs(1)).await;
+            for observation in active {
+                observation.complete(Outcome::Neutral);
+            }
+            advance(Duration::from_secs(60)).await;
+            let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
+            assert_eq!(index, 0);
+            assert!(probe.is_none());
+            assert!(!stats.entry(&buckets[0]).lock().deprioritized);
         }
-        let active = (0..3)
-            .map(|_| stats.begin(&buckets[0], None))
-            .collect::<Vec<_>>();
-        advance(Duration::from_secs(1)).await;
-        for observation in active {
-            observation.complete(Outcome::Neutral);
-        }
-        advance(Duration::from_secs(60)).await;
-        let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
-        assert_eq!(index, 0);
-        assert!(probe.is_none());
-        assert!(!stats.entry(&buckets[0]).lock().deprioritized);
     }
 }
