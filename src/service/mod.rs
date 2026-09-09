@@ -29,7 +29,7 @@ use crate::{
 
 pub const PAGE_SIZE: u64 = 16 * 1024 * 1024;
 
-pub const MAX_RANGE_END: u64 = PAGE_SIZE * PageId::MAX as u64;
+pub const MAX_RANGE_END: u64 = PAGE_SIZE * (PageId::MAX as u64 + 1);
 
 fn page_id_for_byte_offset(byte_offset: u64) -> PageId {
     (byte_offset / PAGE_SIZE) as PageId
@@ -171,7 +171,7 @@ impl CacheyService {
         let pagerange = pagerange(&byterange);
 
         metrics::fetch_request_bytes(&kind, byterange.end - byterange.start);
-        metrics::fetch_request_pages(&kind, pagerange.end() - pagerange.start() + 1);
+        metrics::fetch_request_pages(&kind, pagerange.len());
 
         let executor = Arc::new(PageGetExecutor {
             downloader: self.downloader,
@@ -349,7 +349,7 @@ mod tests {
     use bytesize::ByteSize;
     use futures::TryStreamExt;
 
-    use super::{CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, pagerange};
+    use super::{CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange};
     use crate::{
         cache::{CacheConfig, CacheKey, CacheValue},
         object_store::{DownloadLimits, RequestConfig},
@@ -470,9 +470,44 @@ mod tests {
             (0..2 * PAGE_SIZE, 0..=1),
             (PAGE_SIZE - 1..PAGE_SIZE + 1, 0..=1),
             (PAGE_SIZE..2 * PAGE_SIZE, 1..=1),
+            ((1 << 40) - 1..1 << 40, 65535..=65535),
+            (0..1 << 40, 0..=65535),
         ] {
             assert_eq!(pagerange(&bytes), pages, "{bytes:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn full_address_space_records_all_pages() {
+        let service = CacheyService::new(
+            ServiceConfig {
+                cache: CacheConfig {
+                    memory_size: ByteSize::mib(16),
+                    disk_cache: None,
+                    metrics_registry: None,
+                },
+                download_limits: DownloadLimits::default(),
+            },
+            mock_s3_client("http://unused.invalid"),
+            axum_server::Handle::new(),
+        )
+        .await
+        .unwrap();
+
+        drop(service.get(
+            ObjectKind::new("full-address-space").unwrap(),
+            ObjectKey::new("object").unwrap(),
+            BucketName::new("bucket").unwrap().into(),
+            0..1 << 40,
+            NonZeroUsize::MIN,
+            RequestConfig::default(),
+        ));
+        let snapshot = metrics::gather();
+        assert!(
+            std::str::from_utf8(&snapshot)
+                .unwrap()
+                .contains("cachey_fetch_request_pages_sum{kind=\"full-address-space\"} 65536\n")
+        );
     }
 
     #[tokio::test]

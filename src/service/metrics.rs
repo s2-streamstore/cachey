@@ -113,7 +113,7 @@ pub fn fetch_request_bytes(kind: &ObjectKind, bytes: u64) {
         .observe(bytes as f64);
 }
 
-pub fn fetch_request_pages(kind: &ObjectKind, pages: u16) {
+pub fn fetch_request_pages(kind: &ObjectKind, pages: usize) {
     static HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec!(
             "cachey_fetch_request_pages",
@@ -126,7 +126,7 @@ pub fn fetch_request_pages(kind: &ObjectKind, pages: u16) {
 
     HISTOGRAM
         .with_label_values(&[&**kind])
-        .observe(f64::from(pages));
+        .observe(pages as f64);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

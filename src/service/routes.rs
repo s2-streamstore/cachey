@@ -437,13 +437,13 @@ mod tests {
 
     use axum::{
         extract::FromRequestParts,
-        http::{HeaderValue, Method, Request, StatusCode},
+        http::{HeaderValue, Method, Request, StatusCode, header},
     };
 
-    use super::{C0_CONFIG_HEADER, on_chunk_error};
+    use super::{C0_CONFIG_HEADER, RangeHeader, on_chunk_error};
     use crate::{
         object_store::{DownloadError, RequestConfig},
-        service::{ServiceError, metrics},
+        service::{PAGE_SIZE, ServiceError, metrics},
         types::{BucketName, ObjectKind},
     };
 
@@ -456,6 +456,39 @@ mod tests {
         }
         let (mut parts, ()) = request.into_parts();
         RequestConfig::from_request_parts(&mut parts, &()).await
+    }
+
+    #[tokio::test]
+    async fn range_header_allows_the_last_page_within_one_tib() {
+        let limit = 1 << 40;
+        for (range, accepted) in [
+            (limit - PAGE_SIZE..limit, true),
+            (limit - 1..limit, true),
+            (0..limit, true),
+            (0..limit + 1, false),
+            (limit..limit + 1, false),
+        ] {
+            let request = Request::builder()
+                .header(
+                    header::RANGE,
+                    format!("bytes={}-{}", range.start, range.end - 1),
+                )
+                .body(())
+                .unwrap();
+            let (mut parts, ()) = request.into_parts();
+            let result = RangeHeader::from_request_parts(&mut parts, &())
+                .await
+                .map(|header| header.0)
+                .map_err(|(status, _)| status);
+            assert_eq!(
+                result,
+                if accepted {
+                    Ok(range)
+                } else {
+                    Err(StatusCode::RANGE_NOT_SATISFIABLE)
+                }
+            );
+        }
     }
 
     #[tokio::test]
