@@ -774,7 +774,7 @@ async fn test_fetch_endpoint_multi_page_range() {
 }
 
 #[tokio::test]
-async fn test_fetch_endpoint_multi_page_trailers() {
+async fn test_fetch_endpoint_multi_page_trailers_past_eof() {
     let ctx = setup_test_server().await;
 
     let object_size = 3 * PAGE_SIZE as usize;
@@ -802,7 +802,10 @@ async fn test_fetch_endpoint_multi_page_trailers() {
     let req = hyper::Request::builder()
         .uri(uri)
         .version(hyper::Version::HTTP_2)
-        .header("Range", format!("bytes=0-{}", object_size - 1))
+        .header(
+            "Range",
+            format!("bytes=0-{}", object_size + PAGE_SIZE as usize - 1),
+        )
         .body(http_body_util::Empty::<Bytes>::new())
         .expect("Failed to build request");
 
@@ -815,13 +818,13 @@ async fn test_fetch_endpoint_multi_page_trailers() {
     assert_eq!(response.status(), 206);
     assert_eq!(response.version(), hyper::Version::HTTP_2);
 
-    let c0_status_header = response
-        .headers()
-        .get("c0-status")
-        .expect("Missing c0-status header for first chunk");
-    assert!(
-        !c0_status_header.is_empty(),
-        "c0-status header should contain first chunk status"
+    assert_eq!(
+        response.headers()["content-range"],
+        format!("bytes 0-{}/{object_size}", object_size - 1)
+    );
+    assert_eq!(
+        response.headers()["c0-status"],
+        format!("0-{}; {}; 0", PAGE_SIZE - 1, ctx.bucket_name)
     );
 
     let (_parts, body) = response.into_parts();
@@ -836,28 +839,20 @@ async fn test_fetch_endpoint_multi_page_trailers() {
     assert_eq!(body_bytes.len(), object_size);
     assert_eq!(body_bytes, test_data);
 
-    let c0_status_trailers: Vec<_> = trailers.get_all("c0-status").iter().collect();
-
-    assert!(
-        c0_status_trailers.len() >= 2,
-        "Expected at least 2 trailer values (one for each chunk after the first), got {}. \
-         With 3 pages, we should have trailers for chunks 1 and 2.",
-        c0_status_trailers.len()
-    );
-
-    for (idx, trailer_value) in c0_status_trailers.iter().enumerate() {
-        let trailer_str = trailer_value
-            .to_str()
-            .expect("Trailer should be valid UTF-8");
-
-        assert!(
-            trailer_str.contains(&ctx.bucket_name),
-            "Trailer {idx} should contain bucket name, got: {trailer_str}",
-        );
-
-        assert!(
-            trailer_str.contains('-'),
-            "Trailer {idx} should contain byte range with '-', got: {trailer_str}",
-        );
-    }
+    let statuses: Vec<_> = trailers
+        .get_all("c0-status")
+        .iter()
+        .map(|value| value.to_str().expect("valid status"))
+        .collect();
+    let expected: Vec<_> = (1..3)
+        .map(|page| {
+            format!(
+                "{}-{}; {}; 0",
+                page * PAGE_SIZE,
+                (page + 1) * PAGE_SIZE - 1,
+                ctx.bucket_name
+            )
+        })
+        .collect();
+    assert_eq!(statuses, expected);
 }

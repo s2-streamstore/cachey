@@ -13,7 +13,7 @@ use axum::{
 use bytes::BytesMut;
 use futures::StreamExt;
 use http_body::Frame;
-use http_body_util::{BodyExt as _, StreamBody};
+use http_body_util::StreamBody;
 use tokio::time::Instant;
 use tracing::{debug, instrument, warn};
 
@@ -339,10 +339,7 @@ pub async fn fetch(
         return (StatusCode::PARTIAL_CONTENT, headers).into_response();
     }
 
-    let (trailers_tx, trailers_rx) = tokio::sync::oneshot::channel::<HeaderMap>();
-
     let body = StreamBody::new(async_stream::stream! {
-        let mut trailers_tx = Some(trailers_tx);
         let mut trailers = HeaderMap::new();
         let mut chunk_idx = 0;
         while let Some(chunk) = chunks.next().await {
@@ -354,16 +351,12 @@ pub async fn fetch(
                     let is_last_chunk = chunk.range.end == byterange.end.min(chunk.object_size);
                     if is_last_chunk {
                         metrics::fetch_request_count(&kind, &method, "success");
-                        let trailers_tx = trailers_tx
-                            .take()
-                            .expect("final chunk should send trailers exactly once");
-                        let _ = trailers_tx.send(std::mem::take(&mut trailers));
                     }
                     yield Ok(Frame::data(chunk.data));
                     if is_last_chunk {
-                        // `service.get` can already have later requested pages in flight before
-                        // we learn the true object size. Once we've emitted the full valid
-                        // response range, ignore any speculative beyond-EOF page results.
+                        // Cancel speculative reads beyond EOF before sending trailers.
+                        drop(chunks);
+                        yield Ok(Frame::trailers(trailers));
                         break;
                     }
                 },
@@ -376,12 +369,6 @@ pub async fn fetch(
             }
             chunk_idx += 1;
         }
-    })
-    .with_trailers(async {
-        let Ok(trailers) = trailers_rx.await else {
-            return None;
-        };
-        Some(Ok(trailers))
     });
 
     (
