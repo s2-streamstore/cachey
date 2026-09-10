@@ -453,3 +453,272 @@ async fn test_fetch_endpoint_multi_page_trailers_past_eof() {
         .collect();
     assert_eq!(statuses, expected);
 }
+
+fn h1_client<B>()
+-> hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, B>
+where
+    B: hyper::body::Body + Send,
+    B::Data: Send,
+{
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build_http()
+}
+
+async fn upload_multipage_object(ctx: &TestContext, object_key: &str) -> (Bytes, usize) {
+    let object_size = 2 * PAGE_SIZE as usize + 123;
+    let mut test_data = BytesMut::zeroed(object_size);
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = (i % 256) as u8;
+    }
+    let test_data = test_data.freeze();
+    upload_test_object(
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
+        object_key,
+        test_data.clone(),
+    )
+    .await;
+    (test_data, object_size)
+}
+
+#[tokio::test]
+async fn test_fetch_endpoint_multi_page_trailers_delivered_over_h1_with_te() {
+    let ctx = setup_test_server().await;
+    let object_key = "multi-page-trailers-h1-te.bin";
+    let (test_data, object_size) = upload_multipage_object(&ctx, object_key).await;
+
+    let uri = format!(
+        "{}/fetch/{}/{}",
+        ctx.server_url, ctx.rustfs.bucket_name, object_key
+    )
+    .parse::<hyper::Uri>()
+    .expect("Failed to parse URI");
+
+    let req = hyper::Request::builder()
+        .uri(uri)
+        .version(hyper::Version::HTTP_11)
+        .header("TE", "trailers")
+        .header(
+            "Range",
+            format!("bytes=0-{}", object_size + PAGE_SIZE as usize - 1),
+        )
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("Failed to build request");
+
+    let response = h1_client()
+        .request(req)
+        .await
+        .expect("Failed to send request");
+    assert_eq!(response.status(), 206);
+    assert_eq!(response.version(), hyper::Version::HTTP_11);
+
+    assert_eq!(
+        response.headers()["content-range"],
+        format!("bytes 0-{}/{object_size}", object_size - 1)
+    );
+    assert_eq!(
+        response.headers()["c0-status"],
+        format!("0-{}; {}; 0", PAGE_SIZE - 1, ctx.rustfs.bucket_name)
+    );
+    assert_eq!(response.headers()["trailer"], "c0-status");
+    assert!(
+        !response.headers().contains_key("content-length"),
+        "multi-page GET must be streamed without Content-Length so HTTP/1.1 trailers are framed"
+    );
+
+    let (_parts, body) = response.into_parts();
+    let collected = body.collect().await.expect("Failed to collect body");
+    let trailers = collected
+        .trailers()
+        .cloned()
+        .expect("Expected trailers over HTTP/1.1 when TE: trailers is sent");
+    let body_bytes = collected.to_bytes();
+    assert_eq!(body_bytes, test_data);
+
+    let statuses: Vec<_> = trailers
+        .get_all("c0-status")
+        .iter()
+        .map(|value| value.to_str().expect("valid status"))
+        .collect();
+    let expected: Vec<_> = (1..3)
+        .map(|page| {
+            format!(
+                "{}-{}; {}; 0",
+                page * PAGE_SIZE,
+                ((page + 1) * PAGE_SIZE).min(object_size as u64) - 1,
+                ctx.rustfs.bucket_name
+            )
+        })
+        .collect();
+    assert_eq!(statuses, expected);
+}
+
+#[tokio::test]
+async fn test_fetch_endpoint_multi_page_h1_without_te_streams_body_but_omits_trailers() {
+    let ctx = setup_test_server().await;
+    let object_key = "multi-page-h1-no-te.bin";
+    let (test_data, object_size) = upload_multipage_object(&ctx, object_key).await;
+
+    let uri = format!(
+        "{}/fetch/{}/{}",
+        ctx.server_url, ctx.rustfs.bucket_name, object_key
+    )
+    .parse::<hyper::Uri>()
+    .expect("Failed to parse URI");
+
+    let req = hyper::Request::builder()
+        .uri(uri)
+        .version(hyper::Version::HTTP_11)
+        .header(
+            "Range",
+            format!("bytes=0-{}", object_size + PAGE_SIZE as usize - 1),
+        )
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("Failed to build request");
+
+    let response = h1_client()
+        .request(req)
+        .await
+        .expect("Failed to send request");
+    assert_eq!(response.status(), 206);
+    assert_eq!(response.version(), hyper::Version::HTTP_11);
+    assert_eq!(
+        response.headers()["c0-status"],
+        format!("0-{}; {}; 0", PAGE_SIZE - 1, ctx.rustfs.bucket_name)
+    );
+    assert_eq!(response.headers()["trailer"], "c0-status");
+    assert!(
+        !response.headers().contains_key("content-length"),
+        "framing must not depend on the client TE header"
+    );
+
+    let (_parts, body) = response.into_parts();
+    let collected = body.collect().await.expect("Failed to collect body");
+    let trailers_empty = collected.trailers().is_none_or(hyper::HeaderMap::is_empty);
+    let body_bytes = collected.to_bytes();
+    assert_eq!(body_bytes, test_data);
+    assert!(
+        trailers_empty,
+        "HTTP/1.1 server must not emit trailers without TE: trailers from the client"
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_endpoint_single_page_get_keeps_content_length_over_h1() {
+    let ctx = setup_test_server().await;
+
+    let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize);
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = (i % 256) as u8;
+    }
+    let test_data = test_data.freeze();
+    let object_key = "single-page-content-length-h1.bin";
+    upload_test_object(
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
+        object_key,
+        test_data.clone(),
+    )
+    .await;
+
+    let uri = format!(
+        "{}/fetch/{}/{}",
+        ctx.server_url, ctx.rustfs.bucket_name, object_key
+    )
+    .parse::<hyper::Uri>()
+    .expect("Failed to parse URI");
+
+    let req = hyper::Request::builder()
+        .uri(uri)
+        .version(hyper::Version::HTTP_11)
+        .header("Range", format!("bytes=0-{}", PAGE_SIZE - 1))
+        .header("TE", "trailers")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("Failed to build request");
+
+    let response = h1_client()
+        .request(req)
+        .await
+        .expect("Failed to send request");
+    assert_eq!(response.status(), 206);
+    assert_eq!(response.version(), hyper::Version::HTTP_11);
+    assert_eq!(
+        response.headers()["content-length"].to_str().unwrap(),
+        PAGE_SIZE.to_string().as_str()
+    );
+    assert!(
+        !response.headers().contains_key("trailer"),
+        "single-page GET must not advertise trailers"
+    );
+
+    let (_parts, body) = response.into_parts();
+    let collected = body.collect().await.expect("Failed to collect body");
+    let trailers_empty = collected.trailers().is_none_or(hyper::HeaderMap::is_empty);
+    assert_eq!(collected.to_bytes(), test_data);
+    assert!(
+        trailers_empty,
+        "single-page GET must not carry c0-status trailers"
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_endpoint_object_smaller_than_requested_uses_single_page_framing() {
+    let ctx = setup_test_server().await;
+
+    let object_size = 4096usize;
+    let mut test_data = BytesMut::zeroed(object_size);
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
+    let test_data = test_data.freeze();
+    let object_key = "small-object-wide-range.bin";
+    upload_test_object(
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
+        object_key,
+        test_data.clone(),
+    )
+    .await;
+
+    let uri = format!(
+        "{}/fetch/{}/{}",
+        ctx.server_url, ctx.rustfs.bucket_name, object_key
+    )
+    .parse::<hyper::Uri>()
+    .expect("Failed to parse URI");
+
+    let req = hyper::Request::builder()
+        .uri(uri)
+        .version(hyper::Version::HTTP_11)
+        .header("TE", "trailers")
+        .header("Range", format!("bytes=0-{}", 2 * PAGE_SIZE - 1))
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("Failed to build request");
+
+    let response = h1_client()
+        .request(req)
+        .await
+        .expect("Failed to send request");
+    assert_eq!(response.status(), 206);
+    assert_eq!(response.version(), hyper::Version::HTTP_11);
+    assert_eq!(
+        response.headers()["content-range"],
+        format!("bytes 0-{}/{object_size}", object_size - 1)
+    );
+    assert_eq!(
+        response.headers()["content-length"].to_str().unwrap(),
+        object_size.to_string().as_str()
+    );
+    assert!(
+        !response.headers().contains_key("trailer"),
+        "a request that resolves to a single served page must not advertise trailers"
+    );
+
+    let (_parts, body) = response.into_parts();
+    let collected = body.collect().await.expect("Failed to collect body");
+    let trailers_empty = collected.trailers().is_none_or(hyper::HeaderMap::is_empty);
+    assert_eq!(collected.to_bytes(), test_data);
+    assert!(
+        trailers_empty,
+        "no c0-status trailers when only one page is served"
+    );
+}

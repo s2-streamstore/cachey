@@ -68,29 +68,35 @@ The service maps requests to 16 MiB page-aligned ranges and the response has sta
 | Header | Description |
 |--------|-------------|
 | `Content-Range` | Actual byte range served |
-| `Content-Length` | Number of bytes in response |
+| `Content-Length` | Number of bytes in response. Omitted for multi-page `GET` responses, which are streamed with chunked transfer encoding (HTTP/1.1) or DATA frames (HTTP/2); `HEAD` and single-page `GET` always include it |
 | `Last-Modified` | Timestamp from first page |
 | `Content-Type` | Always `application/octet-stream` |
 | `C0-Status` | Status for first page |
+| `Trailer` | For multi-page `GET`, advertises `C0-Status` as a trailing header field |
 
 `C0-Status` format: `{first}-{last}; {bucket}; {cached_at}`
 - Byte range and which bucket was used
 - `cached_at` is Unix timestamp with 0 implying a cache miss
 - Only first page status is sent as a header; status for subsequent pages follows the body as trailers
 
+HTTP/1.1 clients that want to receive the per-page `C0-Status` trailers MUST send `TE: trailers` with the request. Without it, the server is prohibited by the HTTP/1.1 protocol from emitting the trailer block, so subsequent-page `C0-Status` is silently omitted (the body is unaffected). HTTP/2 clients receive the trailers unconditionally.
+
 #### Example Response
 
 ```http
 HTTP/1.1 206 Partial Content
 Content-Range: bytes 1048576-18874367/52428800
-Content-Length: 17825792
+Transfer-Encoding: chunked
 Content-Type: application/octet-stream
 C0-Status: 1048576-16777215; us-west-videos; 1704067200
+Trailer: C0-Status
 
-<data>
+<chunked data>
 
 C0-Status: 16777216-18874367; us-west-videos; 0
 ```
+
+The response above spans two pages, so it is streamed without `Content-Length` and advertises `C0-Status` as a trailer field. To receive the trailing `C0-Status` over HTTP/1.1, the request must include `TE: trailers`.
 
 ### Monitoring
 
