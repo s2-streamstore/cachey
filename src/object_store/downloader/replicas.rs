@@ -121,6 +121,7 @@ impl ReplicaRequest<'_> {
 }
 
 impl Downloader {
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -180,7 +181,9 @@ impl Downloader {
                     }
                     (false, None)
                 },
-                () = sleep_until(next_rescue), if !rescues.is_empty() => {
+                () = sleep_until(next_rescue),
+                    if !rescues.is_empty() && active.len() < MAX_CONCURRENT_COPIES =>
+                {
                     (false, rescues.pop_front().map(|(_, index)| index))
                 },
                 () = sleep_until(next_hedge), if hedge_at.is_some() => {

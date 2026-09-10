@@ -1628,4 +1628,95 @@ mod tests {
         }
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn fourth_replica_rescue_reaches_a_healthy_copy_at_full_concurrency() {
+        // Four unmeasured replicas with bucket_timeout == page_timeout. The
+        // primary and two rescue copies keep three slots busy, so the fourth
+        // rescue fires at full concurrency. A recoverable body error from the
+        // third copy frees a slot before the page deadline, and the healthy
+        // fourth replica wins. This exercises the rescue-at-capacity path
+        // (overflow beyond MAX_CONCURRENT_COPIES).
+        let (downloader, script) = scripted_downloader([
+            ("local", 0, 1000, false),
+            ("peer", 0, 1000, false),
+            ("third", 0, 48, true),
+            ("fourth", 0, 5, false),
+        ]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                bucket_timeout: Duration::from_millis(200),
+                page_timeout: Duration::from_millis(200),
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        let output = fetch(&downloader, &["local", "peer", "third", "fourth"]).await;
+        assert_eq!(output.used_bucket_idx, 3);
+        assert!(output.latency < Duration::from_millis(200));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 4);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn five_replicas_chained_fallback_reaches_a_healthy_fifth_at_full_concurrency() {
+        // Five replicas with bucket_timeout == page_timeout. The primary plus
+        // two rescues fill the three-copy cap before the fourth and fifth
+        // rescues can fire. A body error from the third copy triggers a chained
+        // fallback: the fourth (also unhealthy, body error) is tried and then
+        // the healthy fifth wins — all before the page deadline.
+        let (downloader, script) = scripted_downloader([
+            ("local", 0, 1000, false),
+            ("peer", 0, 1000, false),
+            ("third", 0, 110, true),
+            ("fourth", 0, 20, true),
+            ("fifth", 0, 5, false),
+        ]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                bucket_timeout: Duration::from_millis(300),
+                page_timeout: Duration::from_millis(300),
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        let output = fetch(&downloader, &["local", "peer", "third", "fourth", "fifth"]).await;
+        assert_eq!(output.used_bucket_idx, 4);
+        assert!(output.latency < Duration::from_millis(300));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 5);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn four_replicas_all_stalling_at_equal_deadline_time_out_without_leaking_copies() {
+        // Four replicas with bucket_timeout == page_timeout where all copies
+        // stall to the page deadline. The fourth rescue fires at full
+        // concurrency and is deferred; no copy completes before the deadline,
+        // so the fourth replica is not launched (no time budget remains). The
+        // request times out cleanly with exactly three backend requests and no
+        // leaked active copies.
+        let (downloader, script) = scripted_downloader([
+            ("local", 0, 1000, false),
+            ("peer", 0, 1000, false),
+            ("third", 0, 1000, false),
+            ("fourth", 0, 1000, false),
+        ]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                bucket_timeout: Duration::from_millis(200),
+                page_timeout: Duration::from_millis(200),
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        let result = fetch_with_config(
+            &downloader,
+            &["local", "peer", "third", "fourth"],
+            &RequestConfig::default(),
+        )
+        .await;
+        assert!(matches!(result, Err(DownloadError::Timeout { .. })));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
 }
