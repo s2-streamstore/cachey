@@ -24,7 +24,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     object_store::{DownloadError, RequestConfig},
-    service::{CacheyService, Chunk, ServiceError, metrics},
+    service::{CacheyService, Chunk, PAGE_SIZE, ServiceError, metrics},
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
 };
 
@@ -261,11 +261,8 @@ pub async fn fetch(
             let object_size = chunk.object_size;
             let first_byte = chunk.range.start;
             let last_byte = byterange.end.min(object_size) - 1;
+            let content_length = last_byte - first_byte + 1;
             headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
-            headers.insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from(last_byte - first_byte + 1),
-            );
             headers.insert(
                 header::CONTENT_RANGE,
                 HeaderValue::try_from(format!("bytes {first_byte}-{last_byte}/{object_size}"))
@@ -279,6 +276,13 @@ pub async fn fetch(
                 .unwrap(),
             );
             headers.insert("c0-status", c0_status(chunk));
+
+            let single_page = first_byte / PAGE_SIZE == last_byte / PAGE_SIZE;
+            if method == axum::http::Method::HEAD || single_page {
+                headers.insert(header::CONTENT_LENGTH, HeaderValue::from(content_length));
+            } else {
+                headers.insert(header::TRAILER, HeaderValue::from_static("c0-status"));
+            }
         }
         Err(e) => {
             let (status, headers) = on_chunk_error(&kind, &method, 0, e);
