@@ -1599,6 +1599,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn denied_rescue_does_not_mask_the_active_copys_timeout() {
+        let (downloader, script) = scripted_downloader([("local", 200, 0, false)]);
+        let page_timeout = Duration::from_millis(100);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                page_timeout,
+                bucket_timeout: page_timeout,
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        for bucket in ["local", "peer"] {
+            downloader
+                .bucketed_stats
+                .begin(&BucketName::new(bucket).unwrap(), None)
+                .complete(crate::object_store::stats::Outcome::Overload);
+        }
+        assert!(downloader.attempt_budget.try_retry());
+        let start = tokio::time::Instant::now();
+        let result =
+            fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
+        assert!(
+            matches!(result, Err(DownloadError::Timeout { ref bucket, timeout })
+                if &**bucket == "local" && timeout == page_timeout),
+            "{result:?}"
+        );
+        assert_eq!(start.elapsed(), page_timeout);
+        assert_eq!(script.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn page_expiry_records_timeouts_for_copies_given_enough_time() {
         let (downloader, script) = scripted_downloader([
             ("local", 1000, 0, false),
@@ -1627,5 +1659,108 @@ mod tests {
             assert!(metrics(&downloader, bucket).await.deprioritized, "{bucket}");
         }
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_timeouts_preserve_backend_failures() {
+        for peer_latency in [5, 150] {
+            let (downloader, script) =
+                scripted_downloader([("local", 0, 2, true), ("peer", 200, 0, false)]);
+            let downloader = downloader
+                .with_test_limits(DownloadLimits {
+                    page_timeout: Duration::from_millis(100),
+                    hedge_budget_percent: 0,
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            seed_latency(&downloader, "local", 2).await;
+            seed_latency(&downloader, "peer", peer_latency).await;
+            let start = tokio::time::Instant::now();
+            let result =
+                fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
+            assert!(
+                matches!(result, Err(DownloadError::BodyStreaming(_))),
+                "{result:?}"
+            );
+            assert_eq!(start.elapsed(), Duration::from_millis(100));
+            assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_can_succeed_despite_a_historical_tail_beyond_the_deadline() {
+        let (downloader, script) =
+            scripted_downloader([("local", 0, 2, true), ("peer", 5, 0, false)]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                page_timeout: Duration::from_millis(100),
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        seed_latency(&downloader, "local", 2).await;
+        seed_latency(&downloader, "peer", 150).await;
+        let output = fetch(&downloader, &["local", "peer"]).await;
+        assert_eq!(output.used_bucket_idx, 1);
+        assert_eq!(output.latency, Duration::from_millis(7));
+        assert_eq!(output.piece.data, Bytes::from_static(b"data"));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_admission_timeout_preserves_backend_failure_but_overrides_missing() {
+        for missing in [false, true] {
+            let (downloader, script) = scripted_downloader([("local", 2, 0, true)]);
+            if missing {
+                script.service_errors.lock().insert(0, 404);
+            }
+            let page_timeout = Duration::from_millis(100);
+            let downloader = downloader
+                .with_test_limits(DownloadLimits {
+                    page_timeout,
+                    max_inflight_requests: 1,
+                    max_inflight_bytes: 4,
+                    hedge_budget_percent: 0,
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            seed_latency(&downloader, "local", 2).await;
+            seed_latency(&downloader, "peer", 5).await;
+            let start = tokio::time::Instant::now();
+            let read = async {
+                let result =
+                    fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default())
+                        .await;
+                assert_eq!(start.elapsed(), page_timeout);
+                result
+            };
+            let competing_read = async {
+                sleep(Duration::from_millis(1)).await;
+                let permit = downloader
+                    .admission
+                    .acquire(4, start + page_timeout)
+                    .await
+                    .unwrap();
+                sleep(page_timeout).await;
+                drop(permit);
+            };
+            let (result, ()) = tokio::join!(read, competing_read);
+            if missing {
+                assert!(
+                    matches!(result, Err(DownloadError::AdmissionTimeout)),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(DownloadError::BodyStreaming(_))),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(script.requests.load(Ordering::SeqCst), 1);
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+            assert!(downloader.admission.try_acquire(4).is_some());
+        }
     }
 }

@@ -22,6 +22,27 @@ const MAX_CONCURRENT_COPIES: usize = 3;
 
 type Completion = (usize, Result<ObjectPiece, DownloadError>);
 
+fn record_fallback_error(last_error: &mut Option<DownloadError>, error: DownloadError) {
+    let priority = |error: &DownloadError| match error {
+        DownloadError::NoSuchKey => 0,
+        DownloadError::AdmissionTimeout => 1,
+        DownloadError::Timeout { .. } => 2,
+        DownloadError::InvalidObjectState(_)
+        | DownloadError::InvalidResponse(_)
+        | DownloadError::BodyStreaming(_)
+        | DownloadError::Overloaded(_)
+        | DownloadError::Unknown(_)
+        | DownloadError::RangeNotSatisfied { .. }
+        | DownloadError::AdmissionExhausted { .. } => 3,
+    };
+    if last_error
+        .as_ref()
+        .is_none_or(|previous| priority(&error) >= priority(previous))
+    {
+        *last_error = Some(error);
+    }
+}
+
 pub(super) struct AttemptPermits {
     admission: DownloadPermit,
     hedge: Option<HedgePermit>,
@@ -160,6 +181,7 @@ impl Downloader {
         let mut active = FuturesUnordered::new();
         active.push(request.attempt(primary, probe, primary_permits));
         let mut last_error = None;
+        let mut retry_budget_exhausted = false;
         while !active.is_empty() {
             let next_rescue = rescues
                 .front()
@@ -172,9 +194,7 @@ impl Downloader {
                         Ok(piece) => return Ok(request.output(piece, primary, index, start)),
                         Err(error) => {
                             if !error.should_attempt_fallback_bucket() { return Err(error); }
-                            if last_error.is_none() || !matches!(error, DownloadError::NoSuchKey) {
-                                last_error = Some(error);
-                            }
+                            record_fallback_error(&mut last_error, error);
                             hedge_at = None;
                         }
                     }
@@ -202,11 +222,7 @@ impl Downloader {
                 continue;
             };
             if overloaded && !self.attempt_budget.try_retry() {
-                if matches!(last_error, None | Some(DownloadError::NoSuchKey)) {
-                    last_error = Some(DownloadError::Overloaded(
-                        "Replica retry budget exhausted during widespread overload".to_owned(),
-                    ));
-                }
+                retry_budget_exhausted = true;
                 continue;
             }
             let permits = if early {
@@ -224,9 +240,15 @@ impl Downloader {
             tried[index] = true;
             active.push(request.attempt(index, None, permits));
         }
-        Err(last_error.unwrap_or_else(|| {
-            DownloadError::Unknown("No replica could complete the read".to_owned())
-        }))
+        Err(match last_error {
+            None | Some(DownloadError::NoSuchKey) if retry_budget_exhausted => {
+                DownloadError::Overloaded(
+                    "Replica retry budget exhausted during widespread overload".to_owned(),
+                )
+            }
+            Some(error) => error,
+            None => DownloadError::Unknown("No replica could complete the read".to_owned()),
+        })
     }
 
     pub(super) fn hedge_permits(
@@ -269,5 +291,82 @@ impl Downloader {
             }),
             backup_admission,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{mem::discriminant, time::Duration};
+
+    use super::{DownloadError, record_fallback_error};
+    use crate::types::BucketName;
+
+    fn timeout(bucket: &str) -> DownloadError {
+        DownloadError::Timeout {
+            bucket: BucketName::new(bucket).unwrap(),
+            timeout: Duration::from_millis(50),
+        }
+    }
+
+    fn backend_errors() -> [DownloadError; 5] {
+        [
+            DownloadError::InvalidObjectState("archived object".to_owned()),
+            DownloadError::InvalidResponse("invalid content range".to_owned()),
+            DownloadError::BodyStreaming("connection reset".to_owned()),
+            DownloadError::Overloaded("slow down".to_owned()),
+            DownloadError::Unknown("service failure".to_owned()),
+        ]
+    }
+
+    fn assert_accumulated_error(errors: [DownloadError; 2], expected: &DownloadError) {
+        let mut last_error = None;
+        for error in errors {
+            record_fallback_error(&mut last_error, error);
+        }
+        let actual = last_error.unwrap();
+        assert_eq!(discriminant(&actual), discriminant(expected), "{actual:?}");
+        assert_eq!(actual.to_string(), expected.to_string());
+    }
+
+    fn assert_preferred_in_either_order(preferred: &DownloadError, other: &DownloadError) {
+        assert_accumulated_error([preferred.clone(), other.clone()], preferred);
+        assert_accumulated_error([other.clone(), preferred.clone()], preferred);
+    }
+
+    #[test]
+    fn partial_misses_do_not_mask_other_replica_errors() {
+        for error in backend_errors()
+            .into_iter()
+            .chain([DownloadError::AdmissionTimeout, timeout("peer")])
+        {
+            assert_preferred_in_either_order(&error, &DownloadError::NoSuchKey);
+        }
+    }
+
+    #[test]
+    fn backend_errors_survive_timeout_and_admission_failures() {
+        for error in backend_errors() {
+            for fallback in [DownloadError::AdmissionTimeout, timeout("peer")] {
+                assert_preferred_in_either_order(&error, &fallback);
+            }
+        }
+    }
+
+    #[test]
+    fn download_timeout_survives_admission_failure() {
+        assert_preferred_in_either_order(&timeout("peer"), &DownloadError::AdmissionTimeout);
+    }
+
+    #[test]
+    fn equally_relevant_errors_preserve_the_latest_diagnostic() {
+        let primary = DownloadError::BodyStreaming("primary connection reset".to_owned());
+        for fallback in [
+            DownloadError::BodyStreaming("fallback stream truncated".to_owned()),
+            DownloadError::Overloaded("fallback throttled".to_owned()),
+        ] {
+            assert_accumulated_error([primary.clone(), fallback.clone()], &fallback);
+        }
+        let fallback = timeout("fallback");
+        assert_accumulated_error([timeout("primary"), fallback.clone()], &fallback);
     }
 }
