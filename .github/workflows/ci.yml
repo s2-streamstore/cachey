@@ -26,7 +26,7 @@ jobs:
     name: Rust dependency cooldown gate
     permissions:
       contents: read
-    uses: s2-streamstore/s2/.github/workflows/rust-dependency-cooldown.yml@97411e90049539d264ea9eda0efd2802548dae6b
+    uses: s2-streamstore/s2/.github/workflows/rust-dependency-cooldown.yml@bfe6588322125d42440f2a6e8530a16d36cec801
 
   conventional-commit:
     name: conventional commit
