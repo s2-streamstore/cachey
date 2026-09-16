@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/s2-streamstore/cachey/compare/0.11.0...0.11.1) - 2026-09-16
+
+### Fixed
+
+- *(downloader)* preserve backend errors across fallback timeouts ([#147](https://github.com/s2-streamstore/cachey/pull/147))
+
+### Other
+
+- adopt dependency cooldown security exceptions ([#149](https://github.com/s2-streamstore/cachey/pull/149))
+- clarify HTTP/2 requirement for per-page trailers
+
 ## [0.11.0](https://github.com/s2-streamstore/cachey/compare/0.10.15...0.11.0) - 2026-09-09
 
 ### Fixed
