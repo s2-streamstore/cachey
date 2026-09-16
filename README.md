@@ -76,7 +76,11 @@ The service maps requests to 16 MiB page-aligned ranges and the response has sta
 `C0-Status` format: `{first}-{last}; {bucket}; {cached_at}`
 - Byte range and which bucket was used
 - `cached_at` is Unix timestamp with 0 implying a cache miss
-- Only first page status is sent as a header; status for subsequent pages follows the body as trailers
+- First page status is sent as a header over both HTTP/1.1 and HTTP/2
+- Multi-page GET responses include subsequent page statuses as trailers over HTTP/2 only
+
+Use HTTP/2 when you need per-page status for a multi-page read. HTTP/1.1 responses
+include `Content-Length` and only the first page's status.
 
 #### Example Response
 
@@ -88,8 +92,6 @@ Content-Type: application/octet-stream
 C0-Status: 1048576-16777215; us-west-videos; 1704067200
 
 <data>
-
-C0-Status: 16777216-18874367; us-west-videos; 0
 ```
 
 ### Monitoring

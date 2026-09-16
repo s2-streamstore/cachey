@@ -74,5 +74,10 @@ primary start. Latency histograms exclude failures and client body transmission.
 overlapped, including rescue and recovery probes; the page `fallback` metric counts
 successes from a bucket other than the initial choice.
 
+HTTP responses expose the serving bucket and cache status through `C0-Status`.
+The first page's status is a response header. For multi-page GET responses,
+subsequent pages' statuses require HTTP/2 and arrive as trailers after the body.
+HTTP/1.1 provides only the first page's status.
+
 See the [simulation harness](simulation/README.md) and
 [reference results](simulation/REFERENCE.md).
