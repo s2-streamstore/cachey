@@ -51,9 +51,14 @@ Rust callers configure `DownloadLimits` through `Downloader::new` or
 `ServiceConfig::download_limits`, with an additional default limit of 1,024 active
 copies. The server requires memory for at least one page.
 
-Admission failure or backend overload returns HTTP 503; timeouts return 504. Missing
-replicas cannot hide another replica's backend failure. Failures after response
-streaming begins terminate the body.
+Admission failure or backend overload returns HTTP 503; timeouts return 504. When a
+multi-bucket read fails, backend errors take precedence over timeouts, timeouts over
+admission failures, and admission failures over missing objects. The latest error
+within the same category is returned. This preserves backend diagnostics and
+prevents a partial miss from hiding a timeout or admission failure. Error precedence
+is independent of bucket-health scoring and historical latency. Exhausting the
+retry budget produces HTTP 503 if the read would otherwise report only missing
+objects. Failures after response streaming begins terminate the body.
 
 ## Metrics
 
