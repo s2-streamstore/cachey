@@ -7,10 +7,15 @@ health, then recent complete-read latency. The first client-supplied bucket has 
 locality preference: its latency is compared with 1.5 times each alternative's.
 Every supplied bucket remains eligible for fallback.
 
+A backend `InvalidRange` (HTTP 416) response also permits fallback: an empty or
+shorter copy in one bucket does not establish the object size in another. If no
+replica serves the range, the read fails using the error precedence described below.
+Empty or reversed request ranges are rejected before contacting any bucket.
+
 A single backend failure immediately deprioritizes a bucket, favoring prompt failover
 at the cost of extra cross-zone reads after isolated errors. Missing objects, invalid
-client ranges, cancellation, and admission failures do not affect health. Timeouts count
-against health when the copy had enough time for its expected latency. The error
+or unsatisfied ranges, cancellation, and admission failures do not affect health.
+Timeouts count against health when the copy had enough time for its expected latency. The error
 fraction decays, but restoring normal preference requires 20 successful operations
 started after the latest failure. After 24–36 seconds, a previously competitive
 bucket—or one that failed before its first successful read—can receive an exclusive
