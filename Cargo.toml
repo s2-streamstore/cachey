@@ -8,56 +8,52 @@ repository = "https://github.com/s2-streamstore/cachey"
 description = "Read-through cache for object storage"
 
 [dependencies]
-async-stream = "0.3"
-aws-config = "1.11"
-aws-sdk-s3 = { version = "1", default-features = false, features = [
-    "behavior-version-latest",
-    "rt-tokio",
-    "default-https-client",
-] }
-aws-smithy-runtime-api = "1.15"
-axum = { version = "0.8", features = ["macros"] }
-axum-server = { version = "0.8", features = ["tls-rustls"] }
-bytes = "1.12"
-bytesize = "2.7"
-clap = { version = "4.6", features = ["derive"] }
-compact_str = { version = "0.10", features = ["serde"] }
-dashmap = "6.2"
-exponential-decay-histogram = "0.1"
-eyre = "0.6"
-foyer = "0.22"
-futures = "0.3"
-http = "1.5"
-http-body = "1.1"
-http-body-util = "0.1"
-http-content-range = "0.2"
+async-stream = "0.3.6"
+aws-config = "1.12.0"
+aws-sdk-s3 = { version = "1.148.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-smithy-runtime-api = "1.16.2"
+axum = { version = "0.8.9", features = ["macros"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+bytes = "1.12.1"
+bytesize = "2.7.0"
+clap = { version = "4.6.7", features = ["derive"] }
+compact_str = { version = "0.10.0", features = ["serde"] }
+dashmap = "6.2.1"
+exponential-decay-histogram = "0.1.16"
+eyre = "0.6.14"
+foyer = "0.22.6"
+futures = "0.3.34"
+http = "1.5.0"
+http-body = "1.1.0"
+http-body-util = "0.1.5"
+http-content-range = "0.2.5"
 http-range-header = "0.4.2"
-httpdate = "1.0"
-itertools = "0.15"
-jemalloc_pprof = { version = "0.9", optional = true, features = ["flamegraph"] }
-mixtrics = { version = "0.2", features = ["prometheus_0_14"] }
-parking_lot = "0.12"
-prometheus = { version = "0.14", features = ["process"] }
-rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
-serde = "1.0"
-thiserror = "2.0"
-tikv-jemallocator = { version = "0.7", optional = true, features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
-tikv-jemalloc-ctl = { version = "0.7", optional = true, features = ["stats"] }
-tokio = { version = "1", features = ["full", "test-util"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
+httpdate = "1.0.3"
+itertools = "0.15.0"
+jemalloc_pprof = { version = "0.9.0", optional = true, features = ["flamegraph"] }
+mixtrics = { version = "0.2.5", features = ["prometheus_0_14"] }
+parking_lot = "0.12.5"
+prometheus = { version = "0.14.0", features = ["process"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+serde = "1.0.229"
+thiserror = "2.0.20"
+tikv-jemallocator = { version = "0.7.0", optional = true, features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.7.0", optional = true, features = ["stats"] }
+tokio = { version = "1.53.1", features = ["full", "test-util"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
 
 [features]
 jemalloc = ["dep:tikv-jemallocator", "dep:jemalloc_pprof", "dep:tikv-jemalloc-ctl"]
 
 [dev-dependencies]
-aws-smithy-types = { version = "1.6.2", features = ["test-util"] }
-hyper = "1"
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http2", "tokio"] }
-proptest = "1.11"
-reqwest = { version = "0.13", features = ["json"] }
-serde_json = "1.0"
-testcontainers = { version = "0.28", default-features = false, features = ["aws-lc-rs", "http_wait"] }
+aws-smithy-types = { version = "1.6.4", features = ["test-util"] }
+hyper = "1.11.1"
+hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http2", "tokio"] }
+proptest = "1.11.0"
+reqwest = { version = "0.13.5", features = ["json"] }
+serde_json = "1.0.151"
+testcontainers = { version = "0.28.0", default-features = false, features = ["aws-lc-rs", "http_wait"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
