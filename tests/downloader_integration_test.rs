@@ -102,3 +102,59 @@ async fn missing_primary_falls_back_without_poisoning_health() {
     assert_eq!(output.used_bucket_idx, 1);
     assert_eq!(output.piece.data, data);
 }
+
+#[tokio::test]
+async fn unsatisfied_ranges_fall_back_to_other_replicas() {
+    let ctx = setup_rustfs().await;
+    let peers = ["missing-bucket", "fallback-bucket"];
+    for peer in peers {
+        ctx.client
+            .create_bucket()
+            .bucket(peer)
+            .send()
+            .await
+            .unwrap();
+    }
+    let buckets = BucketNameSet::new(
+        std::iter::once(ctx.bucket_name.as_str())
+            .chain(peers)
+            .map(|name| BucketName::new(name).unwrap()),
+    )
+    .unwrap();
+    let data = Bytes::from_static(b"replicated object");
+    for primary_size in [0, 4] {
+        let downloader = make_downloader(ctx.client.clone());
+        let key = ObjectKey::new(format!("object-{primary_size}")).unwrap();
+        upload_test_object(
+            &ctx.client,
+            &ctx.bucket_name,
+            &key,
+            data.slice(..primary_size),
+        )
+        .await;
+        upload_test_object(&ctx.client, peers[1], &key, data.clone()).await;
+
+        let output = downloader
+            .download(
+                &buckets,
+                key.clone(),
+                &(primary_size as u64..PAGE_SIZE),
+                &RequestConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.primary_bucket_idx, 0);
+        assert_eq!(output.used_bucket_idx, 2);
+        assert_eq!(output.piece.data, data.slice(primary_size..));
+        assert_eq!(output.piece.object_size, data.len() as u64);
+
+        let range = data.len() as u64..PAGE_SIZE;
+        let error = downloader
+            .download(&buckets, key, &range, &RequestConfig::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, DownloadError::RangeNotSatisfied { requested, .. } if requested == range)
+        );
+    }
+}

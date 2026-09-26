@@ -63,9 +63,10 @@ pub enum DownloadError {
 impl DownloadError {
     fn should_attempt_fallback_bucket(&self) -> bool {
         match self {
-            Self::RangeNotSatisfied { .. } | Self::AdmissionExhausted { .. } => false,
+            Self::AdmissionExhausted { .. } => false,
             Self::InvalidObjectState(_)
             | Self::NoSuchKey
+            | Self::RangeNotSatisfied { .. }
             | Self::InvalidResponse(_)
             | Self::BodyStreaming(_)
             | Self::Overloaded(_)
