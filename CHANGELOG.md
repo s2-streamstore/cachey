@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2](https://github.com/s2-streamstore/cachey/compare/0.11.1...0.11.2) - 2026-09-26
+
+### Fixed
+
+- *(downloader)* fall back on unsatisfied replica ranges ([#150](https://github.com/s2-streamstore/cachey/pull/150))
+
+### Other
+
+- *(deps)* upgrade dependencies within seven-day cooldown ([#152](https://github.com/s2-streamstore/cachey/pull/152))
+
 ## [0.11.1](https://github.com/s2-streamstore/cachey/compare/0.11.0...0.11.1) - 2026-09-16
 
 ### Fixed
