@@ -550,6 +550,7 @@ mod tests {
         requests: AtomicUsize,
         active: AtomicUsize,
         service_errors: Mutex<HashMap<usize, u16>>,
+        range_error_sizes: Mutex<HashMap<usize, u64>>,
     }
 
     impl HttpConnector for ScriptedConnector {
@@ -558,6 +559,12 @@ mod tests {
             self.state.active.fetch_add(1, Ordering::SeqCst);
             let active = ActiveRequest(self.state.clone());
             let service_error = self.state.service_errors.lock().get(&request_idx).copied();
+            let object_size = self
+                .state
+                .range_error_sizes
+                .lock()
+                .get(&request_idx)
+                .copied();
             let (bucket, headers_ms, body_ms, fail_body) = self
                 .responses
                 .lock()
@@ -571,15 +578,21 @@ mod tests {
             HttpConnectorFuture::new(async move {
                 sleep(Duration::from_millis(headers_ms)).await;
                 if let Some(status) = service_error {
-                    let code = if status == 404 {
-                        "NoSuchKey"
-                    } else {
-                        "SlowDown"
+                    let code = match status {
+                        404 => "NoSuchKey",
+                        416 => "InvalidRange",
+                        _ => "SlowDown",
                     };
-                    return Ok(HttpResponse::new(
+                    let mut response = HttpResponse::new(
                         status.try_into().unwrap(),
                         SdkBody::from(format!("<Error><Code>{code}</Code></Error>")),
-                    ));
+                    );
+                    if let Some(object_size) = object_size {
+                        response
+                            .headers_mut()
+                            .insert("content-range", format!("bytes */{object_size}"));
+                    }
+                    return Ok(response);
                 }
                 let body = StreamBody::new(futures::stream::once(async move {
                     let _active = active;
@@ -731,6 +744,49 @@ mod tests {
         assert!(
             matches!(error, DownloadError::RangeNotSatisfied { requested, object_size: Some(512) } if requested == (1024..2048))
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replica_range_errors_retain_size_across_backend_failures() {
+        for fallback_size in [Some(0), None] {
+            let (downloader, script) = scripted_downloader([
+                ("primary", 1, 0, false),
+                ("peer", 1, 0, false),
+                ("fallback", 1, 0, false),
+            ]);
+            script
+                .service_errors
+                .lock()
+                .extend([(0, 416), (1, 503), (2, 416)]);
+            script.range_error_sizes.lock().insert(0, 17);
+            if let Some(size) = fallback_size {
+                script.range_error_sizes.lock().insert(2, size);
+            }
+            let buckets = BucketNameSet::new(
+                ["primary", "peer", "fallback"]
+                    .into_iter()
+                    .map(|name| BucketName::new(name).unwrap()),
+            )
+            .unwrap();
+            let error = downloader
+                .download(
+                    &buckets,
+                    ObjectKey::new("object").unwrap(),
+                    &(32..64),
+                    &RequestConfig::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    DownloadError::RangeNotSatisfied { ref requested, object_size: Some(17) }
+                        if requested == &(32..64)
+                ),
+                "{error:?}"
+            );
+            assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        }
     }
 
     #[test]

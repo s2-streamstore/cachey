@@ -65,6 +65,11 @@ is independent of bucket-health scoring and historical latency. Exhausting the
 retry budget produces HTTP 503 if the read would otherwise report only missing
 objects. Failures after response streaming begins terminate the body.
 
+If the selected error is an unsatisfied range, it carries the largest known object
+size from all observed unsatisfied-range responses, even across intervening errors
+or responses without a size. This is the largest observed size; it does not establish
+an authoritative size or replica agreement.
+
 ## Metrics
 
 | Measurement | Meaning |
