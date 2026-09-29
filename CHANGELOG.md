@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3](https://github.com/s2-streamstore/cachey/compare/0.11.2...0.11.3) - 2026-09-29
+
+### Fixed
+
+- *(downloader)* preserve object sizes across replica failures ([#155](https://github.com/s2-streamstore/cachey/pull/155))
+
 ## [0.11.2](https://github.com/s2-streamstore/cachey/compare/0.11.1...0.11.2) - 2026-09-26
 
 ### Fixed
