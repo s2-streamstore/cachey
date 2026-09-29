@@ -22,24 +22,43 @@ const MAX_CONCURRENT_COPIES: usize = 3;
 
 type Completion = (usize, Result<ObjectPiece, DownloadError>);
 
-fn record_fallback_error(last_error: &mut Option<DownloadError>, error: DownloadError) {
-    let priority = |error: &DownloadError| match error {
-        DownloadError::NoSuchKey => 0,
-        DownloadError::AdmissionTimeout => 1,
-        DownloadError::Timeout { .. } => 2,
-        DownloadError::InvalidObjectState(_)
-        | DownloadError::InvalidResponse(_)
-        | DownloadError::BodyStreaming(_)
-        | DownloadError::Overloaded(_)
-        | DownloadError::Unknown(_)
-        | DownloadError::RangeNotSatisfied { .. }
-        | DownloadError::AdmissionExhausted { .. } => 3,
-    };
-    if last_error
-        .as_ref()
-        .is_none_or(|previous| priority(&error) >= priority(previous))
-    {
-        *last_error = Some(error);
+#[derive(Default)]
+struct FallbackErrors {
+    last_error: Option<DownloadError>,
+    largest_object_size: Option<u64>,
+}
+
+impl FallbackErrors {
+    fn record(&mut self, error: DownloadError) {
+        if let DownloadError::RangeNotSatisfied { object_size, .. } = &error {
+            self.largest_object_size = self.largest_object_size.max(*object_size);
+        }
+        let priority = |error: &DownloadError| match error {
+            DownloadError::NoSuchKey => 0,
+            DownloadError::AdmissionTimeout => 1,
+            DownloadError::Timeout { .. } => 2,
+            DownloadError::InvalidObjectState(_)
+            | DownloadError::InvalidResponse(_)
+            | DownloadError::BodyStreaming(_)
+            | DownloadError::Overloaded(_)
+            | DownloadError::Unknown(_)
+            | DownloadError::RangeNotSatisfied { .. }
+            | DownloadError::AdmissionExhausted { .. } => 3,
+        };
+        if self
+            .last_error
+            .as_ref()
+            .is_none_or(|previous| priority(&error) >= priority(previous))
+        {
+            self.last_error = Some(error);
+        }
+    }
+
+    fn into_error(mut self) -> Option<DownloadError> {
+        if let Some(DownloadError::RangeNotSatisfied { object_size, .. }) = &mut self.last_error {
+            *object_size = self.largest_object_size;
+        }
+        self.last_error
     }
 }
 
@@ -180,7 +199,7 @@ impl Downloader {
                 .then(|| start + threshold.min(self.limits.page_timeout));
         let mut active = FuturesUnordered::new();
         active.push(request.attempt(primary, probe, primary_permits));
-        let mut last_error = None;
+        let mut fallback_errors = FallbackErrors::default();
         let mut retry_budget_exhausted = false;
         while !active.is_empty() {
             let next_rescue = rescues
@@ -194,7 +213,7 @@ impl Downloader {
                         Ok(piece) => return Ok(request.output(piece, primary, index, start)),
                         Err(error) => {
                             if !error.should_attempt_fallback_bucket() { return Err(error); }
-                            record_fallback_error(&mut last_error, error);
+                            fallback_errors.record(error);
                             hedge_at = None;
                         }
                     }
@@ -240,7 +259,7 @@ impl Downloader {
             tried[index] = true;
             active.push(request.attempt(index, None, permits));
         }
-        Err(match last_error {
+        Err(match fallback_errors.into_error() {
             None | Some(DownloadError::NoSuchKey) if retry_budget_exhausted => {
                 DownloadError::Overloaded(
                     "Replica retry budget exhausted during widespread overload".to_owned(),
@@ -298,7 +317,9 @@ impl Downloader {
 mod tests {
     use std::{mem::discriminant, time::Duration};
 
-    use super::{DownloadError, record_fallback_error};
+    use itertools::Itertools;
+
+    use super::{DownloadError, FallbackErrors};
     use crate::types::BucketName;
 
     fn timeout(bucket: &str) -> DownloadError {
@@ -318,12 +339,15 @@ mod tests {
         ]
     }
 
-    fn assert_accumulated_error(errors: [DownloadError; 2], expected: &DownloadError) {
-        let mut last_error = None;
+    fn assert_accumulated_error(
+        errors: impl IntoIterator<Item = DownloadError>,
+        expected: &DownloadError,
+    ) {
+        let mut fallback_errors = FallbackErrors::default();
         for error in errors {
-            record_fallback_error(&mut last_error, error);
+            fallback_errors.record(error);
         }
-        let actual = last_error.unwrap();
+        let actual = fallback_errors.into_error().unwrap();
         assert_eq!(discriminant(&actual), discriminant(expected), "{actual:?}");
         assert_eq!(actual.to_string(), expected.to_string());
     }
@@ -368,5 +392,64 @@ mod tests {
         }
         let fallback = timeout("fallback");
         assert_accumulated_error([timeout("primary"), fallback.clone()], &fallback);
+    }
+
+    fn range_error(object_size: Option<u64>) -> DownloadError {
+        DownloadError::RangeNotSatisfied {
+            requested: 32..64,
+            object_size,
+        }
+    }
+
+    #[test]
+    fn unsatisfied_ranges_preserve_the_largest_known_size_in_any_order() {
+        for sizes in [
+            [Some(17), Some(4), Some(0)],
+            [Some(17), None, Some(0)],
+            [Some(0), None, None],
+            [None, None, None],
+        ] {
+            let expected = range_error(sizes.into_iter().flatten().max());
+            for ordering in sizes.into_iter().permutations(sizes.len()) {
+                assert_accumulated_error(ordering.into_iter().map(range_error), &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn range_sizes_survive_intervening_backend_errors() {
+        for backend_error in backend_errors() {
+            for size in [Some(0), Some(4), None] {
+                assert_accumulated_error(
+                    [
+                        range_error(Some(17)),
+                        backend_error.clone(),
+                        range_error(size),
+                    ],
+                    &range_error(Some(17)),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn range_size_evidence_preserves_error_precedence() {
+        for backend_error in backend_errors() {
+            assert_accumulated_error(
+                [
+                    range_error(Some(17)),
+                    range_error(Some(0)),
+                    backend_error.clone(),
+                ],
+                &backend_error,
+            );
+        }
+        for error in [
+            DownloadError::NoSuchKey,
+            DownloadError::AdmissionTimeout,
+            timeout("peer"),
+        ] {
+            assert_preferred_in_either_order(&range_error(Some(17)), &error);
+        }
     }
 }
