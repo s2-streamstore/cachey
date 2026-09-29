@@ -35,10 +35,21 @@ fn record_fallback_error(last_error: &mut Option<DownloadError>, error: Download
         | DownloadError::RangeNotSatisfied { .. }
         | DownloadError::AdmissionExhausted { .. } => 3,
     };
-    if last_error
-        .as_ref()
-        .is_none_or(|previous| priority(&error) >= priority(previous))
-    {
+    let replace = match (&error, last_error.as_ref()) {
+        (
+            DownloadError::RangeNotSatisfied {
+                object_size: Some(new),
+                ..
+            },
+            Some(DownloadError::RangeNotSatisfied {
+                object_size: Some(prev),
+                ..
+            }),
+        ) => new >= prev,
+        (error, Some(previous)) => priority(error) >= priority(previous),
+        _ => true,
+    };
+    if replace {
         *last_error = Some(error);
     }
 }
@@ -368,5 +379,57 @@ mod tests {
         }
         let fallback = timeout("fallback");
         assert_accumulated_error([timeout("primary"), fallback.clone()], &fallback);
+    }
+
+    #[test]
+    fn range_not_satisfied_fallbacks_keep_the_largest_object_size() {
+        let range = 20..30;
+        let full = DownloadError::RangeNotSatisfied {
+            requested: range.clone(),
+            object_size: Some(17),
+        };
+        let truncated = DownloadError::RangeNotSatisfied {
+            requested: range,
+            object_size: Some(4),
+        };
+        let accumulated = |first: DownloadError, second: DownloadError| {
+            let mut last_error = None;
+            record_fallback_error(&mut last_error, first);
+            record_fallback_error(&mut last_error, second);
+            last_error.unwrap()
+        };
+        let result = accumulated(full.clone(), truncated.clone());
+        assert!(
+            matches!(
+                result,
+                DownloadError::RangeNotSatisfied {
+                    object_size: Some(17),
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        let result = accumulated(truncated, full);
+        assert!(
+            matches!(
+                result,
+                DownloadError::RangeNotSatisfied {
+                    object_size: Some(17),
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn range_not_satisfied_survives_lower_priority_fallback_errors() {
+        let range_not_satisfied = DownloadError::RangeNotSatisfied {
+            requested: 0..4,
+            object_size: Some(17),
+        };
+        assert_preferred_in_either_order(&range_not_satisfied, &DownloadError::NoSuchKey);
+        assert_preferred_in_either_order(&range_not_satisfied, &DownloadError::AdmissionTimeout);
+        assert_preferred_in_either_order(&range_not_satisfied, &timeout("peer"));
     }
 }

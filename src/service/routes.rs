@@ -550,6 +550,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn range_not_satisfied_emits_416_with_object_size_content_range() {
+        let kind = ObjectKind::new("range-error").unwrap();
+        for object_size in [0u64, 17, 1 << 20] {
+            let error = ServiceError::Download(DownloadError::RangeNotSatisfied {
+                requested: object_size + 1..object_size + 2,
+                object_size: Some(object_size),
+            });
+            let (status, headers) = on_chunk_error(&kind, &Method::GET, 0, &error);
+            assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+            assert_eq!(
+                headers
+                    .get(header::CONTENT_RANGE)
+                    .map(|value| value.to_str().unwrap()),
+                Some(format!("bytes */{object_size}").as_str()),
+            );
+        }
+        let error = ServiceError::Download(DownloadError::RangeNotSatisfied {
+            requested: 20..30,
+            object_size: None,
+        });
+        let (status, headers) = on_chunk_error(&kind, &Method::GET, 0, &error);
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert!(headers.get(header::CONTENT_RANGE).is_none());
+    }
+
     #[tokio::test]
     async fn c0_config_parses_settings_and_ignores_unknown_keys() {
         let config = parse_c0_config(Some(HeaderValue::from_static(
