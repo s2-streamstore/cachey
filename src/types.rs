@@ -1,4 +1,4 @@
-use std::{ops::Deref, str::FromStr};
+use std::ops::Deref;
 
 use compact_str::CompactString;
 use itertools::Itertools;
@@ -84,14 +84,6 @@ impl<'de> Deserialize<'de> for ObjectKind {
     }
 }
 
-impl FromStr for ObjectKind {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::new(CompactString::from(s))
-    }
-}
-
 impl Deref for ObjectKind {
     type Target = str;
 
@@ -140,14 +132,6 @@ impl<'de> Deserialize<'de> for ObjectKey {
     }
 }
 
-impl FromStr for ObjectKey {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::new(CompactString::from(s))
-    }
-}
-
 impl Deref for ObjectKey {
     type Target = str;
 
@@ -180,15 +164,6 @@ impl std::ops::Deref for BucketNameSet {
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-impl IntoIterator for BucketNameSet {
-    type Item = BucketName;
-    type IntoIter = std::vec::IntoIter<BucketName>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
     }
 }
 
