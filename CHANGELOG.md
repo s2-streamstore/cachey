@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.4](https://github.com/s2-streamstore/cachey/compare/0.11.3...0.11.4) - 2026-10-07
+
+### Other
+
+- *(types)* remove unused FromStr and IntoIterator impls ([#157](https://github.com/s2-streamstore/cachey/pull/157))
+
 ## [0.11.3](https://github.com/s2-streamstore/cachey/compare/0.11.2...0.11.3) - 2026-09-29
 
 ### Fixed
