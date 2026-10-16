@@ -119,6 +119,9 @@ fn map_get_object_error(
             timeout: elapsed,
         };
     }
+    let http_overload = error
+        .raw_response()
+        .is_some_and(|response| matches!(response.status().as_u16(), 429 | 503));
     let object_size = error
         .raw_response()
         .and_then(|response| response.headers().get("content-range"))
@@ -139,16 +142,18 @@ fn map_get_object_error(
             }
         }
         service_error
-            if matches!(
-                service_error.code(),
-                Some(
-                    "SlowDown"
-                        | "Throttling"
-                        | "ThrottlingException"
-                        | "TooManyRequests"
-                        | "TooManyRequestsException"
-                )
-            ) =>
+            if http_overload
+                || matches!(
+                    service_error.code(),
+                    Some(
+                        "ServiceUnavailable"
+                            | "SlowDown"
+                            | "Throttling"
+                            | "ThrottlingException"
+                            | "TooManyRequests"
+                            | "TooManyRequestsException"
+                    )
+                ) =>
         {
             DownloadError::Overloaded(service_error.to_string())
         }
@@ -503,7 +508,7 @@ mod tests {
 
     use aws_sdk_s3::{
         config::{Credentials, Region, retry::RetryConfig},
-        error::ErrorMetadata,
+        error::{ErrorMetadata, SdkError},
         operation::get_object::{GetObjectError, GetObjectOutput},
         primitives::{ByteStream, SdkBody},
     };
@@ -550,6 +555,7 @@ mod tests {
         requests: AtomicUsize,
         active: AtomicUsize,
         service_errors: Mutex<HashMap<usize, u16>>,
+        service_error_bodies: Mutex<HashMap<usize, &'static str>>,
         range_error_sizes: Mutex<HashMap<usize, u64>>,
     }
 
@@ -559,6 +565,12 @@ mod tests {
             self.state.active.fetch_add(1, Ordering::SeqCst);
             let active = ActiveRequest(self.state.clone());
             let service_error = self.state.service_errors.lock().get(&request_idx).copied();
+            let service_error_body = self
+                .state
+                .service_error_bodies
+                .lock()
+                .get(&request_idx)
+                .copied();
             let object_size = self
                 .state
                 .range_error_sizes
@@ -585,7 +597,10 @@ mod tests {
                     };
                     let mut response = HttpResponse::new(
                         status.try_into().unwrap(),
-                        SdkBody::from(format!("<Error><Code>{code}</Code></Error>")),
+                        SdkBody::from(service_error_body.map_or_else(
+                            || format!("<Error><Code>{code}</Code></Error>"),
+                            str::to_owned,
+                        )),
                     );
                     if let Some(object_size) = object_size {
                         response
@@ -806,6 +821,155 @@ mod tests {
                     if actual == bucket && timeout == elapsed
             ));
         }
+    }
+
+    #[test]
+    fn service_unavailable_and_throttling_codes_are_overload() {
+        for (status, code) in [
+            (503, "ServiceUnavailable"),
+            (503, "SlowDown"),
+            (400, "Throttling"),
+            (400, "ThrottlingException"),
+            (429, "TooManyRequests"),
+            (429, "TooManyRequestsException"),
+        ] {
+            let error = GetObjectError::generic(ErrorMetadata::builder().code(code).build());
+            let response = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
+            let error = map_get_object_error(
+                &BucketName::new("bucket").unwrap(),
+                &(0..4),
+                Duration::from_millis(1),
+                SdkError::service_error(error, response),
+            );
+            assert!(
+                matches!(error, DownloadError::Overloaded(_)),
+                "{code}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unmodeled_http_overload_responses_use_status() {
+        for status in [429, 503] {
+            for body in [
+                "temporarily unavailable",
+                "<html><body>temporarily unavailable</body></html>",
+                "<Error><Message>temporarily unavailable</Message></Error>",
+            ] {
+                let (downloader, script) = scripted_downloader([("bucket", 1, 0, false)]);
+                script.service_errors.lock().insert(0, status);
+                script.service_error_bodies.lock().insert(0, body);
+                let error = downloader
+                    .s3
+                    .get_object()
+                    .bucket("bucket")
+                    .key("object")
+                    .range("bytes=0-3")
+                    .send()
+                    .await
+                    .unwrap_err();
+                let error = map_get_object_error(
+                    &BucketName::new("bucket").unwrap(),
+                    &(0..4),
+                    Duration::from_millis(1),
+                    error,
+                );
+                assert!(
+                    matches!(error, DownloadError::Overloaded(_)),
+                    "HTTP {status} with {body:?}: {error:?}",
+                );
+                assert_eq!(script.requests.load(Ordering::SeqCst), 1);
+                assert_eq!(script.active.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn response_errors_with_overload_status_are_overload() {
+        for status in [429, 503] {
+            let response = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
+            let error = SdkError::response_error(io::Error::other("invalid response"), response);
+            let error = map_get_object_error(
+                &BucketName::new("bucket").unwrap(),
+                &(0..4),
+                Duration::from_millis(1),
+                error,
+            );
+            assert!(matches!(error, DownloadError::Overloaded(_)), "{error:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn other_server_errors_keep_failure_classification() {
+        for status in [500, 502, 504] {
+            let (downloader, script) = scripted_downloader([("bucket", 1, 0, false)]);
+            script.service_errors.lock().insert(0, status);
+            script
+                .service_error_bodies
+                .lock()
+                .insert(0, "<Error><Code>InternalError</Code></Error>");
+            let result =
+                fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+            assert!(
+                matches!(result, Err(DownloadError::Unknown(_))),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn service_unavailable_reaches_a_healthy_replica() {
+        let (downloader, script) =
+            scripted_downloader([("local", 1, 0, false), ("peer", 1, 1, false)]);
+        script.service_errors.lock().insert(0, 503);
+        script
+            .service_error_bodies
+            .lock()
+            .insert(0, "<Error><Code>ServiceUnavailable</Code></Error>");
+        let output = fetch(&downloader, &["local", "peer"]).await;
+        assert_eq!(output.used_bucket_idx, 1);
+        assert_eq!(output.piece.data, Bytes::from_static(b"data"));
+        assert!(
+            downloader
+                .bucketed_stats
+                .overloaded(&BucketName::new("local").unwrap())
+        );
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn service_unavailable_uses_the_shared_overload_budget() {
+        let (downloader, script) = scripted_downloader(
+            (0..15).map(|index| (["local", "peer", "third"][index % 3], 1, 0, false)),
+        );
+        script
+            .service_errors
+            .lock()
+            .extend((0..15).map(|index| (index, 503)));
+        script
+            .service_error_bodies
+            .lock()
+            .extend((0..15).map(|index| (index, "<Error><Code>ServiceUnavailable</Code></Error>")));
+        let mut errors = Vec::new();
+        for _ in 0..5 {
+            errors.push(
+                fetch_with_config(
+                    &downloader.clone(),
+                    &["local", "peer", "third"],
+                    &RequestConfig::default(),
+                )
+                .await
+                .unwrap_err(),
+            );
+        }
+        assert_eq!(script.requests.load(Ordering::SeqCst), 8);
+        assert!(
+            errors
+                .iter()
+                .all(|error| matches!(error, DownloadError::Overloaded(_)))
+        );
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
