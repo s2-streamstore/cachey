@@ -109,7 +109,7 @@ Usage: server [OPTIONS]
 
 Options:
       --memory <MEMORY>
-          Maximum memory to use for cache (e.g., "512MiB", "2GB", "1.5GiB") [default: 4GiB]
+          Retained cache capacity, at least one 16 MiB page plus metadata (e.g., "32MiB", "2GiB") [default: 4GiB]
       --disk-path <DISK_PATH>
           Path to disk cache storage, which may be a directory or block device
       --disk-kind <DISK_KIND>
@@ -139,6 +139,22 @@ Options:
   -V, --version
           Print version
 ```
+
+### Cache memory
+
+`--memory` controls the serialized weight of retained cache entries, including their key and value
+metadata. The server requires at least **16,778,390 bytes**: one complete 16 MiB page plus the maximum
+accepted key, kind, bucket, and header sizes. For example, `--memory 32MiB` is a supported small-cache
+configuration; `--memory 16MiB` returns a configuration error.
+
+Small caches use fewer memory shards so that every shard can hold a complete page within its share
+of the configured capacity. Larger caches retain eight shards. This capacity is separate from active
+downloads (`--max-download-memory`), disk write buffers, runtime allocations, and data still held by
+readers; it is not a process RSS limit.
+
+The low-level Rust `build_cache` API continues to accept smaller capacities for callers caching small
+objects. Those callers must keep each entry within the selected shard's capacity because Foyer can
+retain an individually oversized entry.
 
 ## Development
 

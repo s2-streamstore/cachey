@@ -14,8 +14,20 @@ use mixtrics::registry::prometheus_0_14::PrometheusMetricsRegistry;
 
 use crate::types::{BucketName, ObjectKey, ObjectKind, PageId};
 
+pub(crate) const MAX_PAGE_WEIGHT: usize = crate::service::PAGE_SIZE as usize
+    + ObjectKey::MAX_LEN
+    + ObjectKind::MAX_LEN
+    + BucketName::MAX_LEN
+    + size_of::<CacheKeyHeader>()
+    + size_of::<CacheValueHeader>();
+
 #[derive(Debug)]
 pub struct CacheConfig {
+    /// Capacity measured by the serialized weight of retained entries.
+    ///
+    /// Foyer can retain an entry larger than its shard's capacity. The service requires enough
+    /// capacity for a maximum-sized page; low-level callers using smaller capacities must limit
+    /// their entry sizes accordingly. This does not include in-flight data or disk I/O buffers.
     pub memory_size: ByteSize,
     pub disk_cache: Option<DiskCacheConfig>,
     pub metrics_registry: Option<prometheus::Registry>,
@@ -44,8 +56,11 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
         builder = builder.with_metrics_registry(Box::new(PrometheusMetricsRegistry::new(registry)));
     }
 
+    let memory_capacity = config.memory_size.as_u64() as usize;
+    let shards = (memory_capacity / MAX_PAGE_WEIGHT).clamp(1, 8);
     let mut builder = builder
-        .memory(config.memory_size.as_u64() as usize)
+        .memory(memory_capacity)
+        .with_shards(shards)
         .with_weighter(|key: &CacheKey, value: &CacheValue| {
             key.estimated_size() + value.estimated_size()
         })
@@ -421,10 +436,15 @@ impl foyer::Code for CacheValue {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use bytesize::ByteSize;
     use foyer::Code;
     use proptest::{collection, prop_assert_eq, proptest};
 
-    use super::{CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader};
+    use super::{
+        CacheConfig, CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader, MAX_PAGE_WEIGHT,
+        build_cache,
+    };
     use crate::{
         service::PAGE_SIZE,
         types::{BucketName, ObjectKey, ObjectKind},
@@ -614,5 +634,126 @@ mod tests {
         let header = CacheValueHeader::new(4, 0, 0, 0, 0).unwrap();
         let data = [header.to_bytes().as_slice(), &[0xff; 4]].concat();
         assert!(CacheValue::decode(&mut data.as_slice()).is_err());
+    }
+
+    #[tokio::test]
+    async fn full_pages_respect_small_memory_capacities() {
+        for capacity in [ByteSize::mib(32), ByteSize::mib(64), ByteSize::mib(128)] {
+            for max_length_names in [false, true] {
+                let cache = build_cache(CacheConfig {
+                    memory_size: capacity,
+                    disk_cache: None,
+                    metrics_registry: None,
+                })
+                .await
+                .unwrap();
+                for index in 0..32 {
+                    let key = CacheKey {
+                        kind: ObjectKind::new(if max_length_names {
+                            "k".repeat(ObjectKind::MAX_LEN)
+                        } else {
+                            "kind".to_owned()
+                        })
+                        .unwrap(),
+                        object: ObjectKey::new(if max_length_names {
+                            format!("{index:0width$}", width = ObjectKey::MAX_LEN)
+                        } else {
+                            format!("object-{index}")
+                        })
+                        .unwrap(),
+                        page_id: 0,
+                    };
+                    let value = CacheValue {
+                        bucket: BucketName::new(if max_length_names {
+                            "b".repeat(BucketName::MAX_LEN)
+                        } else {
+                            "bucket".to_owned()
+                        })
+                        .unwrap(),
+                        mtime: 0,
+                        data: Bytes::from(vec![index as u8; PAGE_SIZE as usize]),
+                        object_size: PAGE_SIZE,
+                        cached_at: 1,
+                    };
+                    drop(cache.insert(key, value));
+                    assert!(cache.memory().usage() > 0);
+                    assert!(
+                        cache.memory().usage() <= capacity.as_u64() as usize,
+                        "{capacity}: {} bytes retained after object {index} (maximum names: {max_length_names})",
+                        cache.memory().usage(),
+                    );
+                }
+                cache.close().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn large_caches_keep_eight_memory_shards() {
+        let cache = build_cache(CacheConfig {
+            memory_size: ByteSize::gib(4),
+            disk_cache: None,
+            metrics_registry: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(cache.memory().shards(), 8);
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn low_level_cache_still_supports_small_objects() {
+        let capacity = ByteSize::kib(64);
+        let cache = build_cache(CacheConfig {
+            memory_size: capacity,
+            disk_cache: None,
+            metrics_registry: None,
+        })
+        .await
+        .unwrap();
+        let key = CacheKey {
+            kind: ObjectKind::new("kind").unwrap(),
+            object: ObjectKey::new("object").unwrap(),
+            page_id: 0,
+        };
+        let value = CacheValue {
+            bucket: BucketName::new("bucket").unwrap(),
+            mtime: 0,
+            data: Bytes::from(vec![7; 1024]),
+            object_size: 1024,
+            cached_at: 1,
+        };
+        drop(cache.insert(key.clone(), value.clone()));
+        assert_eq!(cache.get(&key).await.unwrap().unwrap().value(), &value);
+        assert!(cache.memory().usage() <= capacity.as_u64() as usize);
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn minimum_memory_capacity_retains_a_maximum_weight_page() {
+        let cache = build_cache(CacheConfig {
+            memory_size: ByteSize::b(MAX_PAGE_WEIGHT as u64),
+            disk_cache: None,
+            metrics_registry: None,
+        })
+        .await
+        .unwrap();
+        let key = CacheKey {
+            kind: ObjectKind::new("k".repeat(ObjectKind::MAX_LEN)).unwrap(),
+            object: ObjectKey::new("o".repeat(ObjectKey::MAX_LEN)).unwrap(),
+            page_id: 0,
+        };
+        let value = CacheValue {
+            bucket: BucketName::new("b".repeat(BucketName::MAX_LEN)).unwrap(),
+            mtime: 0,
+            data: Bytes::from(vec![7; PAGE_SIZE as usize]),
+            object_size: PAGE_SIZE,
+            cached_at: 1,
+        };
+        drop(cache.insert(key.clone(), value.clone()));
+        assert_eq!(cache.memory().usage(), MAX_PAGE_WEIGHT);
+        assert_eq!(cache.memory().shards(), 1);
+        assert_eq!(cache.get(&key).await.unwrap().unwrap().value(), &value);
+        cache.close().await.unwrap();
     }
 }

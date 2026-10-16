@@ -22,7 +22,7 @@ pub use throughput::SlidingThroughput;
 mod routes;
 
 use crate::{
-    cache::{CacheConfig, CacheKey, CacheValue, build_cache},
+    cache::{CacheConfig, CacheKey, CacheValue, MAX_PAGE_WEIGHT, build_cache},
     object_store::{DownloadError, DownloadLimits, Downloader, RequestConfig},
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind, PageId},
 };
@@ -105,6 +105,10 @@ impl CacheyService {
         eyre::ensure!(
             config.download_limits.max_inflight_bytes >= PAGE_SIZE,
             "download memory must hold at least one cache page ({PAGE_SIZE} bytes)"
+        );
+        eyre::ensure!(
+            config.cache.memory_size.as_u64() >= MAX_PAGE_WEIGHT as u64,
+            "cache memory must hold at least one full page and its metadata ({MAX_PAGE_WEIGHT} bytes)"
         );
         let ingress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
         let egress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
@@ -351,7 +355,7 @@ mod tests {
 
     use super::{CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange};
     use crate::{
-        cache::{CacheConfig, CacheKey, CacheValue},
+        cache::{CacheConfig, CacheKey, CacheValue, MAX_PAGE_WEIGHT},
         object_store::{DownloadLimits, RequestConfig},
         types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
     };
@@ -439,7 +443,7 @@ mod tests {
             let result = CacheyService::new(
                 ServiceConfig {
                     cache: CacheConfig {
-                        memory_size: ByteSize::mib(16),
+                        memory_size: ByteSize::mib(32),
                         disk_cache: None,
                         metrics_registry: None,
                     },
@@ -463,6 +467,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn service_requires_cache_memory_for_a_full_page_and_metadata() {
+        for capacity in [0, PAGE_SIZE as usize, MAX_PAGE_WEIGHT - 1, MAX_PAGE_WEIGHT] {
+            let result = CacheyService::new(
+                ServiceConfig {
+                    cache: CacheConfig {
+                        memory_size: ByteSize::b(capacity as u64),
+                        disk_cache: None,
+                        metrics_registry: None,
+                    },
+                    download_limits: DownloadLimits::default(),
+                },
+                mock_s3_client("http://unused.invalid"),
+                axum_server::Handle::new(),
+            )
+            .await;
+            if capacity < MAX_PAGE_WEIGHT {
+                assert!(result.is_err_and(|error| {
+                    error.to_string().contains(&format!(
+                        "cache memory must hold at least one full page and its metadata ({MAX_PAGE_WEIGHT} bytes)"
+                    ))
+                }));
+            } else {
+                let service = result.unwrap();
+                assert_eq!(service.cache.memory().shards(), 1);
+                service.cache.close().await.unwrap();
+            }
+        }
+    }
+
     #[test]
     fn page_bounds_respect_exclusive_range_ends() {
         for (bytes, pages) in [
@@ -482,7 +516,7 @@ mod tests {
         let service = CacheyService::new(
             ServiceConfig {
                 cache: CacheConfig {
-                    memory_size: ByteSize::mib(16),
+                    memory_size: ByteSize::mib(32),
                     disk_cache: None,
                     metrics_registry: None,
                 },
@@ -522,7 +556,8 @@ mod tests {
         let service = CacheyService::new(
             ServiceConfig {
                 cache: CacheConfig {
-                    memory_size: ByteSize::mib(64),
+                    // Keep both full pages resident even when they map to the same shard.
+                    memory_size: ByteSize::mib(512),
                     disk_cache: None,
                     metrics_registry: None,
                 },
@@ -604,7 +639,7 @@ mod tests {
         let service = CacheyService::new(
             ServiceConfig {
                 cache: CacheConfig {
-                    memory_size: ByteSize::mib(16),
+                    memory_size: ByteSize::mib(32),
                     disk_cache: None,
                     metrics_registry: None,
                 },

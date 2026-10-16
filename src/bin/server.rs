@@ -55,7 +55,7 @@ struct TlsConfig {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Maximum memory to use for cache (e.g., "512MiB", "2GB", "1.5GiB")
+    /// Retained cache capacity, at least one 16 MiB page plus metadata (e.g., "32MiB", "2GiB")
     #[arg(long, value_parser = parse_bytes, default_value = "4GiB")]
     memory: ByteSize,
 
