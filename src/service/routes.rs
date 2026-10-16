@@ -350,7 +350,7 @@ fn c0_status(chunk: &Chunk) -> HeaderValue {
 
 pub async fn metrics(State(service): State<CacheyService>) -> impl IntoResponse {
     service.observe_metrics();
-    let metrics = metrics::gather();
+    let metrics = metrics::gather_with(service.runtime_metrics.collect());
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         metrics,

@@ -100,6 +100,15 @@ C0-Status: 1048576-16777215; us-west-videos; 1704067200
 
 `GET /metrics` returns a more comprehensive set of metrics in Prometheus text format.
 
+Tokio scheduler metrics use `runtime="server"` for the runtime that constructs the
+service and `runtime="foyer"` for Foyer's storage runtime. Each scrape reports
+`cachey_tokio_workers`, `cachey_tokio_alive_tasks`, and
+`cachey_tokio_global_queue_depth` as gauges. The counters
+`cachey_tokio_worker_busy_seconds_total` and `cachey_tokio_worker_parks_total` sum
+worker activity over each runtime's lifetime. These are runtime-wide measurements;
+tasks sharing a runtime contribute to its values. No background metrics task is
+started.
+
 ## Command line
 
 [Docker images](https://github.com/s2-streamstore/cachey/pkgs/container/cachey) are available.

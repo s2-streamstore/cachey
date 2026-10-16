@@ -323,9 +323,15 @@ pub fn observe_jemalloc_metrics() {
 #[cfg(not(feature = "jemalloc"))]
 pub fn observe_jemalloc_metrics() {}
 
+#[cfg(test)]
 pub fn gather() -> Bytes {
+    gather_with(Vec::new())
+}
+
+pub fn gather_with(mut extra: Vec<prometheus::proto::MetricFamily>) -> Bytes {
     let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
+    let mut metric_families = prometheus::gather();
+    metric_families.append(&mut extra);
     let mut buffer = BytesMut::new().writer();
     encoder.encode(&metric_families, &mut buffer).unwrap();
     buffer.into_inner().freeze()

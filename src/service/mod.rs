@@ -16,6 +16,7 @@ use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
 
 mod metrics;
+mod runtime_metrics;
 mod throughput;
 pub use metrics::PageRequestType;
 pub use throughput::SlidingThroughput;
@@ -94,6 +95,7 @@ pub struct CacheyService {
     ingress_throughput: Arc<Mutex<SlidingThroughput>>,
     egress_throughput: Arc<Mutex<SlidingThroughput>>,
     server_handle: axum_server::Handle<SocketAddr>,
+    runtime_metrics: runtime_metrics::RuntimeMetrics,
 }
 
 impl CacheyService {
@@ -110,12 +112,14 @@ impl CacheyService {
         let egress_throughput = Arc::new(Mutex::new(SlidingThroughput::default()));
         let downloader = Downloader::new(s3, config.download_limits, ingress_throughput.clone())?;
         let cache = build_cache(config.cache).await?;
+        let runtime_metrics = runtime_metrics::RuntimeMetrics::capture(cache.storage().spawner());
         Ok(Self {
             cache,
             downloader,
             ingress_throughput,
             egress_throughput,
             server_handle,
+            runtime_metrics,
         })
     }
 
@@ -461,6 +465,77 @@ mod tests {
                 assert!(result.is_ok());
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_endpoint_reports_server_and_foyer_runtimes_on_each_scrape() {
+        let service = CacheyService::new(
+            ServiceConfig {
+                cache: CacheConfig {
+                    memory_size: ByteSize::mib(32),
+                    disk_cache: None,
+                    metrics_registry: None,
+                },
+                download_limits: DownloadLimits::default(),
+            },
+            mock_s3_client("http://unused.invalid"),
+            axum_server::Handle::new(),
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, service.into_router())
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for _ in 0..3 {
+            let response = client
+                .get(format!("http://{address}/metrics"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[http::header::CONTENT_TYPE],
+                "text/plain; version=0.0.4"
+            );
+            let body = response.text().await.unwrap();
+            assert!(body.contains("cachey_tokio_workers{runtime=\"server\"} 2\n"));
+            for (name, kind) in [
+                ("cachey_tokio_workers", "gauge"),
+                ("cachey_tokio_alive_tasks", "gauge"),
+                ("cachey_tokio_global_queue_depth", "gauge"),
+                ("cachey_tokio_worker_busy_seconds_total", "counter"),
+                ("cachey_tokio_worker_parks_total", "counter"),
+            ] {
+                assert_eq!(body.matches(&format!("# TYPE {name} {kind}\n")).count(), 1);
+                for runtime in ["server", "foyer"] {
+                    let prefix = format!("{name}{{runtime=\"{runtime}\"}} ");
+                    let values: Vec<_> = body
+                        .lines()
+                        .filter_map(|line| line.strip_prefix(&prefix))
+                        .collect();
+                    assert_eq!(values.len(), 1, "{name} {runtime}");
+                    assert!(values[0].parse::<f64>().unwrap() >= 0.0);
+                }
+            }
+        }
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
