@@ -100,6 +100,12 @@ C0-Status: 1048576-16777215; us-west-videos; 1704067200
 
 `GET /metrics` returns a more comprehensive set of metrics in Prometheus text format.
 
+On SIGTERM or Ctrl+C, the server stops accepting requests, drains existing HTTP
+connections for up to 30 seconds, and waits for the disk cache to flush and close.
+Allow time for that final disk I/O in the process termination grace period.
+Embedded callers can await `CacheyService::close()` after draining their requests.
+Cached entries remain subject to disk cache admission and eviction.
+
 ## Command line
 
 [Docker images](https://github.com/s2-streamstore/cachey/pkgs/container/cachey) are available.

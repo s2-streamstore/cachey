@@ -145,11 +145,22 @@ async fn main() -> eyre::Result<()> {
 
     tokio::spawn(shutdown_signal(server_handle.clone()));
 
-    let app = CacheyService::new(service_config, s3_client, server_handle.clone())
-        .await?
-        .into_router();
+    let service = CacheyService::new(service_config, s3_client, server_handle.clone()).await?;
+    let app = service.clone().into_router();
+    let serve_result = serve(app, &addr, args.tls, server_handle).await;
+    let close_result = service.close().await;
+    serve_result?;
+    close_result?;
+    Ok(())
+}
 
-    match (args.tls.tls_self, args.tls.tls_cert, args.tls.tls_key) {
+async fn serve(
+    app: axum::Router,
+    addr: &str,
+    tls: TlsConfig,
+    server_handle: axum_server::Handle<SocketAddr>,
+) -> eyre::Result<()> {
+    match (tls.tls_self, tls.tls_cert, tls.tls_key) {
         (false, Some(cert_path), Some(key_path)) => {
             info!(
                 addr,

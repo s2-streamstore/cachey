@@ -119,6 +119,14 @@ impl CacheyService {
         })
     }
 
+    /// Close the cache and wait for pending disk cache I/O to finish.
+    ///
+    /// Stop accepting requests and drain existing requests before closing the cache.
+    /// Cached entries remain subject to the disk cache's admission and eviction policies.
+    pub async fn close(&self) -> Result<(), ServiceError> {
+        self.cache.close().await.map_err(ServiceError::Cache)
+    }
+
     pub fn observe_metrics(&self) {
         self.downloader
             .observe_bucket_metrics(metrics::set_bucket_stats);
