@@ -100,6 +100,10 @@ C0-Status: 1048576-16777215; us-west-videos; 1704067200
 
 `GET /metrics` returns a more comprehensive set of metrics in Prometheus text format.
 
+Egress throughput counts payload as it is yielded to GET response bodies or direct Rust `get`
+consumers, excluding HTTP headers and trailers. HEAD responses do not contribute body egress, even
+when they fetch data to populate the cache. Data read from object storage still contributes ingress.
+
 ## Command line
 
 [Docker images](https://github.com/s2-streamstore/cachey/pkgs/container/cachey) are available.

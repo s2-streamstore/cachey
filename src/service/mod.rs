@@ -148,6 +148,7 @@ impl CacheyService {
         self.ingress_throughput.lock().bps(lookback)
     }
 
+    /// Average payload bytes per second yielded to Rust consumers or HTTP response bodies.
     #[must_use]
     pub fn egress_throughput_bps(&self, lookback: Duration) -> f64 {
         self.egress_throughput.lock().bps(lookback)
@@ -157,6 +158,24 @@ impl CacheyService {
     ///
     /// If `byterange.start >= byterange.end` or `byterange.end > MAX_RANGE_END`.
     pub fn get(
+        self,
+        kind: ObjectKind,
+        object: ObjectKey,
+        buckets: BucketNameSet,
+        byterange: Range<u64>,
+        concurrency: NonZeroUsize,
+        req_config: RequestConfig,
+    ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
+        let egress_throughput = self.egress_throughput.clone();
+        self.get_chunks(kind, object, buckets, byterange, concurrency, req_config)
+            .inspect(move |result| {
+                if let Ok(chunk) = result {
+                    egress_throughput.lock().record(chunk.data.len());
+                }
+            })
+    }
+
+    fn get_chunks(
         self,
         kind: ObjectKind,
         object: ObjectKey,
@@ -195,7 +214,6 @@ impl CacheyService {
                     });
                 }
                 let (data, range) = slice_page_data(page_id, &byterange, &value)?;
-                self.egress_throughput.lock().record(data.len());
                 Ok(Chunk {
                     bucket: value.bucket,
                     mtime: value.mtime,
@@ -342,14 +360,18 @@ mod tests {
     use axum::{
         Router,
         extract::{Path, State},
-        http::{HeaderMap, StatusCode},
+        http::{HeaderMap, Method, StatusCode},
+        response::{IntoResponse, Response},
         routing::get,
     };
     use bytes::Bytes;
     use bytesize::ByteSize;
     use futures::TryStreamExt;
+    use http_body_util::BodyExt;
 
-    use super::{CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange};
+    use super::{
+        CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange, routes,
+    };
     use crate::{
         cache::{CacheConfig, CacheKey, CacheValue},
         object_store::{DownloadLimits, RequestConfig},
@@ -431,6 +453,224 @@ mod tests {
             .region(Region::new("us-east-1"))
             .build();
         aws_sdk_s3::Client::from_conf(config)
+    }
+
+    async fn accounting_service(endpoint: &str) -> CacheyService {
+        CacheyService::new(
+            ServiceConfig {
+                cache: CacheConfig {
+                    memory_size: ByteSize::mib(512),
+                    disk_cache: None,
+                    metrics_registry: None,
+                },
+                download_limits: DownloadLimits::default(),
+            },
+            mock_s3_client(endpoint),
+            axum_server::Handle::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn cached_accounting_service(data: &Bytes) -> CacheyService {
+        let service = accounting_service("http://unused.invalid").await;
+        for start in (0..data.len()).step_by(PAGE_SIZE as usize) {
+            drop(service.cache.insert(
+                CacheKey {
+                    kind: ObjectKind::new("accounting").unwrap(),
+                    object: ObjectKey::new("object").unwrap(),
+                    page_id: (start / PAGE_SIZE as usize) as u16,
+                },
+                CacheValue {
+                    bucket: BucketName::new("bucket").unwrap(),
+                    object_size: data.len() as u64,
+                    mtime: 1_700_000_000,
+                    data: data.slice(start..data.len().min(start + PAGE_SIZE as usize)),
+                    cached_at: 1_700_000_001,
+                },
+            ));
+        }
+        service
+    }
+
+    async fn accounting_fetch(service: CacheyService, method: Method, length: u64) -> Response {
+        routes::fetch(
+            State(service),
+            Path((
+                ObjectKind::new("accounting").unwrap(),
+                ObjectKey::new("object").unwrap(),
+            )),
+            method,
+            routes::RangeHeader(0..length),
+            routes::BucketHeaders(vec![BucketName::new("bucket").unwrap()]),
+            RequestConfig::default(),
+        )
+        .await
+    }
+
+    fn assert_rate(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warm_head_has_no_payload_egress() {
+        let data = Bytes::from(vec![7; 8192]);
+        let service = cached_accounting_service(&data).await;
+        let response = accounting_fetch(service.clone(), Method::HEAD, data.len() as u64).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "8192");
+        assert!(
+            axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_rate(service.egress_throughput_bps(Duration::from_secs(1)), 0.0);
+        assert_rate(service.ingress_throughput_bps(Duration::from_secs(1)), 0.0);
+    }
+
+    #[tokio::test]
+    async fn cold_head_records_ingress_without_payload_egress() {
+        let data = Bytes::from(vec![7; 8192]);
+        let (endpoint, request_count, server_handle) = spawn_mock_s3_server(
+            &BucketName::new("bucket").unwrap(),
+            &ObjectKey::new("object").unwrap(),
+            data,
+            Duration::ZERO,
+        )
+        .await;
+        let service = accounting_service(&endpoint).await;
+        let response = accounting_fetch(service.clone(), Method::HEAD, 8192).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "8192");
+        assert!(
+            axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        server_handle.abort();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_rate(service.egress_throughput_bps(Duration::from_secs(10)), 0.0);
+        assert_rate(
+            service.ingress_throughput_bps(Duration::from_secs(10)),
+            819.2,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_counts_single_and_multiple_pages_once() {
+        for length in [8192, 2 * PAGE_SIZE as usize + 4096] {
+            let data = Bytes::from(vec![7; length]);
+            let service = cached_accounting_service(&data).await;
+            let response = accounting_fetch(service.clone(), Method::GET, length as u64).await;
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), length)
+                    .await
+                    .unwrap(),
+                data
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_rate(
+                service.egress_throughput_bps(Duration::from_secs(1)),
+                length as f64,
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_dropped_before_the_first_frame_has_no_payload_egress() {
+        let data = Bytes::from(vec![7; 8192]);
+        let service = cached_accounting_service(&data).await;
+        let response = accounting_fetch(service.clone(), Method::GET, data.len() as u64).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        drop(response);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_rate(service.egress_throughput_bps(Duration::from_secs(1)), 0.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_dropped_after_one_frame_counts_only_that_frame() {
+        let data = Bytes::from(vec![7; 2 * PAGE_SIZE as usize + 4096]);
+        let service = cached_accounting_service(&data).await;
+        let response = accounting_fetch(service.clone(), Method::GET, data.len() as u64).await;
+        let mut body = response.into_body();
+        let frame = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(frame, data.slice(..PAGE_SIZE as usize));
+        drop(body);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_rate(
+            service.egress_throughput_bps(Duration::from_secs(1)),
+            PAGE_SIZE as f64,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_rust_reads_keep_payload_egress_accounting() {
+        let data = Bytes::from(vec![7; 8192]);
+        let service = cached_accounting_service(&data).await;
+        let chunks = service
+            .clone()
+            .get(
+                ObjectKind::new("accounting").unwrap(),
+                ObjectKey::new("object").unwrap(),
+                BucketName::new("bucket").unwrap().into(),
+                0..data.len() as u64,
+                NonZeroUsize::MIN,
+                RequestConfig::default(),
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].data, data);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_rate(
+            service.egress_throughput_bps(Duration::from_secs(1)),
+            8192.0,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stats_and_prometheus_report_emitted_payload() {
+        let data = Bytes::from(vec![7; 8192]);
+        let service = cached_accounting_service(&data).await;
+        let head = accounting_fetch(service.clone(), Method::HEAD, data.len() as u64).await;
+        assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
+        drop(head);
+        let get = accounting_fetch(service.clone(), Method::GET, data.len() as u64).await;
+        assert_eq!(
+            axum::body::to_bytes(get.into_body(), data.len())
+                .await
+                .unwrap(),
+            data
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let stats = routes::stats(State(service.clone())).await.into_response();
+        let stats = axum::body::to_bytes(stats.into_body(), 1024).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_slice(&stats).unwrap();
+        assert_rate(stats["egress_throughput_10s_bps"].as_f64().unwrap(), 819.2);
+        service.observe_metrics();
+        let snapshot = metrics::gather();
+        let text = std::str::from_utf8(&snapshot).unwrap();
+        let value = text
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(
+                    "cachey_throughput_bytes_per_sec{direction=\"egress\",window=\"10s\"} ",
+                )
+            })
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert_rate(value, 819.2);
     }
 
     #[tokio::test]

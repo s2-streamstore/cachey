@@ -232,9 +232,10 @@ pub async fn fetch(
         const { NonZeroUsize::new(2).unwrap() }
     };
 
+    let egress_throughput = service.egress_throughput.clone();
     let mut chunks = Box::pin(
         service
-            .get(
+            .get_chunks(
                 kind.clone(),
                 object,
                 buckets,
@@ -304,6 +305,7 @@ pub async fn fetch(
                     if is_last_chunk {
                         metrics::fetch_request_count(&kind, &method, "success");
                     }
+                    egress_throughput.lock().record(chunk.data.len());
                     yield Ok(Frame::data(chunk.data));
                     if is_last_chunk {
                         // Stop waiting for pages beyond EOF; shared cache fills can continue.
