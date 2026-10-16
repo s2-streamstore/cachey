@@ -88,7 +88,19 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
                 fs_device.build()?
             }
         };
-        let engine = BlockEngineConfig::new(device).with_block_size(64 * 1024 * 1024);
+        // Reserve an extra aligned block beyond Cachey's maximum encoded entry for Foyer framing.
+        let buffer_pool_size = (crate::service::PAGE_SIZE as usize
+            + ObjectKey::MAX_LEN
+            + ObjectKind::MAX_LEN
+            + BucketName::MAX_LEN
+            + size_of::<CacheKeyHeader>()
+            + size_of::<CacheValueHeader>())
+        .next_multiple_of(4096)
+            + 4096;
+        let engine = BlockEngineConfig::new(device)
+            .with_block_size(64 * 1024 * 1024)
+            .with_flushers(1)
+            .with_buffer_pool_size(buffer_pool_size);
         builder = builder
             .with_engine_config(engine)
             .with_io_engine_config(io_engine_config(disk_config.iouring));
@@ -421,10 +433,17 @@ impl foyer::Code for CacheValue {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use bytes::Bytes;
+    use bytesize::ByteSize;
     use foyer::Code;
     use proptest::{collection, prop_assert_eq, proptest};
 
-    use super::{CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader};
+    use super::{
+        CacheConfig, CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader, DiskCacheConfig,
+        DiskCacheKind, build_cache,
+    };
     use crate::{
         service::PAGE_SIZE,
         types::{BucketName, ObjectKey, ObjectKind},
@@ -614,5 +633,93 @@ mod tests {
         let header = CacheValueHeader::new(4, 0, 0, 0, 0).unwrap();
         let data = [header.to_bytes().as_slice(), &[0xff; 4]].concat();
         assert!(CacheValue::decode(&mut data.as_slice()).is_err());
+    }
+
+    async fn assert_pages_survive_disk_reopen(kind: DiskCacheKind) {
+        let directory = std::env::temp_dir().join(format!(
+            "cachey-disk-pages-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = match kind {
+            DiskCacheKind::BlockFile => directory.join("cache.bin"),
+            DiskCacheKind::FileSystem => directory.join("cache"),
+        };
+        let config = || CacheConfig {
+            memory_size: ByteSize::mib(64),
+            disk_cache: Some(DiskCacheConfig {
+                path: path.clone(),
+                kind: kind.clone(),
+                capacity: Some(ByteSize::mib(512)),
+                iouring: false,
+            }),
+            metrics_registry: None,
+        };
+        let expected: Vec<_> = [(0, PAGE_SIZE), (1, PAGE_SIZE - 4096)]
+            .into_iter()
+            .map(|(page_id, length)| {
+                (
+                    CacheKey {
+                        kind: ObjectKind::new("k".repeat(ObjectKind::MAX_LEN)).unwrap(),
+                        object: ObjectKey::new("o".repeat(ObjectKey::MAX_LEN)).unwrap(),
+                        page_id,
+                    },
+                    CacheValue {
+                        bucket: BucketName::new("b".repeat(BucketName::MAX_LEN)).unwrap(),
+                        mtime: 1_700_000_000,
+                        object_size: 2 * PAGE_SIZE - 4096,
+                        data: Bytes::from(vec![page_id as u8 + 1; length as usize]),
+                        cached_at: 1_700_000_001,
+                    },
+                )
+            })
+            .collect();
+        let cache = build_cache(config()).await.unwrap();
+        for (key, value) in &expected {
+            drop(cache.insert(key.clone(), value.clone()));
+            cache.flush_if(|candidate, _| candidate == key).await;
+        }
+        cache.close().await.unwrap();
+        drop(cache);
+
+        let reopened = build_cache(config()).await.unwrap();
+        let mut recovered = Vec::new();
+        for (key, _) in &expected {
+            recovered.push(
+                reopened
+                    .get(key)
+                    .await
+                    .unwrap()
+                    .map(|entry| entry.value().clone()),
+            );
+        }
+        reopened.close().await.unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        for ((key, value), recovered) in expected.into_iter().zip(recovered) {
+            let recovered = recovered.unwrap_or_else(|| {
+                panic!("flushed page {} missing after disk reopen", key.page_id)
+            });
+            assert_eq!(
+                recovered, value,
+                "page {} must survive disk reopen with its full contents and metadata",
+                key.page_id,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_pages_survive_filesystem_cache_reopen() {
+        assert_pages_survive_disk_reopen(DiskCacheKind::FileSystem).await;
+    }
+
+    #[tokio::test]
+    async fn full_pages_survive_block_file_cache_reopen() {
+        assert_pages_survive_disk_reopen(DiskCacheKind::BlockFile).await;
     }
 }
