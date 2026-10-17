@@ -1,0 +1,10 @@
+# crates.io versions allowed inside the publication cooldown, such as security releases.
+# Select one with:
+#   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo +nightly update -p <crate> --precise <version>
+# A full `cargo update` reverts these until they age out, so re-run the targeted update after it.
+# Remove entries once they are older than the cooldown.
+
+[[exception]]
+crate = "rustls"
+version = "0.23.46"
+advisory = "RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, RUSTSEC-2026-0349"
