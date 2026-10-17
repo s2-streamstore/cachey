@@ -24,7 +24,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     object_store::{DownloadError, RequestConfig},
-    service::{CacheyService, Chunk, FetchRequest, ServiceError, metrics},
+    service::{CacheyService, Chunk, FetchRequest, PAGE_SIZE, ServiceError, metrics},
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
 };
 
@@ -32,6 +32,7 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 static C0_BUCKET_HEADER: HeaderName = HeaderName::from_static("c0-bucket");
 static C0_CONFIG_HEADER: HeaderName = HeaderName::from_static("c0-config");
 static C0_OBJECT_SIZE_HEADER: HeaderName = HeaderName::from_static("c0-object-size");
+static C0_EXACT_HEADER: HeaderName = HeaderName::from_static("c0-exact");
 
 fn on_chunk_error(
     kind: &ObjectKind,
@@ -230,18 +231,49 @@ where
     }
 }
 
+#[derive(Debug)]
+pub struct ExactHeader(pub bool);
+
+impl<S> FromRequestParts<S> for ExactHeader
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let Some(header_value) = parts.headers.get(&C0_EXACT_HEADER) else {
+            return Ok(Self(false));
+        };
+        header_value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Self)
+            .ok_or((StatusCode::BAD_REQUEST, "Invalid C0-Exact header"))
+    }
+}
+
 #[instrument(skip(service))]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn fetch(
     State(service): State<CacheyService>,
     Path((kind, object)): Path<(ObjectKind, ObjectKey)>,
     method: axum::http::Method,
     RangeHeader(byterange): RangeHeader,
     ObjectSizeHeader(object_size): ObjectSizeHeader,
+    ExactHeader(exact): ExactHeader,
     BucketHeaders(buckets): BucketHeaders,
     req_config: RequestConfig,
 ) -> Response {
     let start = Instant::now();
+
+    if exact && byterange.end - byterange.start > PAGE_SIZE {
+        return (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "Exact range exceeds the page size",
+        )
+            .into_response();
+    }
 
     let buckets = if buckets.is_empty() {
         BucketName::from(kind.clone()).into()
@@ -268,6 +300,7 @@ pub async fn fetch(
                     buckets,
                     byterange: byterange.clone(),
                     object_size,
+                    exact,
                     config: req_config,
                 },
                 concurrency,

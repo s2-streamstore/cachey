@@ -7,6 +7,7 @@ High-performance read-through cache for object storage.
 - Designed for caching immutable blobs
 - Works with any S3-compatible backend, but has its own `/fetch` API requiring a precise `Range`
 - Fixed page size (16 MiB) – maps requested byte range to page-aligned lookups
+- Exact-range mode for small reads of large objects – caches just the requested range
 - Coalesces concurrent requests for the same page
 - Makes hedged requests to manage tail latency of object storage
 - Can attempt redundant buckets for a given object
@@ -32,6 +33,7 @@ HEAD|GET /fetch/{kind}/{object}
 | `C0-Bucket` | no | Bucket(s) containing the object |
 | `C0-Config` | no | Override S3 request config |
 | `C0-Object-Size` | no | Size of the object in bytes |
+| `C0-Exact` | no | `true` to fetch and cache exactly the requested range, up to 16 MiB |
 
 `C0-Bucket` behavior:
 - Multiple headers specify redundant buckets, with the preferred bucket first
@@ -42,6 +44,10 @@ HEAD|GET /fetch/{kind}/{object}
 - Admission trusts the size, so one that understates the object lets a read hold more than it reserved
 - A range starting at or past the size returns 416 without contacting a bucket
 - A bucket reporting a different size returns 409, or 416 for a range past the object's actual end; other readers of the page are unaffected
+
+`C0-Exact` behavior:
+- The range is downloaded and cached as one entry instead of as the 16 MiB pages it spans
+- Only a request for the same range hits that entry, so use it when an object's ranges are always read whole
 
 See [replica reads](docs/replica-reads.md) for selection, fallback, hedging, and download limits.
 
