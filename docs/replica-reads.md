@@ -3,9 +3,20 @@
 ## Selection and recovery
 
 Selection favors copies likely to finish within the remaining page deadline, then
-health, then recent complete-read latency. The first client-supplied bucket has a
-locality preference: its latency is compared with 1.5 times each alternative's.
+health, then expected latency for the requested size. The first client-supplied bucket
+has a locality preference: its latency is compared with 1.5 times each alternative's.
 Every supplied bucket remains eligible for fallback.
+
+## Latency model
+
+Each bucket's latency is modeled as time to first byte plus body time, so requests of
+any size share one set of statistics. Time to first byte runs from starting a request
+to successful response headers, including SDK retries, as hedge and deadline timers do.
+Bodies under 1 MiB are tracked by duration, since they take a few round trips
+regardless of size; larger bodies are tracked by throughput. A bucket that has never
+served a large body is assumed to serve small ones, so page-sized requests for small
+objects keep meaningful estimates. A recovery probe discards the bucket's latency
+history, so the bucket is judged by the probe's measurements.
 
 A backend `InvalidRange` (HTTP 416) response also permits fallback: an empty or
 shorter copy in one bucket does not establish the object size in another. If no
@@ -31,12 +42,15 @@ including unmeasured buckets. Multi-bucket reads try each bucket at most once at
 the downloader layer, with up to three copies active per page. The first validated
 result wins and cancels the others.
 
-Early hedges start at successful-operation p99 latency and use one SDK attempt,
-against another bucket when available or the same bucket otherwise. By default,
-the shared budget permits one startup hedge and earns another per 20 successful
-pages. Setting the budget to zero disables early hedges; fallback and deadline
-rescue remain available. When every bucket has recently reported overload, early
-hedges stop and extra attempts use a separate success-funded retry budget.
+Early hedges are timed in two phases and use one SDK attempt, against another bucket
+when available or the same bucket otherwise. Before response headers arrive, a hedge
+starts at the p99 time to first byte. Once headers arrive, the hedge is rearmed for the
+announced body length: it starts when the body has taken longer than both its p99 body
+time and the p99 time to first byte. By default, the shared budget permits one
+startup hedge and earns another per 20 successful pages. Setting the budget to zero
+disables early hedges; fallback and deadline rescue remain available. When every
+bucket has recently reported overload, early hedges stop and extra attempts use a
+separate success-funded retry budget.
 
 ## Limits
 
@@ -74,20 +88,19 @@ an authoritative size or replica agreement.
 
 | Measurement | Meaning |
 |-------------|---------|
-| `cachey_bucket_latency_mean_seconds` | Mean successful complete-operation duration |
-| `cachey_bucket_latency_hedge_seconds` | Successful-operation p99 |
-| `cachey_bucket_first_byte_mean_seconds` / `cachey_bucket_first_byte_p99_seconds` | Per-attempt time from transmitting a request to successful response headers, excluding SDK retry backoff |
-| `cachey_bucket_throughput_{mean,p1}_bytes_per_second` | Response body throughput after headers, sampled from bodies of at least 1 MiB |
+| `cachey_bucket_first_byte_{mean,p99}_seconds` | Time from starting a request to successful response headers, including SDK retries |
+| `cachey_bucket_small_body_{mean,p99}_seconds` | Time to read a body under 1 MiB after its headers |
+| `cachey_bucket_throughput_{mean,p1}_bytes_per_second` | Body throughput after headers, for bodies of at least 1 MiB |
 | `cachey_bucket_error_rate` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |
 | `cachey_first_chunk_latency_seconds` | Handler time to first available chunk, including cache lookup and coalescing |
 
 Stalls and canceled reads can raise routing latency estimates without adding
-successful histogram samples. A single-bucket hedge win is timed from the original
-primary start. Latency histograms exclude failures and client body transmission.
-First-byte and throughput samples come from each backend request, including hedges,
-and do not yet influence routing or hedging.
+histogram samples. Bucket latency samples come from each backend request, including
+hedges, so a request contributes only the phases it completed. Page latency for a
+single-bucket hedge win is timed from the original primary start. Latency histograms
+exclude client body transmission.
 
 `DownloadOutput` reports the initial and winning buckets. `hedged` means copies
 overlapped, including rescue and recovery probes; the page `fallback` metric counts

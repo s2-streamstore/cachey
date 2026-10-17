@@ -1,4 +1,4 @@
-use std::{ops::Range, time::Duration};
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::{
@@ -8,6 +8,7 @@ use tokio::{
 
 use super::{
     BucketOperation, DownloadError, DownloadOutput, Downloader, ObjectPiece, RequestConfig,
+    ResponseHeaders, body_hedge_at,
 };
 use crate::{
     object_store::{
@@ -125,6 +126,7 @@ impl ReplicaRequest<'_> {
         index: usize,
         probe: Option<ProbePermit>,
         permits: Option<AttemptPermits>,
+        headers: Option<Arc<ResponseHeaders>>,
     ) -> Completion {
         let bucket = &self.buckets[index];
         let (hedge, admission) = match permits {
@@ -152,7 +154,7 @@ impl ReplicaRequest<'_> {
                 ActiveCopy(&self.progress)
             };
             self.downloader
-                .fetch_piece(bucket, self.object, self.range, config)
+                .fetch_piece(bucket, self.object, self.range, config, headers)
                 .await
         })
         .await;
@@ -161,6 +163,7 @@ impl ReplicaRequest<'_> {
 }
 
 impl Downloader {
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -179,26 +182,35 @@ impl Downloader {
             deadline,
             progress: parking_lot::Mutex::default(),
         };
-        let routing = self.bucketed_stats.snapshot(buckets);
+        let bytes = range.end - range.start;
+        let routing = self.bucketed_stats.snapshot(buckets, bytes);
         let PrimaryAttempt {
             index: primary,
             probe,
             permits: primary_permits,
             mut backup_admission,
         } = self.prepare_primary(
-            range.end - range.start,
+            bytes,
             deadline.saturating_duration_since(Instant::now()),
             &routing,
         );
         let mut tried = vec![false; buckets.len()];
         tried[primary] = true;
         let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
-        let threshold = routing.tail(primary).unwrap_or_default();
+        let primary_model = routing.model(primary);
+        let threshold = primary_model.first_byte_tail().unwrap_or_default();
         let mut hedge_at =
             (self.limits.hedge_budget_percent > 0 && !threshold.is_zero() && probe.is_none())
                 .then(|| start + threshold.min(self.limits.page_timeout));
+        let primary_headers = Arc::new(ResponseHeaders::default());
+        let mut awaiting_headers = hedge_at.is_some();
         let mut active = FuturesUnordered::new();
-        active.push(request.attempt(primary, probe, primary_permits));
+        active.push(request.attempt(
+            primary,
+            probe,
+            primary_permits,
+            Some(primary_headers.clone()),
+        ));
         let mut fallback_errors = FallbackErrors::default();
         let mut retry_budget_exhausted = false;
         while !active.is_empty() {
@@ -219,6 +231,11 @@ impl Downloader {
                     }
                     (false, None)
                 },
+                body_bytes = primary_headers.arrived(), if awaiting_headers && hedge_at.is_some() => {
+                    awaiting_headers = false;
+                    hedge_at = body_hedge_at(&primary_model, body_bytes);
+                    continue;
+                },
                 () = sleep_until(next_rescue), if !rescues.is_empty() => {
                     (false, rescues.pop_front().map(|(_, index)| index))
                 },
@@ -231,7 +248,7 @@ impl Downloader {
             {
                 continue;
             }
-            let routing = self.bucketed_stats.snapshot(buckets);
+            let routing = self.bucketed_stats.snapshot(buckets, bytes);
             let overloaded = routing.all_overloaded();
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() || (early && overloaded) {
@@ -245,8 +262,7 @@ impl Downloader {
                 continue;
             }
             let permits = if early {
-                let Some(permits) = self.hedge_permits(&buckets[index], range.end - range.start)
-                else {
+                let Some(permits) = self.hedge_permits(&buckets[index], bytes) else {
                     continue;
                 };
                 Some(permits)
@@ -257,7 +273,7 @@ impl Downloader {
                 })
             };
             tried[index] = true;
-            active.push(request.attempt(index, None, permits));
+            active.push(request.attempt(index, None, permits, None));
         }
         Err(match fallback_errors.into_error() {
             None | Some(DownloadError::NoSuchKey) if retry_budget_exhausted => {

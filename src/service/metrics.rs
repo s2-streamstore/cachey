@@ -22,28 +22,10 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         .unwrap()
     });
 
-    static LATENCY_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
-        register_gauge_vec!(
-            "cachey_bucket_latency_mean_seconds",
-            "Mean successful bucket fetch latency, including retries, hedging, and body validation",
-            &["bucket"]
-        )
-        .unwrap()
-    });
-
-    static LATENCY_HEDGE: LazyLock<GaugeVec> = LazyLock::new(|| {
-        register_gauge_vec!(
-            "cachey_bucket_latency_hedge_seconds",
-            "Hedge delay from the successful bucket fetch latency quantile, in seconds",
-            &["bucket"]
-        )
-        .unwrap()
-    });
-
     static FIRST_BYTE_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_first_byte_mean_seconds",
-            "Mean time from transmitting a request attempt to receiving successful response headers",
+            "Mean time from starting a request to successful response headers, including SDK retries",
             &["bucket"]
         )
         .unwrap()
@@ -52,7 +34,25 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     static FIRST_BYTE_P99: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_first_byte_p99_seconds",
-            "p99 time from transmitting a request attempt to receiving successful response headers",
+            "p99 time from starting a request to successful response headers, including SDK retries",
+            &["bucket"]
+        )
+        .unwrap()
+    });
+
+    static SMALL_BODY_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_small_body_mean_seconds",
+            "Mean time to read a response body under 1 MiB after its headers",
+            &["bucket"]
+        )
+        .unwrap()
+    });
+
+    static SMALL_BODY_P99: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_small_body_p99_seconds",
+            "p99 time to read a response body under 1 MiB after its headers",
             &["bucket"]
         )
         .unwrap()
@@ -97,18 +97,18 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     ERROR_RATE
         .with_label_values(&[bucket])
         .set(metrics.error_rate);
-    LATENCY_MEAN
-        .with_label_values(&[bucket])
-        .set(metrics.latency_mean.as_secs_f64());
-    LATENCY_HEDGE
-        .with_label_values(&[bucket])
-        .set(metrics.latency_hedge.as_secs_f64());
     FIRST_BYTE_MEAN
         .with_label_values(&[bucket])
         .set(metrics.first_byte_mean.as_secs_f64());
     FIRST_BYTE_P99
         .with_label_values(&[bucket])
         .set(metrics.first_byte_p99.as_secs_f64());
+    SMALL_BODY_MEAN
+        .with_label_values(&[bucket])
+        .set(metrics.small_body_mean.as_secs_f64());
+    SMALL_BODY_P99
+        .with_label_values(&[bucket])
+        .set(metrics.small_body_p99.as_secs_f64());
     THROUGHPUT_MEAN
         .with_label_values(&[bucket])
         .set(metrics.throughput_mean);
