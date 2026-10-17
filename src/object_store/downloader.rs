@@ -24,7 +24,10 @@ use crate::{
     types::{BucketName, BucketNameSet, ObjectKey},
 };
 
+mod first_byte;
 mod replicas;
+
+use first_byte::FirstByteObserver;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DownloadError {
@@ -397,7 +400,12 @@ impl Downloader {
             .bucket(&**bucket)
             .key(&**object)
             .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
-            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+            .customize()
+            .interceptor(FirstByteObserver::new(
+                self.bucketed_stats.clone(),
+                bucket.clone(),
+            ));
 
         let started = Instant::now();
         let output = if req_config.is_noop() {
@@ -418,18 +426,15 @@ impl Downloader {
                 config_override = config_override.force_path_style(force_path_style);
             }
 
-            request
-                .customize()
-                .config_override(config_override)
-                .send()
-                .await
+            request.config_override(config_override).send().await
         }
         .map_err(|error| map_get_object_error(bucket, byterange, started.elapsed(), error))?;
-        self.read_response(byterange, output).await
+        self.read_response(bucket, byterange, output).await
     }
 
     async fn read_response(
         &self,
+        bucket: &BucketName,
         req_range: &Range<u64>,
         output: GetObjectOutput,
     ) -> Result<ObjectPiece, DownloadError> {
@@ -461,6 +466,7 @@ impl Downloader {
         })?;
         let mut body = output.body;
         let mut data = BytesMut::with_capacity(capacity);
+        let body_started = Instant::now();
         while let Some(chunk) = body
             .try_next()
             .await
@@ -480,6 +486,8 @@ impl Downloader {
             )));
         }
         self.throughput.lock().record(data.len());
+        self.bucketed_stats
+            .observe_body(bucket, data.len() as u64, body_started.elapsed());
         Ok(ObjectPiece {
             mtime,
             data: data.freeze(),
@@ -694,7 +702,9 @@ mod tests {
             let output = GetObjectOutput::builder()
                 .set_content_range(header.map(str::to_owned))
                 .build();
-            let result = downloader.read_response(&(0..10), output).await;
+            let result = downloader
+                .read_response(&BucketName::new("bucket").unwrap(), &(0..10), output)
+                .await;
             assert!(
                 matches!(result, Err(DownloadError::InvalidResponse(_))),
                 "{header:?}: {result:?}"
@@ -719,7 +729,7 @@ mod tests {
                 .build();
             let result = timeout(
                 Duration::from_millis(1),
-                downloader.read_response(&(0..10), output),
+                downloader.read_response(&BucketName::new("bucket").unwrap(), &(0..10), output),
             )
             .await
             .expect("excess data must be rejected without waiting for the rest of the body");
@@ -910,6 +920,57 @@ mod tests {
         assert_eq!(metrics.latency_hedge, Duration::from_millis(150));
         assert!(metrics.error_rate.abs() < f64::EPSILON);
         assert_eq!(metrics.consecutive_failures, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_byte_latency_is_recorded_for_each_successful_request() {
+        let (downloader, script) = scripted_downloader([
+            ("bucket", 70, 0, false),
+            ("bucket", 10, 90, false),
+            ("bucket", 30, 140, false),
+            ("bucket", 50, 190, false),
+        ]);
+        script.service_errors.lock().insert(0, 404);
+        assert!(matches!(
+            fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
+            Err(DownloadError::NoSuchKey)
+        ));
+        fetch(&downloader, &["bucket"]).await;
+        assert!(fetch(&downloader, &["bucket"]).await.hedged);
+
+        let metrics = metrics(&downloader, "bucket").await;
+        assert_eq!(metrics.first_byte_mean, Duration::from_millis(30));
+        assert_eq!(metrics.first_byte_p99, Duration::from_millis(50));
+        assert!(metrics.throughput_mean.abs() < f64::EPSILON);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_throughput_is_recorded_from_response_headers() {
+        let downloader = downloader([]);
+        let len = 1024 * 1024;
+        let body = stream::once(async move {
+            sleep(Duration::from_millis(500)).await;
+            Ok::<_, io::Error>(Frame::data(Bytes::from(vec![0; len])))
+        });
+        let output = GetObjectOutput::builder()
+            .content_range(format!("bytes 0-{}/{len}", len - 1))
+            .body(ByteStream::new(SdkBody::from_body_1_x(StreamBody::new(
+                body,
+            ))))
+            .build();
+        downloader
+            .read_response(
+                &BucketName::new("bucket").unwrap(),
+                &(0..len as u64),
+                output,
+            )
+            .await
+            .unwrap();
+
+        let metrics = metrics(&downloader, "bucket").await;
+        let bytes_per_second = 2.0 * len as f64;
+        assert!((metrics.throughput_mean - bytes_per_second).abs() < f64::EPSILON);
+        assert!((metrics.throughput_p1 - bytes_per_second).abs() < f64::EPSILON);
     }
 
     #[tokio::test(start_paused = true)]

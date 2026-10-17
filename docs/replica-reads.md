@@ -76,6 +76,8 @@ an authoritative size or replica agreement.
 |-------------|---------|
 | `cachey_bucket_latency_mean_seconds` | Mean successful complete-operation duration |
 | `cachey_bucket_latency_hedge_seconds` | Successful-operation p99 |
+| `cachey_bucket_first_byte_mean_seconds` / `cachey_bucket_first_byte_p99_seconds` | Per-attempt time from transmitting a request to successful response headers, excluding SDK retry backoff |
+| `cachey_bucket_throughput_{mean,p1}_bytes_per_second` | Response body throughput after headers, sampled from bodies of at least 1 MiB |
 | `cachey_bucket_error_rate` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |
@@ -84,6 +86,8 @@ an authoritative size or replica agreement.
 Stalls and canceled reads can raise routing latency estimates without adding
 successful histogram samples. A single-bucket hedge win is timed from the original
 primary start. Latency histograms exclude failures and client body transmission.
+First-byte and throughput samples come from each backend request, including hedges,
+and do not yet influence routing or hedging.
 
 `DownloadOutput` reports the initial and winning buckets. `hedged` means copies
 overlapped, including rescue and recovery probes; the page `fallback` metric counts

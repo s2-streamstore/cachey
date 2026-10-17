@@ -40,6 +40,42 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         .unwrap()
     });
 
+    static FIRST_BYTE_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_first_byte_mean_seconds",
+            "Mean time from transmitting a request attempt to receiving successful response headers",
+            &["bucket"]
+        )
+        .unwrap()
+    });
+
+    static FIRST_BYTE_P99: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_first_byte_p99_seconds",
+            "p99 time from transmitting a request attempt to receiving successful response headers",
+            &["bucket"]
+        )
+        .unwrap()
+    });
+
+    static THROUGHPUT_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_throughput_mean_bytes_per_second",
+            "Mean response body throughput after headers, for bodies of at least 1 MiB",
+            &["bucket"]
+        )
+        .unwrap()
+    });
+
+    static THROUGHPUT_P1: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_throughput_p1_bytes_per_second",
+            "p1 response body throughput after headers, for bodies of at least 1 MiB",
+            &["bucket"]
+        )
+        .unwrap()
+    });
+
     static DEPRIORITIZED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         register_int_gauge_vec!(
             "cachey_bucket_deprioritized",
@@ -67,6 +103,18 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     LATENCY_HEDGE
         .with_label_values(&[bucket])
         .set(metrics.latency_hedge.as_secs_f64());
+    FIRST_BYTE_MEAN
+        .with_label_values(&[bucket])
+        .set(metrics.first_byte_mean.as_secs_f64());
+    FIRST_BYTE_P99
+        .with_label_values(&[bucket])
+        .set(metrics.first_byte_p99.as_secs_f64());
+    THROUGHPUT_MEAN
+        .with_label_values(&[bucket])
+        .set(metrics.throughput_mean);
+    THROUGHPUT_P1
+        .with_label_values(&[bucket])
+        .set(metrics.throughput_p1);
     DEPRIORITIZED
         .with_label_values(&[bucket])
         .set(i64::from(metrics.deprioritized));

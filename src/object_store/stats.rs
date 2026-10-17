@@ -20,6 +20,9 @@ const LATENCY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const RECOVERY_SUCCESSES: u32 = 20;
 const OVERLOAD_INTERVAL: Duration = Duration::from_secs(1);
+/// Smaller bodies tend to arrive with the response headers, so their duration says little about
+/// throughput.
+const MIN_THROUGHPUT_SAMPLE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BucketMetrics {
@@ -30,6 +33,13 @@ pub struct BucketMetrics {
     /// Successful complete bucket-operation latency, including retries and body validation.
     pub latency_mean: Duration,
     pub latency_hedge: Duration,
+    /// Time from transmitting a request attempt to receiving successful response headers.
+    pub first_byte_mean: Duration,
+    pub first_byte_p99: Duration,
+    /// Response body bytes per second, after headers, for bodies of at least
+    /// `MIN_THROUGHPUT_SAMPLE_BYTES`.
+    pub throughput_mean: f64,
+    pub throughput_p1: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -55,6 +65,12 @@ struct BucketStats {
     histogram: ExponentialDecayHistogram,
     snapshot: LatencySnapshot,
     snapshot_at: Instant,
+    first_byte: ExponentialDecayHistogram,
+    throughput: ExponentialDecayHistogram,
+}
+
+fn histogram_micros(duration: Duration) -> i64 {
+    duration.as_micros().min(i64::MAX as u128) as i64
 }
 
 fn histogram(now: Instant) -> ExponentialDecayHistogram {
@@ -88,6 +104,8 @@ impl Default for BucketStats {
             histogram: histogram(now),
             snapshot: LatencySnapshot::default(),
             snapshot_at: now - LATENCY_SNAPSHOT_INTERVAL,
+            first_byte: histogram(now),
+            throughput: histogram(now),
         }
     }
 }
@@ -197,10 +215,9 @@ impl Drop for BucketObservation {
                 }
                 stats.best_latency =
                     Some(stats.best_latency.map_or(latency, |best| best.min(latency)));
-                stats.histogram.update_at(
-                    now.into_std(),
-                    latency.as_micros().min(i64::MAX as u128) as i64,
-                );
+                stats
+                    .histogram
+                    .update_at(now.into_std(), histogram_micros(latency));
                 if self.generation == stats.generation {
                     stats.error_rate = error_rate * (1.0 - ERROR_ALPHA);
                     stats.consecutive_failures = 0;
@@ -411,6 +428,24 @@ impl BucketedStats {
         self.by_bucket.entry(bucket.clone()).or_default().clone()
     }
 
+    pub(super) fn observe_first_byte(&self, bucket: &BucketName, latency: Duration) {
+        self.entry(bucket)
+            .lock()
+            .first_byte
+            .update_at(Instant::now().into_std(), histogram_micros(latency));
+    }
+
+    pub(super) fn observe_body(&self, bucket: &BucketName, bytes: u64, elapsed: Duration) {
+        if bytes < MIN_THROUGHPUT_SAMPLE_BYTES || elapsed.is_zero() {
+            return;
+        }
+        let bytes_per_second = bytes as f64 / elapsed.as_secs_f64();
+        self.entry(bucket)
+            .lock()
+            .throughput
+            .update_at(Instant::now().into_std(), bytes_per_second as i64);
+    }
+
     pub(super) fn begin(
         &self,
         bucket: &BucketName,
@@ -493,6 +528,8 @@ impl BucketedStats {
             .map(|entry| {
                 let mut stats = entry.value().lock();
                 let snapshot = stats.snapshot(now);
+                let first_byte = stats.first_byte.snapshot();
+                let throughput = stats.throughput.snapshot();
                 let metrics = BucketMetrics {
                     error_rate: stats.error_rate(now),
                     deprioritized: stats.deprioritized,
@@ -500,6 +537,10 @@ impl BucketedStats {
                     recovery_successes: stats.recovery_successes,
                     latency_mean: snapshot.mean,
                     latency_hedge: snapshot.tail.unwrap_or_default(),
+                    first_byte_mean: Duration::from_micros(first_byte.mean().round() as u64),
+                    first_byte_p99: Duration::from_micros(first_byte.value(0.99) as u64),
+                    throughput_mean: throughput.mean(),
+                    throughput_p1: throughput.value(0.01) as f64,
                 };
                 (entry.key().clone(), metrics)
             })
@@ -524,7 +565,7 @@ mod tests {
 
     use tokio::time::advance;
 
-    use super::{BucketedStats, Outcome, RECOVERY_SUCCESSES};
+    use super::{BucketedStats, MIN_THROUGHPUT_SAMPLE_BYTES, Outcome, RECOVERY_SUCCESSES};
     use crate::types::{BucketName, BucketNameSet};
 
     fn buckets() -> BucketNameSet {
@@ -635,6 +676,35 @@ mod tests {
             exported += 1;
         });
         assert_eq!(exported, buckets.len());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exports_first_byte_latency_and_large_body_throughput() {
+        let stats = BucketedStats::default();
+        let bucket = BucketName::new("local").unwrap();
+        for millis in [10, 30] {
+            stats.observe_first_byte(&bucket, Duration::from_millis(millis));
+        }
+        stats.observe_body(
+            &bucket,
+            MIN_THROUGHPUT_SAMPLE_BYTES - 1,
+            Duration::from_millis(1),
+        );
+        stats.observe_body(&bucket, MIN_THROUGHPUT_SAMPLE_BYTES, Duration::ZERO);
+        stats.observe_body(
+            &bucket,
+            4 * MIN_THROUGHPUT_SAMPLE_BYTES,
+            Duration::from_secs(2),
+        );
+
+        let mut exported = None;
+        stats.export_bucket_metrics(|_, metrics| exported = Some(metrics.clone()));
+        let metrics = exported.expect("bucket metrics");
+        assert_eq!(metrics.first_byte_mean, Duration::from_millis(20));
+        assert_eq!(metrics.first_byte_p99, Duration::from_millis(30));
+        let bytes_per_second = (2 * MIN_THROUGHPUT_SAMPLE_BYTES) as f64;
+        assert!((metrics.throughput_mean - bytes_per_second).abs() < f64::EPSILON);
+        assert!((metrics.throughput_p1 - bytes_per_second).abs() < f64::EPSILON);
     }
 
     #[tokio::test(start_paused = true)]
