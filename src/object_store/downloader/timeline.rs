@@ -14,8 +14,8 @@ struct Headers {
     body_bytes: u64,
 }
 
-/// When a backend request started, and when its successful response headers arrived with the
-/// announced body length.
+/// When a backend request started, and when response headers with a validated range arrived with
+/// the announced body length.
 #[derive(Debug, Default)]
 pub(super) struct RequestTimeline {
     started: OnceLock<Instant>,
@@ -24,14 +24,20 @@ pub(super) struct RequestTimeline {
 }
 
 impl RequestTimeline {
-    pub fn start(&self, at: Instant) {
-        if self.started.set(at).is_ok() {
+    pub fn start(&self) -> Instant {
+        let now = Instant::now();
+        if self.started.set(now).is_ok() {
             self.changed.notify_one();
         }
+        now
     }
 
-    pub fn receive_headers(&self, at: Instant, body_bytes: u64) {
-        if self.headers.set(Headers { at, body_bytes }).is_ok() {
+    pub fn receive_headers(&self, body_bytes: u64) {
+        let headers = Headers {
+            at: Instant::now(),
+            body_bytes,
+        };
+        if self.headers.set(headers).is_ok() {
             self.changed.notify_one();
         }
     }
@@ -40,8 +46,9 @@ impl RequestTimeline {
         self.headers.get().map(|headers| headers.body_bytes)
     }
 
-    /// The time a superseded request had spent so far, a lower bound for its unfinished phase.
-    pub fn unfinished_sample(&self) -> Option<Sample> {
+    /// Measurements so far. For a request that has not finished, the time spent in its current
+    /// phase is a lower bound.
+    pub fn sample(&self) -> Option<Sample> {
         let started = *self.started.get()?;
         Some(match self.headers.get() {
             None => Sample {
@@ -90,10 +97,6 @@ impl<'a> HedgeTimer<'a> {
         }
     }
 
-    pub fn primary(&self) -> &'a RequestTimeline {
-        self.primary
-    }
-
     pub fn disarm(&mut self) {
         self.next = None;
     }
@@ -119,6 +122,9 @@ impl<'a> HedgeTimer<'a> {
 
     /// Completes when a hedge is due, or never if none can be.
     pub async fn due(&mut self) {
+        if self.next.is_none() {
+            return std::future::pending().await;
+        }
         let primary = self.primary;
         loop {
             let changed = primary.changed.notified();
@@ -146,7 +152,7 @@ mod tests {
 
     use super::{HedgeTimer, RequestTimeline};
     use crate::{
-        object_store::stats::{BodySample, BucketedStats, LatencyModel, Outcome, Sample},
+        object_store::stats::{BucketedStats, LatencyModel, Sample},
         types::BucketName,
     };
 
@@ -154,17 +160,12 @@ mod tests {
 
     fn model(first_byte_ms: u64, body_bytes: u64, body_ms: u64) -> LatencyModel {
         let stats = BucketedStats::default();
-        let observation = stats.begin(&BucketName::new("bucket").unwrap(), None);
-        observation.record(&Sample {
-            first_byte: Duration::from_millis(first_byte_ms),
-            body: Some(BodySample {
-                bytes: body_bytes,
-                elapsed: Duration::from_millis(body_ms),
-            }),
-        });
-        let model = observation.model();
-        observation.complete(Outcome::Success);
-        model
+        let bucket = BucketName::new("bucket").unwrap();
+        stats.seed(
+            &bucket,
+            Sample::from_millis(first_byte_ms, body_bytes, body_ms),
+        );
+        stats.model(&bucket)
     }
 
     async fn due_after(timer: &mut HedgeTimer<'_>) -> Option<Duration> {
@@ -187,7 +188,7 @@ mod tests {
         tokio::join!(
             async {
                 sleep(Duration::from_millis(50)).await;
-                timeline.start(Instant::now());
+                timeline.start();
             },
             timer.due(),
         );
@@ -198,10 +199,10 @@ mod tests {
     async fn a_hedge_not_taken_before_headers_can_be_taken_during_the_body() {
         let timeline = RequestTimeline::default();
         let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline());
-        timeline.start(Instant::now());
+        timeline.start();
         assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
         sleep(Duration::from_millis(10)).await;
-        timeline.receive_headers(Instant::now(), 4096);
+        timeline.receive_headers(4096);
         assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
         assert_eq!(due_after(&mut timer).await, None);
     }
@@ -215,8 +216,8 @@ mod tests {
             };
             let timeline = RequestTimeline::default();
             let mut timer = HedgeTimer::new(model, &timeline, deadline());
-            timeline.start(Instant::now());
-            timeline.receive_headers(Instant::now(), 16 * MIB);
+            timeline.start();
+            timeline.receive_headers(16 * MIB);
             assert_eq!(due_after(&mut timer).await, expected);
         }
     }

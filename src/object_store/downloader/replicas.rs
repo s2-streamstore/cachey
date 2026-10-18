@@ -7,7 +7,7 @@ use tokio::{
 };
 
 use super::{
-    BucketOperation, DownloadError, DownloadOutput, Downloader, HedgeTimer, ObjectPiece,
+    BucketOperation, DownloadError, DownloadOutput, Downloader, ObjectPiece, PieceRequest,
     RequestConfig, RequestTimeline,
 };
 use crate::{
@@ -140,7 +140,12 @@ impl ReplicaRequest<'_> {
             ..self.config.clone()
         });
         let _hedge = hedge;
-        let config = hedge_config.as_ref().unwrap_or(self.config);
+        let request = PieceRequest {
+            bucket,
+            object: self.object,
+            range: self.range,
+            config: hedge_config.as_ref().unwrap_or(self.config),
+        };
         let result = BucketOperation {
             downloader: self.downloader,
             bucket,
@@ -149,10 +154,10 @@ impl ReplicaRequest<'_> {
             probe,
         }
         .execute(
-            self.range.end - self.range.start,
+            request.bytes(),
             admission,
             timeline,
-            async |_, observation| {
+            async |_, observation, timeline| {
                 let _active = {
                     let mut progress = self.progress.lock();
                     progress.hedged |= progress.active > 0;
@@ -160,14 +165,7 @@ impl ReplicaRequest<'_> {
                     ActiveCopy(&self.progress)
                 };
                 self.downloader
-                    .fetch_piece(
-                        bucket,
-                        self.object,
-                        self.range,
-                        config,
-                        observation,
-                        Some(timeline),
-                    )
+                    .fetch_piece(request, observation, timeline)
                     .await
             },
         )
@@ -211,8 +209,8 @@ impl Downloader {
         tried[primary] = true;
         let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
         let primary_timeline = RequestTimeline::default();
-        let mut hedge = HedgeTimer::new(routing.model(primary), &primary_timeline, deadline);
-        if self.limits.hedge_budget_percent == 0 || probe.is_some() {
+        let mut hedge = self.hedge_timer(routing.model(primary), &primary_timeline, deadline);
+        if probe.is_some() {
             hedge.disarm();
         }
         let mut active = FuturesUnordered::new();

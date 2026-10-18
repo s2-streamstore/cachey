@@ -18,7 +18,7 @@ use crate::{
         admission::{DownloadAdmission, DownloadPermit},
         budget::AttemptBudget,
         config::{DownloadLimits, RequestConfig},
-        stats::{BodySample, BucketObservation, BucketedStats, Outcome, ProbePermit, Sample},
+        stats::{BucketObservation, BucketedStats, LatencyModel, Outcome, ProbePermit},
     },
     service::SlidingThroughput,
     types::{BucketName, BucketNameSet, ObjectKey},
@@ -177,6 +177,20 @@ pub struct DownloadOutput {
     pub hedged: bool,
 }
 
+#[derive(Clone, Copy)]
+struct PieceRequest<'a> {
+    bucket: &'a BucketName,
+    object: &'a ObjectKey,
+    range: &'a Range<u64>,
+    config: &'a RequestConfig,
+}
+
+impl PieceRequest<'_> {
+    fn bytes(&self) -> u64 {
+        self.range.end - self.range.start
+    }
+}
+
 struct BucketOperation<'a> {
     downloader: &'a Downloader,
     bucket: &'a BucketName,
@@ -193,7 +207,11 @@ impl BucketOperation<'_> {
         bytes: u64,
         admission: Option<DownloadPermit>,
         timeline: &RequestTimeline,
-        fetch: impl AsyncFnOnce(Instant, &BucketObservation) -> Result<T, DownloadError>,
+        fetch: impl AsyncFnOnce(
+            Instant,
+            &BucketObservation,
+            &RequestTimeline,
+        ) -> Result<T, DownloadError>,
     ) -> Result<T, DownloadError> {
         let _admission = match admission {
             Some(permit) => permit,
@@ -216,17 +234,13 @@ impl BucketOperation<'_> {
                 timeout: budget,
             });
         }
-        let unknown_latency = self
-            .unknown_latency
-            .min(self.downloader.limits.bucket_timeout)
-            / 2;
         let observation = self
             .downloader
             .bucketed_stats
             .begin(self.bucket, self.probe);
         let result = select! {
             biased;
-            result = fetch(now + budget, &observation) => result,
+            result = fetch(now + budget, &observation, timeline) => result,
             () = sleep_until(now + budget) => Err(DownloadError::Timeout {
                 bucket: self.bucket.clone(), timeout: budget,
             }),
@@ -237,7 +251,11 @@ impl BucketOperation<'_> {
                 observation
                     .model()
                     .reached_tail(timeline.announced_body_bytes())
-                    .unwrap_or(unknown_latency)
+                    .unwrap_or(
+                        self.unknown_latency
+                            .min(self.downloader.limits.bucket_timeout)
+                            / 2,
+                    )
             }),
         };
         observation.complete(outcome);
@@ -306,30 +324,26 @@ impl Downloader {
             DownloadError::Unknown("Page timeout exceeds the clock's supported range".to_owned())
         })?;
         let output = if buckets.len() == 1 {
-            let bucket = &buckets[0];
-            let timeline = RequestTimeline::default();
+            let request = PieceRequest {
+                bucket: &buckets[0],
+                object: &object,
+                range: byterange,
+                config: req_config,
+            };
             let (piece, hedged) = BucketOperation {
                 downloader: self,
-                bucket,
+                bucket: request.bucket,
                 deadline,
                 unknown_latency: self.limits.page_timeout,
                 probe: None,
             }
             .execute(
-                byterange.end - byterange.start,
+                request.bytes(),
                 None,
-                &timeline,
-                async |deadline, observation| {
-                    let hedge = HedgeTimer::new(observation.model(), &timeline, deadline);
-                    self.fetch_with_hedge(
-                        bucket,
-                        &object,
-                        byterange,
-                        req_config,
-                        observation,
-                        hedge,
-                    )
-                    .await
+                &RequestTimeline::default(),
+                async |deadline, observation, timeline| {
+                    self.fetch_with_hedge(request, observation, timeline, deadline)
+                        .await
                 },
             )
             .await?;
@@ -352,26 +366,14 @@ impl Downloader {
     /// bucket still raise its latency estimates.
     async fn fetch_with_hedge(
         &self,
-        bucket: &BucketName,
-        object: &ObjectKey,
-        byterange: &Range<u64>,
-        config: &RequestConfig,
+        request: PieceRequest<'_>,
         observation: &BucketObservation,
-        mut hedge: HedgeTimer<'_>,
+        timeline: &RequestTimeline,
+        deadline: Instant,
     ) -> Result<(ObjectPiece, bool), DownloadError> {
-        let timeline = hedge.primary();
-        let primary = self.fetch_piece(
-            bucket,
-            object,
-            byterange,
-            config,
-            observation,
-            Some(timeline),
-        );
+        let primary = self.fetch_piece(request, observation, timeline);
         tokio::pin!(primary);
-        if self.limits.hedge_budget_percent == 0 {
-            return primary.await.map(|piece| (piece, false));
-        }
+        let mut hedge = self.hedge_timer(observation.model(), timeline, deadline);
         let _permits = loop {
             select! {
                 biased;
@@ -381,16 +383,23 @@ impl Downloader {
             if observation.overloaded() {
                 continue;
             }
-            if let Some(permits) = self.hedge_permits(bucket, byterange.end - byterange.start) {
+            if let Some(permits) = self.hedge_permits(request.bucket, request.bytes()) {
                 break permits;
             }
         };
         let hedge_config = RequestConfig {
             max_attempts: Some(1),
-            ..config.clone()
+            ..request.config.clone()
         };
-        let mut secondary =
-            Box::pin(self.fetch_piece(bucket, object, byterange, &hedge_config, observation, None));
+        let secondary_timeline = RequestTimeline::default();
+        let mut secondary = Box::pin(self.fetch_piece(
+            PieceRequest {
+                config: &hedge_config,
+                ..request
+            },
+            observation,
+            &secondary_timeline,
+        ));
         let result = select! {
             result = &mut primary => match result {
                 Err(error) if error.should_wait_for_hedged_peer() => secondary.as_mut().await,
@@ -398,7 +407,7 @@ impl Downloader {
             },
             result = &mut secondary => match result {
                 Ok(piece) => {
-                    if let Some(sample) = timeline.unfinished_sample() {
+                    if let Some(sample) = timeline.sample() {
                         observation.record(&sample);
                     }
                     Ok(piece)
@@ -410,16 +419,32 @@ impl Downloader {
         result.map(|piece| (piece, true))
     }
 
+    fn hedge_timer<'a>(
+        &self,
+        model: LatencyModel,
+        primary: &'a RequestTimeline,
+        deadline: Instant,
+    ) -> HedgeTimer<'a> {
+        let mut hedge = HedgeTimer::new(model, primary, deadline);
+        if self.limits.hedge_budget_percent == 0 {
+            hedge.disarm();
+        }
+        hedge
+    }
+
     /// Records the request's measurements only once its body is validated.
     async fn fetch_piece(
         &self,
-        bucket: &BucketName,
-        object: &ObjectKey,
-        byterange: &Range<u64>,
-        req_config: &RequestConfig,
+        request: PieceRequest<'_>,
         observation: &BucketObservation,
-        timeline: Option<&RequestTimeline>,
+        timeline: &RequestTimeline,
     ) -> Result<ObjectPiece, DownloadError> {
+        let PieceRequest {
+            bucket,
+            object,
+            range: byterange,
+            config: req_config,
+        } = request;
         #[cfg(test)]
         let _simulation_copy = crate::object_store::simulation::record_copy(object, bucket);
         let request = self
@@ -430,10 +455,7 @@ impl Downloader {
             .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
 
-        let started = Instant::now();
-        if let Some(timeline) = timeline {
-            timeline.start(started);
-        }
+        let started = timeline.start();
         let output = if req_config.is_noop() {
             request.send().await
         } else {
@@ -459,22 +481,10 @@ impl Downloader {
                 .await
         }
         .map_err(|error| map_get_object_error(bucket, byterange, started.elapsed(), error))?;
-        let headers_at = Instant::now();
-        if let Some(timeline) = timeline {
-            let body_bytes = output
-                .content_length()
-                .and_then(|length| u64::try_from(length).ok())
-                .unwrap_or(byterange.end - byterange.start);
-            timeline.receive_headers(headers_at, body_bytes);
+        let piece = self.read_response(byterange, output, timeline).await?;
+        if let Some(sample) = timeline.sample() {
+            observation.record(&sample);
         }
-        let piece = self.read_response(byterange, output).await?;
-        observation.record(&Sample {
-            first_byte: headers_at.duration_since(started),
-            body: Some(BodySample {
-                bytes: piece.data.len() as u64,
-                elapsed: headers_at.elapsed(),
-            }),
-        });
         Ok(piece)
     }
 
@@ -482,6 +492,7 @@ impl Downloader {
         &self,
         req_range: &Range<u64>,
         output: GetObjectOutput,
+        timeline: &RequestTimeline,
     ) -> Result<ObjectPiece, DownloadError> {
         let invalid_range = || {
             DownloadError::InvalidResponse(format!(
@@ -501,6 +512,7 @@ impl Downloader {
             return Err(invalid_range());
         }
         let expected_data_len = expected_end - req_range.start;
+        timeline.receive_headers(expected_data_len);
         let object_size = content_range.complete_length;
         let mtime = output
             .last_modified()
@@ -574,7 +586,7 @@ mod tests {
         RequestTimeline, map_get_object_error,
     };
     use crate::{
-        object_store::stats::{BodySample, Outcome, Sample},
+        object_store::stats::{Outcome, Sample},
         service::SlidingThroughput,
         types::{BucketName, BucketNameSet, ObjectKey},
     };
@@ -713,23 +725,11 @@ mod tests {
             .await
     }
 
-    fn seed_sample(downloader: &Downloader, bucket: &str, first_byte_ms: u64, body: BodySample) {
-        let observation = downloader
-            .bucketed_stats
-            .begin(&BucketName::new(bucket).unwrap(), None);
-        observation.record(&Sample {
-            first_byte: Duration::from_millis(first_byte_ms),
-            body: Some(body),
-        });
-        observation.complete(Outcome::Success);
-    }
-
     fn seed_latency(downloader: &Downloader, bucket: &str, millis: u64) {
-        let body = BodySample {
-            bytes: 4,
-            elapsed: Duration::ZERO,
-        };
-        seed_sample(downloader, bucket, millis, body);
+        downloader.bucketed_stats.seed(
+            &BucketName::new(bucket).unwrap(),
+            Sample::from_millis(millis, 4, 0),
+        );
     }
 
     async fn metrics(downloader: &Downloader, bucket: &str) -> BucketMetrics {
@@ -756,7 +756,9 @@ mod tests {
             let output = GetObjectOutput::builder()
                 .set_content_range(header.map(str::to_owned))
                 .build();
-            let result = downloader.read_response(&(0..10), output).await;
+            let result = downloader
+                .read_response(&(0..10), output, &RequestTimeline::default())
+                .await;
             assert!(
                 matches!(result, Err(DownloadError::InvalidResponse(_))),
                 "{header:?}: {result:?}"
@@ -781,7 +783,7 @@ mod tests {
                 .build();
             let result = timeout(
                 Duration::from_millis(1),
-                downloader.read_response(&(0..10), output),
+                downloader.read_response(&(0..10), output, &RequestTimeline::default()),
             )
             .await
             .expect("excess data must be rejected without waiting for the rest of the body");
@@ -1020,11 +1022,10 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        let body = BodySample {
-            bytes: 4 * 1024 * 1024,
-            elapsed: Duration::from_secs(4),
-        };
-        seed_sample(&downloader, "bucket", 5, body);
+        downloader.bucketed_stats.seed(
+            &BucketName::new("bucket").unwrap(),
+            Sample::from_millis(5, 4 * 1024 * 1024, 4000),
+        );
         assert!(matches!(
             fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
             Err(DownloadError::Timeout { .. })
@@ -1548,7 +1549,7 @@ mod tests {
             4,
             Some(permit),
             &RequestTimeline::default(),
-            async |_, _| Ok(()),
+            async |_, _, _| Ok(()),
         )
         .await;
         assert!(matches!(result, Err(DownloadError::Timeout { .. })));
