@@ -30,6 +30,9 @@ pub struct BucketMetrics {
     pub deprioritized: bool,
     pub consecutive_failures: u32,
     pub recovery_successes: u32,
+    /// Time from starting a request to its validated body, including SDK retries.
+    pub latency_mean: Duration,
+    pub latency_p99: Duration,
     /// Time from starting a request to receiving successful response headers, including SDK
     /// retries.
     pub first_byte_mean: Duration,
@@ -42,106 +45,85 @@ pub struct BucketMetrics {
     pub throughput_p1: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct Summary<T> {
     mean: T,
     slow: T,
 }
 
-/// Without a large-body measurement, a bucket is assumed to serve small bodies regardless of the
-/// requested size.
-fn body_time(bytes: u64, small_body: Option<Duration>, throughput: Option<f64>) -> Duration {
-    let transfer = throughput.map(|throughput| {
-        Duration::try_from_secs_f64(bytes as f64 / throughput).unwrap_or(Duration::MAX)
-    });
-    match transfer {
-        Some(transfer) if bytes >= MIN_THROUGHPUT_SAMPLE_BYTES => transfer,
-        _ => small_body.or(transfer).unwrap_or_default(),
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BodySample {
+    pub bytes: u64,
+    /// Time from response headers to the end of the body.
+    pub elapsed: Duration,
+}
+
+/// Measurements from one backend request.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Sample {
+    pub first_byte: Duration,
+    /// Absent for a request superseded before its response headers arrived.
+    pub body: Option<BodySample>,
+}
+
+impl Sample {
+    fn latency(&self) -> Duration {
+        self.first_byte
+            .saturating_add(self.body.map_or(Duration::ZERO, |body| body.elapsed))
     }
 }
 
-/// Request latency as time to first byte plus body time, so one set of statistics serves any
-/// request size.
+/// Latency summaries for one bucket. Pages are requested whole, so the body size is unknown until
+/// response headers announce it: earlier decisions use complete request latency across the sizes
+/// the bucket actually served, and later ones predict body time for the announced length.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct LatencyModel {
+    latency: Option<Summary<Duration>>,
     first_byte: Option<Summary<Duration>>,
     small_body: Option<Summary<Duration>>,
     throughput: Option<Summary<f64>>,
 }
 
 impl LatencyModel {
-    fn summarize(
-        histogram: &ExponentialDecayHistogram,
-        slow_quantile: f64,
-    ) -> Option<Summary<f64>> {
-        let snapshot = histogram.snapshot();
-        (snapshot.count() > 0).then(|| Summary {
-            mean: snapshot.mean(),
-            slow: snapshot.value(slow_quantile) as f64,
-        })
-    }
-
-    fn from_histograms(
-        first_byte: &ExponentialDecayHistogram,
-        small_body: &ExponentialDecayHistogram,
-        throughput: &ExponentialDecayHistogram,
-    ) -> Self {
-        let micros = |summary: Summary<f64>| Summary {
-            mean: Duration::from_micros(summary.mean.round() as u64),
-            slow: Duration::from_micros(summary.slow as u64),
-        };
-        Self {
-            first_byte: Self::summarize(first_byte, 0.99).map(micros),
-            small_body: Self::summarize(small_body, 0.99).map(micros),
-            throughput: Self::summarize(throughput, 0.01),
-        }
+    /// Slow complete request latency, or `None` before any measurement.
+    pub fn tail(&self) -> Option<Duration> {
+        self.latency.map(|latency| latency.slow)
     }
 
     pub fn first_byte_tail(&self) -> Option<Duration> {
         self.first_byte.map(|first_byte| first_byte.slow)
     }
 
-    /// Slow body time measured from response headers.
-    pub fn body_tail(&self, bytes: u64) -> Duration {
-        body_time(
-            bytes,
-            self.small_body.map(|small_body| small_body.slow),
-            self.throughput.map(|throughput| throughput.slow),
-        )
+    /// Slow body time after headers announce `bytes`, or `None` before the bucket has served a body
+    /// in the same size class.
+    pub fn body_tail(&self, bytes: u64) -> Option<Duration> {
+        if bytes < MIN_THROUGHPUT_SAMPLE_BYTES {
+            self.small_body.map(|small_body| small_body.slow)
+        } else {
+            self.throughput.map(|throughput| {
+                Duration::try_from_secs_f64(bytes as f64 / throughput.slow).unwrap_or(Duration::MAX)
+            })
+        }
     }
 
-    /// Slow request time, or `None` before any successful response headers.
-    pub fn tail(&self, bytes: u64) -> Option<Duration> {
-        Some(
-            self.first_byte_tail()?
-                .saturating_add(self.body_tail(bytes)),
-        )
+    /// Slow time to finish the phases a request reached: response headers, then any body whose
+    /// length they announced.
+    pub fn reached_tail(&self, announced_body_bytes: Option<u64>) -> Option<Duration> {
+        let first_byte = self.first_byte_tail()?;
+        match announced_body_bytes {
+            None => Some(first_byte),
+            Some(bytes) => Some(first_byte.saturating_add(self.body_tail(bytes)?)),
+        }
     }
-}
 
-#[derive(Debug)]
-struct BucketStats {
-    last_outcome: Instant,
-    error_rate: f64,
-    deprioritized: bool,
-    consecutive_failures: u32,
-    recovery_successes: u32,
-    generation: u64,
-    probe_after: Instant,
-    probing: bool,
-    overload_until: Instant,
-    /// In-flight operations keyed by start time plus expected body time, so their age estimates
-    /// time to first byte.
-    active: BTreeMap<Instant, usize>,
-    routing_first_byte: Duration,
-    routing_small_body: Option<Duration>,
-    routing_throughput: Option<f64>,
-    best_first_byte: Option<Duration>,
-    first_byte: ExponentialDecayHistogram,
-    small_body: ExponentialDecayHistogram,
-    throughput: ExponentialDecayHistogram,
-    model: LatencyModel,
-    model_at: Instant,
+    fn covers(&self, sample: &Sample) -> bool {
+        self.latency.is_some()
+            && match sample.body {
+                Some(body) if body.bytes < MIN_THROUGHPUT_SAMPLE_BYTES => self.small_body.is_some(),
+                Some(body) if !body.elapsed.is_zero() => self.throughput.is_some(),
+                Some(_) | None => true,
+            }
+    }
 }
 
 fn histogram_micros(duration: Duration) -> i64 {
@@ -160,6 +142,103 @@ fn histogram(now: Instant) -> ExponentialDecayHistogram {
     builder.build()
 }
 
+#[derive(Debug)]
+struct LatencyHistograms {
+    latency: ExponentialDecayHistogram,
+    first_byte: ExponentialDecayHistogram,
+    small_body: ExponentialDecayHistogram,
+    throughput: ExponentialDecayHistogram,
+}
+
+impl LatencyHistograms {
+    fn new(now: Instant) -> Self {
+        Self {
+            latency: histogram(now),
+            first_byte: histogram(now),
+            small_body: histogram(now),
+            throughput: histogram(now),
+        }
+    }
+
+    fn record(&mut self, now: Instant, sample: &Sample) {
+        let now = now.into_std();
+        self.latency
+            .update_at(now, histogram_micros(sample.latency()));
+        self.first_byte
+            .update_at(now, histogram_micros(sample.first_byte));
+        match sample.body {
+            Some(body) if body.bytes < MIN_THROUGHPUT_SAMPLE_BYTES => {
+                self.small_body
+                    .update_at(now, histogram_micros(body.elapsed));
+            }
+            Some(body) if !body.elapsed.is_zero() => {
+                let bytes_per_second = body.bytes as f64 / body.elapsed.as_secs_f64();
+                self.throughput.update_at(now, bytes_per_second as i64);
+            }
+            Some(_) | None => {}
+        }
+    }
+
+    fn summarize(
+        histogram: &ExponentialDecayHistogram,
+        slow_quantile: f64,
+    ) -> Option<Summary<f64>> {
+        let snapshot = histogram.snapshot();
+        (snapshot.count() > 0).then(|| Summary {
+            mean: snapshot.mean(),
+            slow: snapshot.value(slow_quantile) as f64,
+        })
+    }
+
+    fn model(&self) -> LatencyModel {
+        let durations = |histogram| {
+            Self::summarize(histogram, 0.99).map(|summary| Summary {
+                mean: Duration::from_micros(summary.mean.round() as u64),
+                slow: Duration::from_micros(summary.slow as u64),
+            })
+        };
+        LatencyModel {
+            latency: durations(&self.latency),
+            first_byte: durations(&self.first_byte),
+            small_body: durations(&self.small_body),
+            throughput: Self::summarize(&self.throughput, 0.01),
+        }
+    }
+
+    #[cfg(test)]
+    fn retention(&self) -> [(u64, usize); 4] {
+        [
+            &self.latency,
+            &self.first_byte,
+            &self.small_body,
+            &self.throughput,
+        ]
+        .map(|histogram| {
+            let snapshot = histogram.snapshot();
+            (snapshot.count(), snapshot.exemplars().count())
+        })
+    }
+}
+
+#[derive(Debug)]
+struct BucketStats {
+    last_outcome: Instant,
+    error_rate: f64,
+    deprioritized: bool,
+    consecutive_failures: u32,
+    recovery_successes: u32,
+    generation: u64,
+    probe_after: Instant,
+    probing: bool,
+    overload_until: Instant,
+    active: BTreeMap<Instant, usize>,
+    routing_latency: Duration,
+    best_latency: Option<Duration>,
+    histograms: LatencyHistograms,
+    model: LatencyModel,
+    model_at: Instant,
+}
+
 impl Default for BucketStats {
     fn default() -> Self {
         let now = Instant::now();
@@ -174,13 +253,9 @@ impl Default for BucketStats {
             probing: false,
             overload_until: now,
             active: BTreeMap::new(),
-            routing_first_byte: Duration::ZERO,
-            routing_small_body: None,
-            routing_throughput: None,
-            best_first_byte: None,
-            first_byte: histogram(now),
-            small_body: histogram(now),
-            throughput: histogram(now),
+            routing_latency: Duration::ZERO,
+            best_latency: None,
+            histograms: LatencyHistograms::new(now),
             model: LatencyModel::default(),
             model_at: now - LATENCY_SNAPSHOT_INTERVAL,
         }
@@ -199,32 +274,30 @@ impl BucketStats {
 
     fn model(&mut self, now: Instant) -> LatencyModel {
         if now.duration_since(self.model_at) >= LATENCY_SNAPSHOT_INTERVAL {
-            self.model =
-                LatencyModel::from_histograms(&self.first_byte, &self.small_body, &self.throughput);
+            self.model = self.histograms.model();
             self.model_at = now;
         }
         self.model
     }
 
-    fn refresh_model(&mut self, now: Instant) {
-        self.model_at = now - LATENCY_SNAPSHOT_INTERVAL;
+    fn record(&mut self, now: Instant, sample: &Sample, replace_history: bool) {
+        if replace_history {
+            self.histograms = LatencyHistograms::new(now);
+        }
+        self.histograms.record(now, sample);
+        let latency = sample.latency();
+        self.routing_latency = if replace_history || self.best_latency.is_none() {
+            latency
+        } else {
+            self.routing_latency.mul_f64(1.0 - LATENCY_ALPHA) + latency.mul_f64(LATENCY_ALPHA)
+        };
+        self.best_latency = Some(self.best_latency.map_or(latency, |best| best.min(latency)));
+        if replace_history || !self.model.covers(sample) {
+            self.model_at = now - LATENCY_SNAPSHOT_INTERVAL;
+        }
     }
 
-    fn reset_latency(&mut self, now: Instant) {
-        self.first_byte = histogram(now);
-        self.small_body = histogram(now);
-        self.throughput = histogram(now);
-        self.routing_small_body = None;
-        self.routing_throughput = None;
-        self.best_first_byte = None;
-        self.refresh_model(now);
-    }
-
-    fn routing_body(&self, bytes: u64) -> Duration {
-        body_time(bytes, self.routing_small_body, self.routing_throughput)
-    }
-
-    fn routing_first_byte(&self, now: Instant, tail: Duration) -> Duration {
+    fn routing_latency(&self, now: Instant, tail: Duration) -> Duration {
         let overdue = tail.saturating_mul(4).max(Duration::from_millis(1));
         let mut count = 0;
         for (started, active) in &self.active {
@@ -234,10 +307,10 @@ impl BucketStats {
             }
             count += active;
             if count >= 3 {
-                return self.routing_first_byte.max(elapsed);
+                return self.routing_latency.max(elapsed);
             }
         }
-        self.routing_first_byte
+        self.routing_latency
     }
 }
 
@@ -261,7 +334,6 @@ impl Drop for ProbePermit {
 
 pub(super) struct BucketObservation {
     stats: Arc<Mutex<BucketStats>>,
-    /// Start time plus expected body time.
     started: Instant,
     generation: u64,
     probe: Option<ProbePermit>,
@@ -269,6 +341,22 @@ pub(super) struct BucketObservation {
 }
 
 impl BucketObservation {
+    /// A probe's measurements replace the bucket's latency history, so a recovering bucket is
+    /// judged by how it performs now.
+    pub fn record(&self, sample: &Sample) {
+        self.stats
+            .lock()
+            .record(Instant::now(), sample, self.probe.is_some());
+    }
+
+    pub fn model(&self) -> LatencyModel {
+        self.stats.lock().model(Instant::now())
+    }
+
+    pub fn overloaded(&self) -> bool {
+        Instant::now() < self.stats.lock().overload_until
+    }
+
     pub fn complete(mut self, outcome: Outcome) {
         self.outcome = Some(outcome);
     }
@@ -287,9 +375,9 @@ impl Drop for BucketObservation {
         let Some(outcome) = self.outcome else {
             let increase = now
                 .duration_since(self.started)
-                .saturating_sub(stats.routing_first_byte)
+                .saturating_sub(stats.routing_latency)
                 .mul_f64(LATENCY_ALPHA);
-            stats.routing_first_byte += increase;
+            stats.routing_latency += increase;
             return;
         };
         let error_rate = stats.error_rate(now);
@@ -348,9 +436,7 @@ pub struct BucketedStats {
 struct BucketSnapshot {
     stats: Arc<Mutex<BucketStats>>,
     model: LatencyModel,
-    body: Duration,
     latency: Duration,
-    tail: Option<Duration>,
     deprioritized: bool,
     error_rate: f64,
     overloaded: bool,
@@ -363,11 +449,11 @@ impl RoutingSnapshot {
         let left_stats = &self.0[left];
         let right_stats = &self.0[right];
         (
-            left_stats.tail.is_some_and(|tail| tail >= remaining),
+            self.tail(left).is_some_and(|tail| tail >= remaining),
             left_stats.deprioritized,
         )
             .cmp(&(
-                right_stats.tail.is_some_and(|tail| tail >= remaining),
+                self.tail(right).is_some_and(|tail| tail >= remaining),
                 right_stats.deprioritized,
             ))
             .then_with(|| {
@@ -458,7 +544,7 @@ impl RoutingSnapshot {
     pub fn primary(&self, remaining: Duration) -> (usize, Option<ProbePermit>) {
         let winner = self.best(&[], remaining).expect("nonempty bucket set");
         let best = &self.0[winner];
-        if best.deprioritized || best.tail.is_some_and(|tail| tail >= remaining) {
+        if best.deprioritized || self.tail(winner).is_some_and(|tail| tail >= remaining) {
             return (winner, None);
         }
         let now = Instant::now();
@@ -467,17 +553,13 @@ impl RoutingSnapshot {
                 continue;
             }
             let mut stats = bucket.stats.lock();
-            let stale = stats.best_first_byte.is_some()
+            let stale = stats.best_latency.is_some()
                 && now.duration_since(stats.last_outcome) >= RECOVERY_INTERVAL;
-            let best_latency = stats
-                .best_first_byte
-                .unwrap_or_default()
-                .saturating_add(bucket.body);
             if (stats.deprioritized || stale)
                 && !stats.probing
                 && stats.active.is_empty()
                 && now >= stats.probe_after
-                && locality_adjusted(best_latency, index) < best.latency
+                && locality_adjusted(stats.best_latency.unwrap_or_default(), index) < best.latency
             {
                 stats.probing = true;
                 return (
@@ -492,7 +574,7 @@ impl RoutingSnapshot {
     }
 
     pub fn tail(&self, index: usize) -> Option<Duration> {
-        self.0[index].tail
+        self.0[index].model.tail()
     }
 
     pub fn model(&self, index: usize) -> LatencyModel {
@@ -512,81 +594,18 @@ impl BucketedStats {
         self.by_bucket.entry(bucket.clone()).or_default().clone()
     }
 
-    pub(super) fn observe_first_byte(&self, bucket: &BucketName, latency: Duration) {
-        let entry = self.entry(bucket);
-        let mut stats = entry.lock();
-        let now = Instant::now();
-        stats
-            .first_byte
-            .update_at(now.into_std(), histogram_micros(latency));
-        stats.routing_first_byte = if stats.best_first_byte.is_none() {
-            latency
-        } else {
-            stats.routing_first_byte.mul_f64(1.0 - LATENCY_ALPHA) + latency.mul_f64(LATENCY_ALPHA)
-        };
-        stats.best_first_byte = Some(
-            stats
-                .best_first_byte
-                .map_or(latency, |best| best.min(latency)),
-        );
-        if stats.model.first_byte.is_none() {
-            stats.refresh_model(now);
-        }
-    }
-
-    pub(super) fn observe_body(&self, bucket: &BucketName, bytes: u64, elapsed: Duration) {
-        let entry = self.entry(bucket);
-        let mut stats = entry.lock();
-        let now = Instant::now();
-        let first_sample = if bytes < MIN_THROUGHPUT_SAMPLE_BYTES {
-            stats
-                .small_body
-                .update_at(now.into_std(), histogram_micros(elapsed));
-            stats.routing_small_body = Some(stats.routing_small_body.map_or(elapsed, |routing| {
-                routing.mul_f64(1.0 - LATENCY_ALPHA) + elapsed.mul_f64(LATENCY_ALPHA)
-            }));
-            stats.model.small_body.is_none()
-        } else if !elapsed.is_zero() {
-            let bytes_per_second = bytes as f64 / elapsed.as_secs_f64();
-            stats
-                .throughput
-                .update_at(now.into_std(), bytes_per_second as i64);
-            stats.routing_throughput = Some(
-                stats
-                    .routing_throughput
-                    .map_or(bytes_per_second, |routing| {
-                        routing * (1.0 - LATENCY_ALPHA) + bytes_per_second * LATENCY_ALPHA
-                    }),
-            );
-            stats.model.throughput.is_none()
-        } else {
-            false
-        };
-        if first_sample {
-            stats.refresh_model(now);
-        }
-    }
-
-    pub(super) fn model(&self, bucket: &BucketName) -> LatencyModel {
-        self.entry(bucket).lock().model(Instant::now())
-    }
-
-    /// A probe discards latency history, so the bucket is judged by its fresh measurements.
     pub(super) fn begin(
         &self,
         bucket: &BucketName,
         probe: Option<ProbePermit>,
-        bytes: u64,
     ) -> BucketObservation {
         let stats = self.entry(bucket);
         let (started, generation) = {
             let mut stats = stats.lock();
-            let now = Instant::now();
+            let started = Instant::now();
             if probe.is_some() {
-                stats.probe_after = now + recovery_delay();
-                stats.reset_latency(now);
+                stats.probe_after = started + recovery_delay();
             }
-            let started = now.checked_add(stats.routing_body(bytes)).unwrap_or(now);
             *stats.active.entry(started).or_default() += 1;
             (started, stats.generation)
         };
@@ -599,7 +618,7 @@ impl BucketedStats {
         }
     }
 
-    pub(super) fn snapshot(&self, buckets: &BucketNameSet, bytes: u64) -> RoutingSnapshot {
+    pub(super) fn snapshot(&self, buckets: &BucketNameSet) -> RoutingSnapshot {
         let now = Instant::now();
         let mut preferred_latency = Duration::ZERO;
         RoutingSnapshot(
@@ -609,24 +628,19 @@ impl BucketedStats {
                 .map(|(index, bucket)| {
                     let entry = self.entry(bucket);
                     let mut stats = entry.lock();
-                    let model = stats.model(now);
-                    let body = stats.routing_body(bytes);
                     if index == 0 {
-                        preferred_latency = stats.routing_first_byte.saturating_add(body);
+                        preferred_latency = stats.routing_latency;
                     }
-                    let tail = model.tail(bytes);
-                    let mut latency = stats
-                        .routing_first_byte(now, model.first_byte_tail().unwrap_or_default())
-                        .saturating_add(body);
+                    let model = stats.model(now);
+                    let tail = model.tail();
+                    let mut latency = stats.routing_latency(now, tail.unwrap_or_default());
                     if index > 0 && tail.is_none() {
                         latency = latency.max(preferred_latency);
                     }
                     BucketSnapshot {
                         stats: entry.clone(),
                         model,
-                        body,
                         latency: locality_adjusted(latency, index),
-                        tail,
                         deprioritized: stats.deprioritized,
                         error_rate: stats.error_rate(now),
                         overloaded: now < stats.overload_until,
@@ -636,18 +650,11 @@ impl BucketedStats {
         )
     }
 
-    pub(super) fn overloaded(&self, bucket: &BucketName) -> bool {
-        Instant::now() < self.entry(bucket).lock().overload_until
-    }
-
     #[cfg(test)]
     pub(super) fn simulation_histograms(&self) -> Vec<(u64, usize)> {
         self.by_bucket
             .iter()
-            .map(|entry| {
-                let snapshot = entry.value().lock().first_byte.snapshot();
-                (snapshot.count(), snapshot.exemplars().count())
-            })
+            .flat_map(|entry| entry.value().lock().histograms.retention())
             .collect()
     }
 
@@ -659,23 +666,17 @@ impl BucketedStats {
             .map(|entry| {
                 let mut stats = entry.value().lock();
                 let model = stats.model(now);
-                let first_byte = model.first_byte.unwrap_or(Summary {
-                    mean: Duration::ZERO,
-                    slow: Duration::ZERO,
-                });
-                let small_body = model.small_body.unwrap_or(Summary {
-                    mean: Duration::ZERO,
-                    slow: Duration::ZERO,
-                });
-                let throughput = model.throughput.unwrap_or(Summary {
-                    mean: 0.0,
-                    slow: 0.0,
-                });
+                let latency = model.latency.unwrap_or_default();
+                let first_byte = model.first_byte.unwrap_or_default();
+                let small_body = model.small_body.unwrap_or_default();
+                let throughput = model.throughput.unwrap_or_default();
                 let metrics = BucketMetrics {
                     error_rate: stats.error_rate(now),
                     deprioritized: stats.deprioritized,
                     consecutive_failures: stats.consecutive_failures,
                     recovery_successes: stats.recovery_successes,
+                    latency_mean: latency.mean,
+                    latency_p99: latency.slow,
                     first_byte_mean: first_byte.mean,
                     first_byte_p99: first_byte.slow,
                     small_body_mean: small_body.mean,
@@ -704,9 +705,12 @@ fn locality_adjusted(latency: Duration, index: usize) -> Duration {
 mod tests {
     use std::time::Duration;
 
-    use tokio::time::advance;
+    use tokio::time::{Instant, advance};
 
-    use super::{BucketedStats, MIN_THROUGHPUT_SAMPLE_BYTES, Outcome, RECOVERY_SUCCESSES};
+    use super::{
+        BodySample, BucketedStats, LatencyModel, MIN_THROUGHPUT_SAMPLE_BYTES, Outcome,
+        RECOVERY_SUCCESSES, Sample,
+    };
     use crate::types::{BucketName, BucketNameSet};
 
     fn buckets() -> BucketNameSet {
@@ -718,11 +722,28 @@ mod tests {
         .unwrap()
     }
 
-    async fn success(stats: &BucketedStats, bucket: &BucketName, millis: u64) {
-        let observation = stats.begin(bucket, None, 0);
-        advance(Duration::from_millis(millis)).await;
-        stats.observe_first_byte(bucket, Duration::from_millis(millis));
+    fn sample(first_byte_ms: u64, body_bytes: u64, body_ms: u64) -> Sample {
+        Sample {
+            first_byte: Duration::from_millis(first_byte_ms),
+            body: Some(BodySample {
+                bytes: body_bytes,
+                elapsed: Duration::from_millis(body_ms),
+            }),
+        }
+    }
+
+    fn record(stats: &BucketedStats, bucket: &BucketName, sample: Sample) {
+        let observation = stats.begin(bucket, None);
+        observation.record(&sample);
         observation.complete(Outcome::Success);
+    }
+
+    fn success(stats: &BucketedStats, bucket: &BucketName, millis: u64) {
+        record(stats, bucket, sample(millis, 4, 0));
+    }
+
+    fn latency_model(stats: &BucketedStats, bucket: &BucketName) -> LatencyModel {
+        stats.entry(bucket).lock().model(Instant::now())
     }
 
     #[tokio::test(start_paused = true)]
@@ -736,15 +757,32 @@ mod tests {
             let stats = BucketedStats::default();
             let buckets = buckets();
             for (bucket, millis) in buckets.iter().zip(latencies) {
-                success(&stats, bucket, millis).await;
+                success(&stats, bucket, millis);
             }
             assert_eq!(
-                stats
-                    .snapshot(&buckets, 0)
-                    .best(&[], Duration::from_secs(1)),
+                stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
                 Some(expected)
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_occasional_large_body_does_not_displace_the_preferred_copy() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for _ in 0..10 {
+            record(&stats, &buckets[0], sample(5, 4096, 2));
+            record(&stats, &buckets[1], sample(20, 4096, 2));
+        }
+        record(
+            &stats,
+            &buckets[0],
+            sample(5, 2 * MIN_THROUGHPUT_SAMPLE_BYTES, 100),
+        );
+        assert_eq!(
+            stats.snapshot(&buckets).best(&[], Duration::from_secs(10)),
+            Some(0)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -752,9 +790,9 @@ mod tests {
         let stats = BucketedStats::default();
         let bucket = &buckets()[0];
         let old = (0..RECOVERY_SUCCESSES)
-            .map(|_| stats.begin(bucket, None, 0))
+            .map(|_| stats.begin(bucket, None))
             .collect::<Vec<_>>();
-        stats.begin(bucket, None, 0).complete(Outcome::Failure);
+        stats.begin(bucket, None).complete(Outcome::Failure);
         for observation in old {
             observation.complete(Outcome::Success);
         }
@@ -762,10 +800,10 @@ mod tests {
         assert!(stats.entry(bucket).lock().deprioritized);
         assert_eq!(stats.entry(bucket).lock().recovery_successes, 0);
         for _ in 0..RECOVERY_SUCCESSES - 1 {
-            success(&stats, bucket, 3).await;
+            success(&stats, bucket, 3);
         }
         assert!(stats.entry(bucket).lock().deprioritized);
-        success(&stats, bucket, 3).await;
+        success(&stats, bucket, 3);
         assert!(!stats.entry(bucket).lock().deprioritized);
     }
 
@@ -776,34 +814,61 @@ mod tests {
             let buckets = buckets();
             for (bucket, millis) in buckets.iter().zip([local_latency, Some(5), Some(6)]) {
                 if let Some(millis) = millis {
-                    success(&stats, bucket, millis).await;
+                    success(&stats, bucket, millis);
                 }
             }
-            stats.begin(&buckets[0], None, 0).complete(Outcome::Failure);
+            stats.begin(&buckets[0], None).complete(Outcome::Failure);
             advance(Duration::from_secs(37)).await;
-            let (index, probe) = stats.snapshot(&buckets, 0).primary(Duration::from_secs(1));
+            let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
             assert_eq!(index, 0);
             assert!(probe.is_some());
             assert_eq!(
-                stats
-                    .snapshot(&buckets, 0)
-                    .primary(Duration::from_secs(1))
-                    .0,
+                stats.snapshot(&buckets).primary(Duration::from_secs(1)).0,
                 1
             );
-            let observation = stats.begin(&buckets[0], probe, 0);
+            let observation = stats.begin(&buckets[0], probe);
             advance(Duration::from_millis(3)).await;
-            stats.observe_first_byte(&buckets[0], Duration::from_millis(3));
+            observation.record(&sample(3, 4, 0));
             observation.complete(Outcome::Success);
             assert_eq!(
-                stats
-                    .snapshot(&buckets, 0)
-                    .best(&[], Duration::from_secs(1)),
+                stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
                 Some(1)
             );
-            let (index, probe) = stats.snapshot(&buckets, 0).primary(Duration::from_secs(1));
+            let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
             assert_eq!(index, 0);
             assert!(probe.is_some());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_successful_probe_replaces_latency_history() {
+        for probe_succeeds in [false, true] {
+            let stats = BucketedStats::default();
+            let buckets = buckets();
+            for (bucket, millis) in buckets.iter().zip([3, 5, 6]) {
+                success(&stats, bucket, millis);
+            }
+            stats.begin(&buckets[0], None).complete(Outcome::Failure);
+            advance(Duration::from_secs(37)).await;
+            let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
+            assert_eq!(index, 0);
+            let observation = stats.begin(&buckets[0], probe);
+            advance(Duration::from_millis(9)).await;
+            if probe_succeeds {
+                observation.record(&sample(9, 4, 0));
+                observation.complete(Outcome::Success);
+            } else {
+                observation.complete(Outcome::Failure);
+            }
+            let tail = if probe_succeeds { 9 } else { 3 };
+            assert_eq!(
+                stats.snapshot(&buckets).tail(0),
+                Some(Duration::from_millis(tail))
+            );
+            assert_eq!(
+                stats.entry(&buckets[0]).lock().best_latency,
+                Some(Duration::from_millis(3))
+            );
         }
     }
 
@@ -812,11 +877,11 @@ mod tests {
         let stats = BucketedStats::default();
         let buckets = buckets();
         for bucket in buckets.iter() {
-            success(&stats, bucket, 3).await;
+            success(&stats, bucket, 3);
         }
         let mut exported = 0;
         stats.export_bucket_metrics(|bucket, metrics| {
-            assert_eq!(metrics.first_byte_mean, Duration::from_millis(3));
+            assert_eq!(metrics.latency_mean, Duration::from_millis(3));
             let entry = stats
                 .by_bucket
                 .try_get_mut(bucket)
@@ -829,27 +894,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn exports_first_byte_small_body_and_throughput() {
+    async fn exports_latency_by_phase_and_size_class() {
         let stats = BucketedStats::default();
         let bucket = BucketName::new("local").unwrap();
-        for millis in [10, 30] {
-            stats.observe_first_byte(&bucket, Duration::from_millis(millis));
-        }
-        stats.observe_body(
+        record(
+            &stats,
             &bucket,
-            MIN_THROUGHPUT_SAMPLE_BYTES - 1,
-            Duration::from_millis(1),
+            sample(10, MIN_THROUGHPUT_SAMPLE_BYTES - 1, 1),
         );
-        stats.observe_body(&bucket, MIN_THROUGHPUT_SAMPLE_BYTES, Duration::ZERO);
-        stats.observe_body(
+        record(&stats, &bucket, sample(30, MIN_THROUGHPUT_SAMPLE_BYTES, 0));
+        record(
+            &stats,
             &bucket,
-            4 * MIN_THROUGHPUT_SAMPLE_BYTES,
-            Duration::from_secs(2),
+            sample(20, 4 * MIN_THROUGHPUT_SAMPLE_BYTES, 2000),
         );
 
         let mut exported = None;
         stats.export_bucket_metrics(|_, metrics| exported = Some(metrics.clone()));
         let metrics = exported.expect("bucket metrics");
+        assert_eq!(metrics.latency_mean, Duration::from_millis(687));
+        assert_eq!(metrics.latency_p99, Duration::from_millis(2020));
         assert_eq!(metrics.first_byte_mean, Duration::from_millis(20));
         assert_eq!(metrics.first_byte_p99, Duration::from_millis(30));
         assert_eq!(metrics.small_body_mean, Duration::from_millis(1));
@@ -860,28 +924,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn request_size_weighs_first_byte_against_throughput() {
+    async fn body_tails_require_a_measurement_in_the_same_size_class() {
         let stats = BucketedStats::default();
-        let buckets = buckets();
-        let page = 16 * MIN_THROUGHPUT_SAMPLE_BYTES;
-        for (bucket, first_byte_ms, page_ms) in [(&buckets[0], 30, 200), (&buckets[1], 2, 1000)] {
-            stats.observe_first_byte(bucket, Duration::from_millis(first_byte_ms));
-            stats.observe_body(bucket, page, Duration::from_millis(page_ms));
-        }
-        stats.observe_first_byte(&buckets[2], Duration::from_millis(300));
-        stats.observe_body(&buckets[2], 1024, Duration::from_millis(4));
+        let bucket = BucketName::new("local").unwrap();
+        record(&stats, &bucket, sample(20, 4096, 3));
+        let model = latency_model(&stats, &bucket);
+        assert_eq!(model.body_tail(4096), Some(Duration::from_millis(3)));
+        assert_eq!(model.body_tail(16 * MIN_THROUGHPUT_SAMPLE_BYTES), None);
+        assert_eq!(model.reached_tail(None), Some(Duration::from_millis(20)));
+        assert_eq!(
+            model.reached_tail(Some(16 * MIN_THROUGHPUT_SAMPLE_BYTES)),
+            None
+        );
 
-        let best = |bytes| {
-            stats
-                .snapshot(&buckets, bytes)
-                .best(&[], Duration::from_secs(10))
-        };
-        assert_eq!(best(4096), Some(1));
-        assert_eq!(best(page), Some(0));
-        let tail_millis =
-            |index: usize| stats.model(&buckets[index]).tail(page).unwrap().as_millis();
-        assert_eq!(tail_millis(0), 230);
-        assert_eq!(tail_millis(2), 304);
+        record(
+            &stats,
+            &bucket,
+            sample(20, 4 * MIN_THROUGHPUT_SAMPLE_BYTES, 250),
+        );
+        let model = latency_model(&stats, &bucket);
+        assert_eq!(
+            model.body_tail(16 * MIN_THROUGHPUT_SAMPLE_BYTES),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(model.tail(), Some(Duration::from_millis(270)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -889,31 +955,48 @@ mod tests {
         let stats = BucketedStats::default();
         let buckets = buckets();
         for (bucket, millis) in buckets.iter().zip([3, 5, 6]) {
-            success(&stats, bucket, millis).await;
+            success(&stats, bucket, millis);
         }
         let active = (0..3)
-            .map(|_| stats.begin(&buckets[0], None, 0))
+            .map(|_| stats.begin(&buckets[0], None))
             .collect::<Vec<_>>();
         advance(Duration::from_millis(20)).await;
         assert_eq!(
-            stats
-                .snapshot(&buckets, 0)
-                .best(&[], Duration::from_secs(1)),
+            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
             Some(1)
         );
         drop(active);
         assert_eq!(
-            stats
-                .snapshot(&buckets, 0)
-                .best(&[], Duration::from_secs(1)),
+            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
             Some(1)
         );
-        success(&stats, &buckets[0], 3).await;
+        success(&stats, &buckets[0], 3);
         assert_eq!(
-            stats
-                .snapshot(&buckets, 0)
-                .best(&[], Duration::from_secs(1)),
+            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
             Some(0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reads_within_the_request_tail_are_not_stalls() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        record(&stats, &buckets[0], sample(20, 4096, 180));
+        for bucket in buckets.iter().skip(1) {
+            success(&stats, bucket, 250);
+        }
+        let _active = (0..3)
+            .map(|_| stats.begin(&buckets[0], None))
+            .collect::<Vec<_>>();
+        advance(Duration::from_millis(300)).await;
+        assert_eq!(
+            stats.snapshot(&buckets).best(&[], Duration::from_secs(10)),
+            Some(0)
+        );
+        advance(Duration::from_millis(600)).await;
+        assert_eq!(
+            stats.snapshot(&buckets).best(&[], Duration::from_secs(10)),
+            Some(1)
         );
     }
 
@@ -922,22 +1005,22 @@ mod tests {
         for peer_latencies in [None, Some([60, 150])] {
             let stats = BucketedStats::default();
             let buckets = buckets();
-            stats.snapshot(&buckets, 0);
-            success(&stats, &buckets[0], 10).await;
+            stats.snapshot(&buckets);
+            success(&stats, &buckets[0], 10);
             if let Some(latencies) = peer_latencies {
                 for (bucket, millis) in buckets.iter().skip(1).zip(latencies) {
-                    success(&stats, bucket, millis).await;
+                    success(&stats, bucket, millis);
                 }
             }
             let active = (0..3)
-                .map(|_| stats.begin(&buckets[0], None, 0))
+                .map(|_| stats.begin(&buckets[0], None))
                 .collect::<Vec<_>>();
             advance(Duration::from_secs(1)).await;
             for observation in active {
                 observation.complete(Outcome::Neutral);
             }
             advance(Duration::from_secs(60)).await;
-            let (index, probe) = stats.snapshot(&buckets, 0).primary(Duration::from_secs(1));
+            let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
             assert_eq!(index, 0);
             assert!(probe.is_none());
             assert!(!stats.entry(&buckets[0]).lock().deprioritized);

@@ -22,6 +22,24 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         .unwrap()
     });
 
+    static LATENCY_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_latency_mean_seconds",
+            "Mean time from starting a request to its validated body, including SDK retries",
+            &["bucket"]
+        )
+        .unwrap()
+    });
+
+    static LATENCY_P99: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_latency_p99_seconds",
+            "p99 time from starting a request to its validated body, including SDK retries",
+            &["bucket"]
+        )
+        .unwrap()
+    });
+
     static FIRST_BYTE_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_first_byte_mean_seconds",
@@ -40,6 +58,49 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         .unwrap()
     });
 
+    static DEPRIORITIZED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "cachey_bucket_deprioritized",
+            "Whether the bucket is deprioritized while remaining eligible for fallback",
+            &["bucket"]
+        )
+        .unwrap()
+    });
+
+    static CONSECUTIVE_FAILURES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "cachey_bucket_consecutive_failures",
+            "Number of consecutive failures per bucket",
+            &["bucket"]
+        )
+        .unwrap()
+    });
+
+    ERROR_RATE
+        .with_label_values(&[bucket])
+        .set(metrics.error_rate);
+    LATENCY_MEAN
+        .with_label_values(&[bucket])
+        .set(metrics.latency_mean.as_secs_f64());
+    LATENCY_P99
+        .with_label_values(&[bucket])
+        .set(metrics.latency_p99.as_secs_f64());
+    FIRST_BYTE_MEAN
+        .with_label_values(&[bucket])
+        .set(metrics.first_byte_mean.as_secs_f64());
+    FIRST_BYTE_P99
+        .with_label_values(&[bucket])
+        .set(metrics.first_byte_p99.as_secs_f64());
+    DEPRIORITIZED
+        .with_label_values(&[bucket])
+        .set(i64::from(metrics.deprioritized));
+    CONSECUTIVE_FAILURES
+        .with_label_values(&[bucket])
+        .set(i64::from(metrics.consecutive_failures));
+    set_bucket_body_stats(bucket, metrics);
+}
+
+fn set_bucket_body_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     static SMALL_BODY_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_small_body_mean_seconds",
@@ -76,33 +137,6 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         .unwrap()
     });
 
-    static DEPRIORITIZED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-        register_int_gauge_vec!(
-            "cachey_bucket_deprioritized",
-            "Whether the bucket is deprioritized while remaining eligible for fallback",
-            &["bucket"]
-        )
-        .unwrap()
-    });
-
-    static CONSECUTIVE_FAILURES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-        register_int_gauge_vec!(
-            "cachey_bucket_consecutive_failures",
-            "Number of consecutive failures per bucket",
-            &["bucket"]
-        )
-        .unwrap()
-    });
-
-    ERROR_RATE
-        .with_label_values(&[bucket])
-        .set(metrics.error_rate);
-    FIRST_BYTE_MEAN
-        .with_label_values(&[bucket])
-        .set(metrics.first_byte_mean.as_secs_f64());
-    FIRST_BYTE_P99
-        .with_label_values(&[bucket])
-        .set(metrics.first_byte_p99.as_secs_f64());
     SMALL_BODY_MEAN
         .with_label_values(&[bucket])
         .set(metrics.small_body_mean.as_secs_f64());
@@ -115,12 +149,6 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     THROUGHPUT_P1
         .with_label_values(&[bucket])
         .set(metrics.throughput_p1);
-    DEPRIORITIZED
-        .with_label_values(&[bucket])
-        .set(i64::from(metrics.deprioritized));
-    CONSECUTIVE_FAILURES
-        .with_label_values(&[bucket])
-        .set(i64::from(metrics.consecutive_failures));
 }
 
 pub fn fetch_request_count(kind: &ObjectKind, method: &axum::http::Method, typ: &str) {

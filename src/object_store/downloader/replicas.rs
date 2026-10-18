@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{ops::Range, time::Duration};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::{
@@ -7,8 +7,8 @@ use tokio::{
 };
 
 use super::{
-    BucketOperation, DownloadError, DownloadOutput, Downloader, ObjectPiece, RequestConfig,
-    ResponseHeaders, body_hedge_at,
+    BucketOperation, DownloadError, DownloadOutput, Downloader, HedgeTimer, ObjectPiece,
+    RequestConfig, RequestTimeline,
 };
 use crate::{
     object_store::{
@@ -126,9 +126,11 @@ impl ReplicaRequest<'_> {
         index: usize,
         probe: Option<ProbePermit>,
         permits: Option<AttemptPermits>,
-        headers: Option<Arc<ResponseHeaders>>,
+        primary: Option<&RequestTimeline>,
     ) -> Completion {
         let bucket = &self.buckets[index];
+        let own_timeline = RequestTimeline::default();
+        let timeline = primary.unwrap_or(&own_timeline);
         let (hedge, admission) = match permits {
             Some(permits) => (permits.hedge, Some(permits.admission)),
             None => (None, None),
@@ -146,24 +148,35 @@ impl ReplicaRequest<'_> {
             unknown_latency: self.unknown_latency(),
             probe,
         }
-        .execute(self.range.end - self.range.start, admission, |_| async {
-            let _active = {
-                let mut progress = self.progress.lock();
-                progress.hedged |= progress.active > 0;
-                progress.active += 1;
-                ActiveCopy(&self.progress)
-            };
-            self.downloader
-                .fetch_piece(bucket, self.object, self.range, config, headers)
-                .await
-        })
+        .execute(
+            self.range.end - self.range.start,
+            admission,
+            timeline,
+            async |_, observation| {
+                let _active = {
+                    let mut progress = self.progress.lock();
+                    progress.hedged |= progress.active > 0;
+                    progress.active += 1;
+                    ActiveCopy(&self.progress)
+                };
+                self.downloader
+                    .fetch_piece(
+                        bucket,
+                        self.object,
+                        self.range,
+                        config,
+                        observation,
+                        Some(timeline),
+                    )
+                    .await
+            },
+        )
         .await;
         (index, result)
     }
 }
 
 impl Downloader {
-    #[allow(clippy::too_many_lines)]
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -183,7 +196,7 @@ impl Downloader {
             progress: parking_lot::Mutex::default(),
         };
         let bytes = range.end - range.start;
-        let routing = self.bucketed_stats.snapshot(buckets, bytes);
+        let routing = self.bucketed_stats.snapshot(buckets);
         let PrimaryAttempt {
             index: primary,
             probe,
@@ -197,27 +210,19 @@ impl Downloader {
         let mut tried = vec![false; buckets.len()];
         tried[primary] = true;
         let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
-        let primary_model = routing.model(primary);
-        let threshold = primary_model.first_byte_tail().unwrap_or_default();
-        let mut hedge_at =
-            (self.limits.hedge_budget_percent > 0 && !threshold.is_zero() && probe.is_none())
-                .then(|| start + threshold.min(self.limits.page_timeout));
-        let primary_headers = Arc::new(ResponseHeaders::default());
-        let mut awaiting_headers = hedge_at.is_some();
+        let primary_timeline = RequestTimeline::default();
+        let mut hedge = HedgeTimer::new(routing.model(primary), &primary_timeline, deadline);
+        if self.limits.hedge_budget_percent == 0 || probe.is_some() {
+            hedge.disarm();
+        }
         let mut active = FuturesUnordered::new();
-        active.push(request.attempt(
-            primary,
-            probe,
-            primary_permits,
-            Some(primary_headers.clone()),
-        ));
+        active.push(request.attempt(primary, probe, primary_permits, Some(&primary_timeline)));
         let mut fallback_errors = FallbackErrors::default();
         let mut retry_budget_exhausted = false;
         while !active.is_empty() {
             let next_rescue = rescues
                 .front()
                 .map_or(deadline, |(after, _)| start + *after);
-            let next_hedge = hedge_at.unwrap_or(deadline);
             let (early, scheduled) = select! {
                 biased;
                 Some((index, result)) = active.next() => {
@@ -226,29 +231,21 @@ impl Downloader {
                         Err(error) => {
                             if !error.should_attempt_fallback_bucket() { return Err(error); }
                             fallback_errors.record(error);
-                            hedge_at = None;
+                            hedge.disarm();
                         }
                     }
                     (false, None)
                 },
-                body_bytes = primary_headers.arrived(), if awaiting_headers && hedge_at.is_some() => {
-                    awaiting_headers = false;
-                    hedge_at = body_hedge_at(&primary_model, body_bytes);
-                    continue;
-                },
                 () = sleep_until(next_rescue), if !rescues.is_empty() => {
                     (false, rescues.pop_front().map(|(_, index)| index))
                 },
-                () = sleep_until(next_hedge), if hedge_at.is_some() => {
-                    hedge_at = None;
-                    (true, None)
-                },
+                () = hedge.due() => (true, None),
             };
             if active.len() >= MAX_CONCURRENT_COPIES || scheduled.is_some_and(|index| tried[index])
             {
                 continue;
             }
-            let routing = self.bucketed_stats.snapshot(buckets, bytes);
+            let routing = self.bucketed_stats.snapshot(buckets);
             let overloaded = routing.all_overloaded();
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() || (early && overloaded) {
@@ -265,6 +262,7 @@ impl Downloader {
                 let Some(permits) = self.hedge_permits(&buckets[index], bytes) else {
                     continue;
                 };
+                hedge.disarm();
                 Some(permits)
             } else {
                 backup_admission.take().map(|admission| AttemptPermits {
