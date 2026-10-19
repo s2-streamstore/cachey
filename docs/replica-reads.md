@@ -47,15 +47,15 @@ result wins and cancels the others.
 
 Early hedges are timed in two phases and use one SDK attempt, against another bucket
 when available or the same bucket otherwise. Before response headers arrive, a hedge
-starts once the primary request has waited longer than the p98 time to first byte,
+starts once the primary request has waited longer than the p99 time to first byte,
 excluding admission wait. Once headers arrive, the hedge is rearmed for the announced
-body length: it starts when the body has taken longer than both its p98 body time and
-the p98 time to first byte. Hedging below the p99 used for timeouts and rescue keeps
-normal variance well within the hedge budget. Copies a hedge supersedes are not
-measured, so stalls and slow transfers keep being hedged until they outgrow the budget,
-instead of pulling the hedge delay up to their own duration. A body in a size class
-the bucket has not yet served is not hedged early. Each phase is one opportunity, so a
-hedge that cannot start before headers may still start during the body. If both copies
+body length: it starts when the body has taken longer than both its p99 body time and
+the p99 time to first byte. These are the same tails that classify timeouts. Copies a
+hedge supersedes are not measured, so stalls and slow transfers keep being hedged until
+they outgrow the budget, instead of pulling the hedge delay up to their own duration. A
+body in a size class the bucket has not yet served is not hedged early. Each phase is
+one opportunity, so a hedge that cannot start before headers may still start during
+the body. If both copies
 of a single-bucket hedge fail, an error that waiting would not change, such as a
 missing object, is reported over a transient failure, and a transient failure over a
 timeout; between equals, the primary's error is reported. By default, the shared

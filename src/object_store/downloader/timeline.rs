@@ -99,9 +99,9 @@ enum Phase {
     Body,
 }
 
-/// Times a page's early hedge against its primary request in two phases: the p98 time to first
+/// Times a page's early hedge against its primary request in two phases: the p99 time to first
 /// byte after the request starts, then, once headers announce the body length, when the body has
-/// taken longer than both its p98 time and the p98 time to first byte. Each phase is due at most
+/// taken longer than both its p99 time and the p99 time to first byte. Each phase is due at most
 /// once, so a hedge that cannot start before headers may still start during the body. A body in a
 /// size class the bucket has not served is not hedged early.
 pub(super) struct HedgeTimer<'a> {
@@ -123,8 +123,8 @@ impl<'a> HedgeTimer<'a> {
             primary,
             deadline,
             next: model
-                .first_byte_hedge()
-                .filter(|hedge| enabled && !hedge.is_zero())
+                .first_byte_tail()
+                .filter(|tail| enabled && !tail.is_zero())
                 .map(|_| Phase::FirstByte),
         }
     }
@@ -135,15 +135,15 @@ impl<'a> HedgeTimer<'a> {
 
     fn due_at(&self) -> Option<(Phase, Instant)> {
         let next = self.next?;
-        let first_byte_hedge = self.model.first_byte_hedge()?;
+        let first_byte_tail = self.model.first_byte_tail()?;
         let (phase, at) = match (next, self.primary.headers.get()) {
             (_, Some(headers)) => {
-                let body_hedge = self.model.body_hedge(headers.body_bytes)?;
+                let body_tail = self.model.body_tail(headers.body_bytes)?;
                 (
                     Phase::Body,
                     headers
                         .at
-                        .checked_add(body_hedge.max(first_byte_hedge).saturating_add(LATE_BY))?,
+                        .checked_add(body_tail.max(first_byte_tail).saturating_add(LATE_BY))?,
                 )
             }
             (Phase::FirstByte, None) => (
@@ -151,7 +151,7 @@ impl<'a> HedgeTimer<'a> {
                 self.primary
                     .started
                     .get()?
-                    .checked_add(first_byte_hedge.saturating_add(LATE_BY))?,
+                    .checked_add(first_byte_tail.saturating_add(LATE_BY))?,
             ),
             (Phase::Body, None) => return None,
         };

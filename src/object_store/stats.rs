@@ -24,11 +24,6 @@ pub(super) const MIB: u64 = 1024 * 1024;
 /// Smaller bodies take a few round trips regardless of size, so their duration is tracked directly
 /// rather than as throughput.
 const MIN_THROUGHPUT_SAMPLE_BYTES: u64 = MIB;
-/// Hedges start at a lower quantile than the tail used for timeouts and rescue, so normal variance
-/// stays well within the default hedge budget. Copies a hedge supersedes are not recorded, so
-/// stalls keep being hedged at this delay rather than pulling it up to their own duration, until
-/// they outgrow the budget and complete unhedged.
-const HEDGE_QUANTILE: f64 = 0.98;
 
 #[derive(Debug, Clone)]
 pub struct BucketMetrics {
@@ -56,7 +51,6 @@ pub struct BucketMetrics {
 #[derive(Debug, Clone, Copy, Default)]
 struct Summary {
     mean: Duration,
-    hedge: Duration,
     slow: Duration,
 }
 
@@ -124,22 +118,20 @@ impl LatencyModel {
         self.latency.map(|latency| latency.slow)
     }
 
-    fn first_byte_tail(&self) -> Option<Duration> {
+    pub fn first_byte_tail(&self) -> Option<Duration> {
         self.first_byte.map(|first_byte| first_byte.slow)
-    }
-
-    pub fn first_byte_hedge(&self) -> Option<Duration> {
-        self.first_byte.map(|first_byte| first_byte.hedge)
     }
 
     /// Slow body time after headers announce `bytes`, or `None` before the bucket has served a body
     /// in the same size class.
-    fn body_tail(&self, bytes: u64) -> Option<Duration> {
-        self.body_time(bytes, |summary| summary.slow)
-    }
-
-    pub fn body_hedge(&self, bytes: u64) -> Option<Duration> {
-        self.body_time(bytes, |summary| summary.hedge)
+    pub fn body_tail(&self, bytes: u64) -> Option<Duration> {
+        let slow = self.body_summary(bytes)?.slow;
+        Some(if is_small_body(bytes) {
+            slow
+        } else {
+            Duration::try_from_secs_f64(slow.as_secs_f64() * bytes as f64 / MIB as f64)
+                .unwrap_or(Duration::MAX)
+        })
     }
 
     fn body_summary(&self, bytes: u64) -> Option<Summary> {
@@ -148,16 +140,6 @@ impl LatencyModel {
         } else {
             self.body_pace
         }
-    }
-
-    fn body_time(&self, bytes: u64, quantile: impl Fn(Summary) -> Duration) -> Option<Duration> {
-        let measured = quantile(self.body_summary(bytes)?);
-        Some(if is_small_body(bytes) {
-            measured
-        } else {
-            Duration::try_from_secs_f64(measured.as_secs_f64() * bytes as f64 / MIB as f64)
-                .unwrap_or(Duration::MAX)
-        })
     }
 
     /// Slow time to finish the phases a request reached: response headers, then any body whose
@@ -195,15 +177,12 @@ fn histogram(now: Instant) -> ExponentialDecayHistogram {
     builder.build()
 }
 
-/// For each of the ascending `quantiles`, the first sample whose preceding weight reaches it, as
-/// `Snapshot::value` defines it, but independent of the reservoir's random order. Equal values are
-/// treated as equal-weight samples, as they are when recorded in the same second, rather than in
-/// whatever order their weights fall. A tolerance absorbs floating-point sums that land exactly on
-/// a quantile.
-fn quantiles<const N: usize>(snapshot: &Snapshot, quantiles: [f64; N]) -> [i64; N] {
+/// The first sample whose preceding weight reaches `q`, as `Snapshot::value` defines it, but
+/// independent of the reservoir's random order. Equal values are treated as equal-weight samples,
+/// as they are when recorded in the same second, rather than in whatever order their weights fall.
+/// A tolerance absorbs floating-point sums that land exactly on the quantile.
+fn quantile(snapshot: &Snapshot, q: f64) -> i64 {
     const TOLERANCE: f64 = 1e-9;
-    let mut values = [0; N];
-    let mut resolved = 0;
     let mut samples = snapshot.exemplars().map(|(value, &())| value).peekable();
     let mut preceding = 0.0;
     let mut last = 0;
@@ -213,29 +192,20 @@ fn quantiles<const N: usize>(snapshot: &Snapshot, quantiles: [f64; N]) -> [i64; 
             count += 1;
         }
         let last_sample_start = preceding + weight * f64::from(count - 1) / f64::from(count);
-        while resolved < N && last_sample_start >= quantiles[resolved] - TOLERANCE {
-            values[resolved] = value;
-            resolved += 1;
-        }
-        if resolved == N {
-            return values;
+        if last_sample_start >= q - TOLERANCE {
+            return value;
         }
         preceding += weight;
         last = value;
     }
-    values[resolved..].fill(last);
-    values
+    last
 }
 
 fn summarize(histogram: &ExponentialDecayHistogram) -> Option<Summary> {
     let snapshot = histogram.snapshot();
-    (snapshot.count() > 0).then(|| {
-        let [hedge, slow] = quantiles(&snapshot, [HEDGE_QUANTILE, 0.99]);
-        Summary {
-            mean: Duration::from_micros(snapshot.mean().round() as u64),
-            hedge: Duration::from_micros(hedge as u64),
-            slow: Duration::from_micros(slow as u64),
-        }
+    (snapshot.count() > 0).then(|| Summary {
+        mean: Duration::from_micros(snapshot.mean().round() as u64),
+        slow: Duration::from_micros(quantile(&snapshot, 0.99) as u64),
     })
 }
 
@@ -853,7 +823,7 @@ mod tests {
 
     use super::{
         BucketMetrics, BucketedStats, MIB, MIN_THROUGHPUT_SAMPLE_BYTES, Outcome, ProbePermit,
-        RECOVERY_SUCCESSES, Sample, histogram, quantiles,
+        RECOVERY_SUCCESSES, Sample, histogram, quantile,
     };
     use crate::types::{BucketName, BucketNameSet};
 
@@ -1055,28 +1025,11 @@ mod tests {
             samples.update_at(now.into_std(), value);
         }
         let snapshot = samples.snapshot();
-        let ascending = [
+        for q in [
             0.0, 0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 0.99, 1.0,
-        ];
-        for (q, value) in ascending.into_iter().zip(quantiles(&snapshot, ascending)) {
-            assert_eq!(value, snapshot.value(q), "{q}");
+        ] {
+            assert_eq!(quantile(&snapshot, q), snapshot.value(q), "{q}");
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn hedges_start_below_the_tail_used_for_timeouts() {
-        let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        for _ in 0..99 {
-            stats.seed(&bucket, Sample::from_millis(10, 4 * MIB, 40));
-        }
-        stats.seed(&bucket, Sample::from_millis(1000, 4 * MIB, 4000));
-        advance(Duration::from_secs(1)).await;
-        let model = stats.model(&bucket);
-        assert_eq!(model.first_byte_hedge(), Some(Duration::from_millis(10)));
-        assert_eq!(model.first_byte_tail(), Some(Duration::from_secs(1)));
-        assert_eq!(model.body_hedge(4 * MIB), Some(Duration::from_millis(40)));
-        assert_eq!(model.body_tail(4 * MIB), Some(Duration::from_secs(4)));
     }
 
     #[tokio::test(start_paused = true)]
