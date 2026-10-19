@@ -188,7 +188,7 @@ async fn test_fetch_metrics_record_success_for_ranged_get() {
 
     let metrics = scrape_metrics(&client, &ctx.server_url).await;
     let expected_metric = format!(
-        "cachey_fetch_request_total{{kind=\"{metric_kind}\",method=\"GET\",status=\"success\"}} "
+        "cachey_fetch_requests_total{{kind=\"{metric_kind}\",method=\"GET\",status=\"success\"}} "
     );
     assert!(
         metrics

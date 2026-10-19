@@ -15,8 +15,8 @@ use crate::{
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     static ERROR_RATE: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
-            "cachey_bucket_error_rate",
-            "Exponentially decayed error rate of completed bucket fetches",
+            "cachey_bucket_error_ratio",
+            "Exponentially decayed fraction of completed bucket fetches that failed",
             &["bucket"]
         )
         .unwrap()
@@ -78,7 +78,7 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
 pub fn fetch_request_count(kind: &ObjectKind, method: &axum::http::Method, typ: &str) {
     static COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
         register_int_counter_vec!(
-            "cachey_fetch_request_total",
+            "cachey_fetch_requests_total",
             "Fetch requests",
             &["kind", "method", "status"]
         )
@@ -173,7 +173,7 @@ impl PageRequestType {
 pub fn page_request_count(kind: &ObjectKind, typ: PageRequestType) {
     static COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
         register_int_counter_vec!(
-            "cachey_page_request_total",
+            "cachey_page_requests_total",
             "Page requests",
             &["kind", "type"]
         )
@@ -204,7 +204,7 @@ pub fn page_download_latency(kind: &ObjectKind, latency: std::time::Duration) {
 pub fn observe_throughput(direction: &str, windowed_bps: &[(&str, f64)]) {
     static GAUGE: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
-            "cachey_throughput_bytes_per_sec",
+            "cachey_throughput_bytes_per_second",
             "Throughput by direction and time window",
             &["direction", "window"]
         )
@@ -217,11 +217,7 @@ pub fn observe_throughput(direction: &str, windowed_bps: &[(&str, f64)]) {
 
 pub fn set_connection_count(count: usize) {
     static CONNECTION_COUNT: LazyLock<IntGauge> = LazyLock::new(|| {
-        register_int_gauge!(
-            "cachey_connection_count",
-            "Current number of active connections"
-        )
-        .unwrap()
+        register_int_gauge!("cachey_connections", "Current number of active connections").unwrap()
     });
 
     CONNECTION_COUNT.set(count as i64);
