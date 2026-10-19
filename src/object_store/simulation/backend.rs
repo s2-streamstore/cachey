@@ -15,7 +15,7 @@ use tokio::{
     time::{Instant, sleep},
 };
 
-use super::model::{FaultKind, Scenario, draw};
+use super::model::{FaultKind, Scenario, draw, occurs};
 
 pub const WARM_READ: u64 = 1 << 60;
 
@@ -149,15 +149,17 @@ impl Backend {
                 (fault.replicas.contains(&replica)
                     && (fault.start_ms..fault.end_ms).contains(&time_ms)
                     && (!fault.first_sdk_attempt_only || attempt == 1)
-                    && draw(
-                        self.seed,
-                        read,
-                        destination,
-                        operation,
-                        wire_attempt,
-                        index as u64,
-                    ) % 1_000_000
-                        < u64::from(fault.probability_ppm))
+                    && occurs(
+                        draw(
+                            self.seed,
+                            read,
+                            destination,
+                            operation,
+                            wire_attempt,
+                            index as u64,
+                        ),
+                        fault.probability_ppm,
+                    ))
                 .then_some((fault.kind, fault.duration_ms))
             })
     }

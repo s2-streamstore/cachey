@@ -143,12 +143,16 @@ fn set_bucket_body_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     SMALL_BODY_P99
         .with_label_values(&[bucket])
         .set(metrics.small_body_p99.as_secs_f64());
-    THROUGHPUT_MEAN
-        .with_label_values(&[bucket])
-        .set(metrics.throughput_mean);
-    THROUGHPUT_P1
-        .with_label_values(&[bucket])
-        .set(metrics.throughput_p1);
+    if let Some(throughput_mean) = metrics.throughput_mean {
+        THROUGHPUT_MEAN
+            .with_label_values(&[bucket])
+            .set(throughput_mean);
+    }
+    if let Some(throughput_p1) = metrics.throughput_p1 {
+        THROUGHPUT_P1
+            .with_label_values(&[bucket])
+            .set(throughput_p1);
+    }
 }
 
 pub fn fetch_request_count(kind: &ObjectKind, method: &axum::http::Method, typ: &str) {

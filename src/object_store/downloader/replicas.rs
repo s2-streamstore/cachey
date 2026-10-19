@@ -92,27 +92,7 @@ struct ReplicaRequest<'a> {
     hedged: AtomicBool,
 }
 
-impl<'a> ReplicaRequest<'a> {
-    fn new(
-        downloader: &'a Downloader,
-        buckets: &'a BucketNameSet,
-        object: &'a ObjectKey,
-        range: &'a Range<u64>,
-        config: &'a RequestConfig,
-        deadline: Instant,
-    ) -> Self {
-        Self {
-            downloader,
-            buckets,
-            object,
-            range,
-            config,
-            deadline,
-            timelines: buckets.iter().map(|_| RequestTimeline::default()).collect(),
-            hedged: AtomicBool::new(false),
-        }
-    }
-
+impl ReplicaRequest<'_> {
     fn unknown_latency(&self) -> Duration {
         self.downloader.limits.page_timeout / u32::try_from(self.buckets.len()).unwrap_or(u32::MAX)
     }
@@ -186,7 +166,16 @@ impl Downloader {
         start: Instant,
         deadline: Instant,
     ) -> Result<DownloadOutput, DownloadError> {
-        let request = ReplicaRequest::new(self, buckets, object, range, config, deadline);
+        let request = ReplicaRequest {
+            downloader: self,
+            buckets,
+            object,
+            range,
+            config,
+            deadline,
+            timelines: buckets.iter().map(|_| RequestTimeline::default()).collect(),
+            hedged: AtomicBool::new(false),
+        };
         let bytes = range.end - range.start;
         let routing = self.bucketed_stats.snapshot(buckets);
         let PrimaryAttempt {

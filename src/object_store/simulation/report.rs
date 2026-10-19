@@ -16,13 +16,13 @@ pub struct Copy {
     pub end_us: u64,
 }
 
-/// A bucket's exported latency model. Zero means not yet measured.
+/// A bucket's exported latency model. Zero durations mean not yet measured.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct Estimates {
     latency_p99_us: u64,
     first_byte_p99_us: u64,
     small_body_p99_us: u64,
-    throughput_p1_bytes_per_second: u64,
+    throughput_p1_bytes_per_second: Option<u64>,
 }
 
 impl From<&BucketMetrics> for Estimates {
@@ -31,25 +31,24 @@ impl From<&BucketMetrics> for Estimates {
             latency_p99_us: metrics.latency_p99.as_micros() as u64,
             first_byte_p99_us: metrics.first_byte_p99.as_micros() as u64,
             small_body_p99_us: metrics.small_body_p99.as_micros() as u64,
-            throughput_p1_bytes_per_second: metrics.throughput_p1 as u64,
+            throughput_p1_bytes_per_second: metrics
+                .throughput_p1
+                .map(|throughput| throughput as u64),
         }
     }
 }
 
 impl Estimates {
     fn slowest(self, other: Self) -> Self {
-        let throughput = match (
-            self.throughput_p1_bytes_per_second,
-            other.throughput_p1_bytes_per_second,
-        ) {
-            (0, measured) | (measured, 0) => measured,
-            (left, right) => left.min(right),
-        };
         Self {
             latency_p99_us: self.latency_p99_us.max(other.latency_p99_us),
             first_byte_p99_us: self.first_byte_p99_us.max(other.first_byte_p99_us),
             small_body_p99_us: self.small_body_p99_us.max(other.small_body_p99_us),
-            throughput_p1_bytes_per_second: throughput,
+            throughput_p1_bytes_per_second: self
+                .throughput_p1_bytes_per_second
+                .into_iter()
+                .chain(other.throughput_p1_bytes_per_second)
+                .min(),
         }
     }
 }

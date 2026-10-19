@@ -6,6 +6,7 @@ use crate::{
 };
 
 const SHORT_BODY_DOMAIN: u64 = 2000;
+const PPM: u32 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -160,9 +161,7 @@ impl Scenario {
                 && self.body_bytes as u64 <= PAGE_SIZE
                 && self.chunks > 0
                 && self.short_body.as_ref().is_none_or(|short| {
-                    short.bytes > 0
-                        && short.bytes < self.body_bytes
-                        && short.probability_ppm <= 1_000_000
+                    short.bytes > 0 && short.bytes < self.body_bytes && short.probability_ppm <= PPM
                 }),
             "invalid body shape"
         );
@@ -177,7 +176,7 @@ impl Scenario {
         for fault in &self.faults {
             eyre::ensure!(
                 fault.start_ms < fault.end_ms
-                    && fault.probability_ppm <= 1_000_000
+                    && fault.probability_ppm <= PPM
                     && fault
                         .replicas
                         .iter()
@@ -206,8 +205,10 @@ impl Scenario {
     pub fn read_body_bytes(&self, seed: u64, read: u64) -> usize {
         match &self.short_body {
             Some(short)
-                if draw(seed, read, 0, 0, 0, SHORT_BODY_DOMAIN) % 1_000_000
-                    < u64::from(short.probability_ppm) =>
+                if occurs(
+                    draw(seed, read, 0, 0, 0, SHORT_BODY_DOMAIN),
+                    short.probability_ppm,
+                ) =>
             {
                 short.bytes
             }
@@ -252,4 +253,9 @@ pub fn draw(
         ^ mix(u64::from(invocation) + 200)
         ^ mix(u64::from(attempt) + 300)
         ^ mix(domain))
+}
+
+/// Whether a draw falls within a probability given in parts per million.
+pub fn occurs(draw: u64, probability_ppm: u32) -> bool {
+    draw % u64::from(PPM) < u64::from(probability_ppm)
 }

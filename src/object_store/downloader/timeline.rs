@@ -47,7 +47,7 @@ impl RequestTimeline {
     pub fn start(&self) -> InFlight<'_> {
         let now = Instant::now();
         if self.started.set(now).is_ok() {
-            self.changed.notify_one();
+            self.changed.notify_waiters();
         }
         InFlight {
             timeline: self,
@@ -65,7 +65,7 @@ impl RequestTimeline {
             body_bytes,
         };
         if self.headers.set(headers).is_ok() {
-            self.changed.notify_one();
+            self.changed.notify_waiters();
         }
     }
 
@@ -108,8 +108,6 @@ pub(super) struct HedgeTimer<'a> {
     model: LatencyModel,
     primary: &'a RequestTimeline,
     deadline: Instant,
-    /// Positive whenever a phase is due.
-    first_byte_hedge: Duration,
     next: Option<Phase>,
 }
 
@@ -120,15 +118,14 @@ impl<'a> HedgeTimer<'a> {
         deadline: Instant,
         enabled: bool,
     ) -> Self {
-        let first_byte_hedge = model
-            .first_byte_hedge()
-            .filter(|hedge| enabled && !hedge.is_zero());
         Self {
             model,
             primary,
             deadline,
-            first_byte_hedge: first_byte_hedge.unwrap_or_default(),
-            next: first_byte_hedge.map(|_| Phase::FirstByte),
+            next: model
+                .first_byte_hedge()
+                .filter(|hedge| enabled && !hedge.is_zero())
+                .map(|_| Phase::FirstByte),
         }
     }
 
@@ -137,16 +134,16 @@ impl<'a> HedgeTimer<'a> {
     }
 
     fn due_at(&self) -> Option<(Phase, Instant)> {
-        let (phase, at) = match (self.next?, self.primary.headers.get()) {
+        let next = self.next?;
+        let first_byte_hedge = self.model.first_byte_hedge()?;
+        let (phase, at) = match (next, self.primary.headers.get()) {
             (_, Some(headers)) => {
                 let body_hedge = self.model.body_hedge(headers.body_bytes)?;
                 (
                     Phase::Body,
-                    headers.at.checked_add(
-                        body_hedge
-                            .max(self.first_byte_hedge)
-                            .saturating_add(LATE_BY),
-                    )?,
+                    headers
+                        .at
+                        .checked_add(body_hedge.max(first_byte_hedge).saturating_add(LATE_BY))?,
                 )
             }
             (Phase::FirstByte, None) => (
@@ -154,14 +151,16 @@ impl<'a> HedgeTimer<'a> {
                 self.primary
                     .started
                     .get()?
-                    .checked_add(self.first_byte_hedge.saturating_add(LATE_BY))?,
+                    .checked_add(first_byte_hedge.saturating_add(LATE_BY))?,
             ),
             (Phase::Body, None) => return None,
         };
         (at < self.deadline).then_some((phase, at))
     }
 
-    /// Completes when a hedge is due, or never if none can be.
+    /// Completes when a hedge is due, or never if none can be. The primary's timeline stops
+    /// changing once its headers arrive, so from then on only the timer is polled. Timers fire on
+    /// the next tick, so one that fires at or past the deadline ends hedging.
     pub async fn due(&mut self) {
         if self.next.is_none() {
             return std::future::pending().await;
@@ -169,14 +168,22 @@ impl<'a> HedgeTimer<'a> {
         let primary = self.primary;
         loop {
             let changed = primary.changed.notified();
+            let settled = primary.headers.get().is_some();
             let Some((phase, at)) = self.due_at() else {
+                if settled {
+                    return std::future::pending().await;
+                }
                 changed.await;
                 continue;
             };
             select! {
                 biased;
-                () = changed => {}
+                () = changed, if !settled => {}
                 () = sleep_until(at) => {
+                    if Instant::now() >= self.deadline {
+                        self.next = None;
+                        return std::future::pending().await;
+                    }
                     self.next = (phase == Phase::FirstByte).then_some(Phase::Body);
                     return;
                 }
@@ -243,6 +250,15 @@ mod tests {
         sleep(Duration::from_millis(10)).await;
         timeline.receive_headers(4096);
         assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(21)));
+        assert_eq!(due_after(&mut timer).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timer_rounded_past_the_deadline_does_not_hedge() {
+        let timeline = RequestTimeline::default();
+        let deadline = Instant::now() + Duration::from_micros(20_002);
+        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline, true);
+        let _in_flight = timeline.start();
         assert_eq!(due_after(&mut timer).await, None);
     }
 

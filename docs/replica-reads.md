@@ -103,7 +103,7 @@ an authoritative size or replica agreement.
 | `cachey_bucket_latency_{mean,p99}_seconds` | Time from starting a request to its validated body, including SDK retries |
 | `cachey_bucket_first_byte_{mean,p99}_seconds` | Time from starting a request to successful response headers, including SDK retries |
 | `cachey_bucket_small_body_{mean,p99}_seconds` | Time to read a body under 1 MiB after its headers |
-| `cachey_bucket_throughput_{mean,p1}_bytes_per_second` | Body throughput after headers, for bodies of at least 1 MiB, from the mean and p99 time per byte |
+| `cachey_bucket_throughput_{mean,p1}_bytes_per_second` | Body throughput after headers, for bodies of at least 1 MiB, from the mean and p99 time per byte; absent until such a body is measured |
 | `cachey_bucket_error_rate` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |

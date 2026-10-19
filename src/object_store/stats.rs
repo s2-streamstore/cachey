@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -46,10 +46,11 @@ pub struct BucketMetrics {
     /// Time to read a body smaller than `MIN_THROUGHPUT_SAMPLE_BYTES` after its headers.
     pub small_body_mean: Duration,
     pub small_body_p99: Duration,
-    /// Body bytes per second after headers, for larger bodies. Derived from the time per byte, so
-    /// the mean is harmonic and p1 reflects the slowest transfers.
-    pub throughput_mean: f64,
-    pub throughput_p1: f64,
+    /// Body bytes per second after headers, for larger bodies, or `None` before one is measured.
+    /// Derived from the time per byte, so the mean is harmonic and p1 reflects the slowest
+    /// transfers.
+    pub throughput_mean: Option<f64>,
+    pub throughput_p1: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -119,11 +120,11 @@ pub(super) struct LatencyModel {
 
 impl LatencyModel {
     /// Slow complete request latency, or `None` before any measurement.
-    pub fn tail(&self) -> Option<Duration> {
+    fn tail(&self) -> Option<Duration> {
         self.latency.map(|latency| latency.slow)
     }
 
-    pub fn first_byte_tail(&self) -> Option<Duration> {
+    fn first_byte_tail(&self) -> Option<Duration> {
         self.first_byte.map(|first_byte| first_byte.slow)
     }
 
@@ -133,7 +134,7 @@ impl LatencyModel {
 
     /// Slow body time after headers announce `bytes`, or `None` before the bucket has served a body
     /// in the same size class.
-    pub fn body_tail(&self, bytes: u64) -> Option<Duration> {
+    fn body_tail(&self, bytes: u64) -> Option<Duration> {
         self.body_time(bytes, |summary| summary.slow)
     }
 
@@ -454,6 +455,8 @@ pub(super) struct BucketObservation {
     stats: Arc<Mutex<BucketStats>>,
     /// The bucket's latency model when the operation began.
     model: LatencyModel,
+    /// The validated request's measurements, applied when the observation ends.
+    sample: OnceLock<Sample>,
     started: Instant,
     generation: u64,
     probe: Option<ProbePermit>,
@@ -464,9 +467,7 @@ impl BucketObservation {
     /// A probe's measurements replace the history of the phases and body size class they cover, so
     /// a recovering bucket is judged by how it performs now.
     pub fn record(&self, sample: &Sample) {
-        self.stats
-            .lock()
-            .record(Instant::now(), sample, self.probe.is_some());
+        let _ = self.sample.set(*sample);
     }
 
     pub fn model(&self) -> LatencyModel {
@@ -492,6 +493,9 @@ impl Drop for BucketObservation {
             }
         }
         let now = Instant::now();
+        if let Some(sample) = self.sample.get() {
+            stats.record(now, sample, self.probe.is_some());
+        }
         let Some(outcome) = self.outcome else {
             let increase = now
                 .duration_since(self.started)
@@ -693,7 +697,7 @@ impl RoutingSnapshot {
         (winner, None)
     }
 
-    pub fn tail(&self, index: usize) -> Option<Duration> {
+    fn tail(&self, index: usize) -> Option<Duration> {
         self.0[index].model.tail()
     }
 
@@ -732,6 +736,7 @@ impl BucketedStats {
         BucketObservation {
             stats,
             model,
+            sample: OnceLock::new(),
             started,
             generation,
             probe,
@@ -809,9 +814,6 @@ impl BucketedStats {
                 let first_byte = model.first_byte.unwrap_or_default();
                 let small_body = model.small_body.unwrap_or_default();
                 let throughput = |pace: Duration| MIB as f64 / pace.as_secs_f64();
-                let (throughput_mean, throughput_p1) = model.body_pace.map_or((0.0, 0.0), |pace| {
-                    (throughput(pace.mean), throughput(pace.slow))
-                });
                 let metrics = BucketMetrics {
                     error_rate: stats.error_rate(now),
                     deprioritized: stats.deprioritized,
@@ -823,8 +825,8 @@ impl BucketedStats {
                     first_byte_p99: first_byte.slow,
                     small_body_mean: small_body.mean,
                     small_body_p99: small_body.slow,
-                    throughput_mean,
-                    throughput_p1,
+                    throughput_mean: model.body_pace.map(|pace| throughput(pace.mean)),
+                    throughput_p1: model.body_pace.map(|pace| throughput(pace.slow)),
                 };
                 (entry.key().clone(), metrics)
             })
@@ -1041,8 +1043,8 @@ mod tests {
         assert_eq!(metrics.first_byte_p99, Duration::from_millis(30));
         assert_eq!(metrics.small_body_mean, Duration::from_millis(1));
         assert_eq!(metrics.small_body_p99, Duration::from_millis(1));
-        assert!((metrics.throughput_mean - 2.5 * MIB as f64).abs() < 1e-6);
-        assert!((metrics.throughput_p1 - 2.0 * MIB as f64).abs() < 1e-6);
+        assert!((metrics.throughput_mean.unwrap() - 2.5 * MIB as f64).abs() < 1e-6);
+        assert!((metrics.throughput_p1.unwrap() - 2.0 * MIB as f64).abs() < 1e-6);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1090,7 +1092,7 @@ mod tests {
             stats.model(&bucket).body_tail(16 * MIB),
             Some(Duration::from_secs(16))
         );
-        assert!((exported(&stats).throughput_p1 - MIB as f64).abs() < 1e-6);
+        assert!((exported(&stats).throughput_p1.unwrap() - MIB as f64).abs() < 1e-6);
     }
 
     #[tokio::test(start_paused = true)]

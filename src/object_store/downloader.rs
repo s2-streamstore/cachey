@@ -405,8 +405,7 @@ impl Downloader {
                 result = &mut primary => return result.map(|piece| (piece, false)),
                 () = hedge.due() => {},
             }
-            if Instant::now() < deadline
-                && !observation.overloaded()
+            if !observation.overloaded()
                 && let Some(permits) = self.hedge_permits(request.bucket, request.bytes())
             {
                 break permits;
@@ -453,55 +452,49 @@ impl Downloader {
         observation: &BucketObservation,
         timeline: &RequestTimeline,
     ) -> Result<ObjectPiece, DownloadError> {
-        #[cfg(test)]
-        let _simulation_copy = crate::object_store::simulation::record_copy(
-            request.object,
-            request.bucket,
-            request.bytes(),
-        );
         let PieceRequest {
             bucket,
             object,
-            range: byterange,
-            config: req_config,
+            range,
+            config,
         } = request;
-        let request = self
+        #[cfg(test)]
+        let _simulation_copy =
+            crate::object_store::simulation::record_copy(object, bucket, request.bytes());
+        let get_object = self
             .s3
             .get_object()
             .bucket(&**bucket)
             .key(&**object)
-            .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
+            .range(format!("bytes={}-{}", range.start, range.end - 1))
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
 
         let in_flight = timeline.start();
-        let output = if req_config.is_noop() {
-            request.send().await
+        let output = if config.is_noop() {
+            get_object.send().await
         } else {
             let client_config = self.s3.config();
             let mut config_override = client_config.to_builder();
             if let Some(timeout_config) =
-                req_config.merged_timeout_config(client_config.timeout_config())
+                config.merged_timeout_config(client_config.timeout_config())
             {
                 config_override = config_override.timeout_config(timeout_config);
             }
-            if let Some(retry_config) = req_config.merged_retry_config(client_config.retry_config())
-            {
+            if let Some(retry_config) = config.merged_retry_config(client_config.retry_config()) {
                 config_override = config_override.retry_config(retry_config);
             }
-            if let Some(force_path_style) = req_config.force_path_style {
+            if let Some(force_path_style) = config.force_path_style {
                 config_override = config_override.force_path_style(force_path_style);
             }
 
-            request
+            get_object
                 .customize()
                 .config_override(config_override)
                 .send()
                 .await
         }
-        .map_err(|error| {
-            map_get_object_error(bucket, byterange, in_flight.started.elapsed(), error)
-        })?;
-        let piece = self.read_response(byterange, output, timeline).await?;
+        .map_err(|error| map_get_object_error(bucket, range, in_flight.started.elapsed(), error))?;
+        let piece = self.read_response(range, output, timeline).await?;
         if let Some(sample) = timeline.sample() {
             observation.record(&sample);
         }
@@ -1136,7 +1129,7 @@ mod tests {
         assert_eq!(metrics.first_byte_mean, Duration::from_millis(20));
         assert_eq!(metrics.first_byte_p99, Duration::from_millis(30));
         assert_eq!(metrics.small_body_mean, Duration::from_millis(115));
-        assert!(metrics.throughput_mean.abs() < f64::EPSILON);
+        assert!(metrics.throughput_mean.is_none());
     }
 
     #[tokio::test(start_paused = true)]
