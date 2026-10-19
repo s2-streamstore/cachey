@@ -75,20 +75,24 @@ struct PrimaryAttempt {
     backup_admission: Option<DownloadPermit>,
 }
 
-#[derive(Default)]
 struct Progress {
-    active: usize,
+    /// Whether each bucket's copy is admitted and fetching.
+    active: Vec<bool>,
     hedged: bool,
 }
 
-struct ActiveCopy<'a>(&'a parking_lot::Mutex<Progress>);
+struct ActiveCopy<'a> {
+    progress: &'a parking_lot::Mutex<Progress>,
+    index: usize,
+}
 
 impl Drop for ActiveCopy<'_> {
     fn drop(&mut self) {
-        self.0.lock().active -= 1;
+        self.progress.lock().active[self.index] = false;
     }
 }
 
+/// Each bucket is tried at most once, so each has one request timeline.
 struct ReplicaRequest<'a> {
     downloader: &'a Downloader,
     buckets: &'a BucketNameSet,
@@ -96,10 +100,34 @@ struct ReplicaRequest<'a> {
     range: &'a Range<u64>,
     config: &'a RequestConfig,
     deadline: Instant,
+    timelines: Vec<RequestTimeline>,
     progress: parking_lot::Mutex<Progress>,
 }
 
-impl ReplicaRequest<'_> {
+impl<'a> ReplicaRequest<'a> {
+    fn new(
+        downloader: &'a Downloader,
+        buckets: &'a BucketNameSet,
+        object: &'a ObjectKey,
+        range: &'a Range<u64>,
+        config: &'a RequestConfig,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            downloader,
+            buckets,
+            object,
+            range,
+            config,
+            deadline,
+            timelines: buckets.iter().map(|_| RequestTimeline::default()).collect(),
+            progress: parking_lot::Mutex::new(Progress {
+                active: vec![false; buckets.len()],
+                hedged: false,
+            }),
+        }
+    }
+
     fn unknown_latency(&self) -> Duration {
         self.downloader.limits.page_timeout / u32::try_from(self.buckets.len()).unwrap_or(u32::MAX)
     }
@@ -121,16 +149,24 @@ impl ReplicaRequest<'_> {
         }
     }
 
+    /// Copies still fetching when another succeeds record what their unfinished phases showed.
+    fn record_superseded(&self) {
+        let progress = self.progress.lock();
+        for (index, active) in progress.active.iter().enumerate() {
+            if *active {
+                self.downloader
+                    .record_superseded(&self.buckets[index], &self.timelines[index]);
+            }
+        }
+    }
+
     async fn attempt(
         &self,
         index: usize,
         probe: Option<ProbePermit>,
         permits: Option<AttemptPermits>,
-        primary: Option<&RequestTimeline>,
     ) -> Completion {
         let bucket = &self.buckets[index];
-        let own_timeline = RequestTimeline::default();
-        let timeline = primary.unwrap_or(&own_timeline);
         let (hedge, admission) = match permits {
             Some(permits) => (permits.hedge, Some(permits.admission)),
             None => (None, None),
@@ -148,21 +184,23 @@ impl ReplicaRequest<'_> {
         };
         let result = BucketOperation {
             downloader: self.downloader,
-            bucket,
+            request,
             deadline: self.deadline,
             unknown_latency: self.unknown_latency(),
             probe,
         }
         .execute(
-            request.bytes(),
             admission,
-            timeline,
-            async |_, observation, timeline| {
+            &self.timelines[index],
+            async |_, _admission, observation, timeline| {
                 let _active = {
                     let mut progress = self.progress.lock();
-                    progress.hedged |= progress.active > 0;
-                    progress.active += 1;
-                    ActiveCopy(&self.progress)
+                    progress.hedged |= progress.active.contains(&true);
+                    progress.active[index] = true;
+                    ActiveCopy {
+                        progress: &self.progress,
+                        index,
+                    }
                 };
                 self.downloader
                     .fetch_piece(request, observation, timeline)
@@ -184,15 +222,7 @@ impl Downloader {
         start: Instant,
         deadline: Instant,
     ) -> Result<DownloadOutput, DownloadError> {
-        let request = ReplicaRequest {
-            downloader: self,
-            buckets,
-            object,
-            range,
-            config,
-            deadline,
-            progress: parking_lot::Mutex::default(),
-        };
+        let request = ReplicaRequest::new(self, buckets, object, range, config, deadline);
         let bytes = range.end - range.start;
         let routing = self.bucketed_stats.snapshot(buckets);
         let PrimaryAttempt {
@@ -208,13 +238,16 @@ impl Downloader {
         let mut tried = vec![false; buckets.len()];
         tried[primary] = true;
         let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
-        let primary_timeline = RequestTimeline::default();
-        let mut hedge = self.hedge_timer(routing.model(primary), &primary_timeline, deadline);
+        let mut hedge = self.hedge_timer(
+            routing.model(primary),
+            &request.timelines[primary],
+            deadline,
+        );
         if probe.is_some() {
             hedge.disarm();
         }
         let mut active = FuturesUnordered::new();
-        active.push(request.attempt(primary, probe, primary_permits, Some(&primary_timeline)));
+        active.push(request.attempt(primary, probe, primary_permits));
         let mut fallback_errors = FallbackErrors::default();
         let mut retry_budget_exhausted = false;
         while !active.is_empty() {
@@ -225,7 +258,10 @@ impl Downloader {
                 biased;
                 Some((index, result)) = active.next() => {
                     match result {
-                        Ok(piece) => return Ok(request.output(piece, primary, index, start)),
+                        Ok(piece) => {
+                            request.record_superseded();
+                            return Ok(request.output(piece, primary, index, start));
+                        }
                         Err(error) => {
                             if !error.should_attempt_fallback_bucket() { return Err(error); }
                             fallback_errors.record(error);
@@ -269,7 +305,7 @@ impl Downloader {
                 })
             };
             tried[index] = true;
-            active.push(request.attempt(index, None, permits, None));
+            active.push(request.attempt(index, None, permits));
         }
         Err(match fallback_errors.into_error() {
             None | Some(DownloadError::NoSuchKey) if retry_budget_exhausted => {

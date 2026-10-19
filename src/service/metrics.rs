@@ -122,7 +122,7 @@ fn set_bucket_body_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     static THROUGHPUT_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_throughput_mean_bytes_per_second",
-            "Mean response body throughput after headers, for bodies of at least 1 MiB",
+            "Harmonic mean response body throughput after headers, for bodies of at least 1 MiB",
             &["bucket"]
         )
         .unwrap()

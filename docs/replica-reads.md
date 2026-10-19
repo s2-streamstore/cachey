@@ -15,9 +15,11 @@ complete request latency across the sizes it actually served. Hedging and timeou
 classification also split each request into phases. Time to first byte runs from
 starting a request to successful response headers, including SDK retries. Bodies under
 1 MiB are tracked by duration, since they take a few round trips regardless of size;
-larger bodies are tracked by throughput. Only validated requests are measured. A
-successful recovery probe replaces the bucket's latency history, so the bucket is
-judged by the probe's measurements.
+larger bodies are tracked by time per byte, so the slowest transfers set the body
+tail. Only validated requests are measured, apart from the copies a successful copy
+supersedes (see [Metrics](#metrics)). A successful recovery probe replaces the history
+of the phases and body size class it measured, so the bucket is judged by the probe's
+measurements; a size class the probe did not serve keeps its history.
 
 A backend `InvalidRange` (HTTP 416) response also permits fallback: an empty or
 shorter copy in one bucket does not establish the object size in another. If no
@@ -51,11 +53,13 @@ admission wait. Once headers arrive, the hedge is rearmed for the announced body
 length: it starts when the body has taken longer than both its p99 body time and the
 p99 time to first byte. A body in a size class the bucket has not yet served is not
 hedged early. Each phase is one opportunity, so a hedge that cannot start before
-headers may still start during the body. By default, the shared budget permits one
-startup hedge and earns another per 20 successful pages. Setting the budget to zero
-disables early hedges; fallback and deadline rescue remain available. When every
-bucket has recently reported overload, early hedges stop and extra attempts use a
-separate success-funded retry budget.
+headers may still start during the body. If both copies of a single-bucket hedge
+fail, any other error is reported over a timeout, and otherwise the primary's error is
+reported. By default, the shared budget permits one startup hedge and earns another
+per 20 successful pages. Setting the budget to zero disables early hedges; fallback
+and deadline rescue remain available. When every bucket has recently reported
+overload, early hedges stop and extra attempts use a separate success-funded retry
+budget.
 
 ## Limits
 
@@ -96,18 +100,23 @@ an authoritative size or replica agreement.
 | `cachey_bucket_latency_{mean,p99}_seconds` | Time from starting a request to its validated body, including SDK retries |
 | `cachey_bucket_first_byte_{mean,p99}_seconds` | Time from starting a request to successful response headers, including SDK retries |
 | `cachey_bucket_small_body_{mean,p99}_seconds` | Time to read a body under 1 MiB after its headers |
-| `cachey_bucket_throughput_{mean,p1}_bytes_per_second` | Body throughput after headers, for bodies of at least 1 MiB |
+| `cachey_bucket_throughput_{mean,p1}_bytes_per_second` | Body throughput after headers, for bodies of at least 1 MiB, from the mean and p99 time per byte |
 | `cachey_bucket_error_rate` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |
 | `cachey_first_chunk_latency_seconds` | Handler time to first available chunk, including cache lookup and coalescing |
 
-Stalls and canceled reads can raise routing latency estimates without adding
-histogram samples. Bucket latency samples come from each validated backend request,
-including hedges. When a single-bucket hedge wins, the superseded primary records the
-time spent in its unfinished phase as a lower bound, so header and body stalls still
-raise the bucket's estimates. Page latency for a single-bucket hedge win is timed from
-the original primary start. Latency histograms exclude client body transmission.
+In-flight stalls and canceled reads can raise routing latency estimates without
+adding request latency samples. Bucket latency samples come from each validated
+backend request, including hedges. When one copy of a page succeeds, each copy still
+in flight adds to a phase's histogram once it has run past the bucket's tail for that
+phase: its time to first byte, exact if headers arrived and a lower bound otherwise,
+and a lower bound on an unfinished body. Header and body stalls therefore raise the
+phase estimates used for hedging and timeout classification, while copies canceled
+early neither lower them nor contribute only their fast responses. Superseded copies
+do not add request latency samples, which would raise the stall threshold for routing
+during a stall. Page latency for a single-bucket hedge win is timed from the original
+primary start. Latency histograms exclude client body transmission.
 
 `DownloadOutput` reports the initial and winning buckets. `hedged` means copies
 overlapped, including rescue and recovery probes; the page `fallback` metric counts
