@@ -5,7 +5,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use exponential_decay_histogram::ExponentialDecayHistogram;
+use exponential_decay_histogram::{ExponentialDecayHistogram, Snapshot};
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
@@ -176,11 +176,35 @@ fn histogram(now: Instant) -> ExponentialDecayHistogram {
     builder.build()
 }
 
+/// The first sample whose preceding weight reaches `quantile`, as `Snapshot::value` defines it, but
+/// independent of the reservoir's random order. Equal values are treated as equal-weight samples,
+/// as they are when recorded in the same second, rather than in whatever order their weights fall.
+/// A tolerance absorbs floating-point sums that land exactly on the quantile.
+fn quantile(snapshot: &Snapshot, quantile: f64) -> i64 {
+    const TOLERANCE: f64 = 1e-9;
+    let mut samples = snapshot.exemplars().map(|(value, &())| value).peekable();
+    let mut preceding = 0.0;
+    let mut last = 0;
+    for (value, weight) in snapshot.values() {
+        let mut count = 0_u32;
+        while samples.next_if_eq(&value).is_some() {
+            count += 1;
+        }
+        let last_sample_start = preceding + weight * f64::from(count - 1) / f64::from(count);
+        if last_sample_start >= quantile - TOLERANCE {
+            return value;
+        }
+        preceding += weight;
+        last = value;
+    }
+    last
+}
+
 fn summarize(histogram: &ExponentialDecayHistogram) -> Option<Summary> {
     let snapshot = histogram.snapshot();
     (snapshot.count() > 0).then(|| Summary {
         mean: Duration::from_micros(snapshot.mean().round() as u64),
-        slow: Duration::from_micros(snapshot.value(0.99) as u64),
+        slow: Duration::from_micros(quantile(&snapshot, 0.99) as u64),
     })
 }
 
@@ -805,11 +829,11 @@ fn locality_adjusted(latency: Duration, index: usize) -> Duration {
 mod tests {
     use std::time::Duration;
 
-    use tokio::time::advance;
+    use tokio::time::{Instant, advance};
 
     use super::{
         BucketMetrics, BucketedStats, MIB, MIN_THROUGHPUT_SAMPLE_BYTES, Outcome, ProbePermit,
-        RECOVERY_SUCCESSES, Sample,
+        RECOVERY_SUCCESSES, Sample, histogram, quantile,
     };
     use crate::types::{BucketName, BucketNameSet};
 
@@ -1005,6 +1029,21 @@ mod tests {
         assert_eq!(metrics.small_body_p99, Duration::from_millis(1));
         assert!((metrics.throughput_mean - 2.5 * MIB as f64).abs() < 1e-6);
         assert!((metrics.throughput_p1 - 2.0 * MIB as f64).abs() < 1e-6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quantiles_match_the_snapshot_definition_for_samples_recorded_together() {
+        let now = Instant::now();
+        let mut samples = histogram(now);
+        for value in [5, 1, 3, 3, 3, 9, 7, 7, 2, 8] {
+            samples.update_at(now.into_std(), value);
+        }
+        let snapshot = samples.snapshot();
+        for q in [
+            0.0, 0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 0.99, 1.0,
+        ] {
+            assert_eq!(quantile(&snapshot, q), snapshot.value(q), "{q}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

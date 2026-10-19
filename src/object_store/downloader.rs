@@ -420,6 +420,7 @@ impl Downloader {
             .await
         });
         let result = select! {
+            biased;
             result = &mut primary => match result {
                 Ok(piece) => {
                     self.record_superseded(request.bucket, &secondary_timeline);
