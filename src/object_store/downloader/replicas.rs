@@ -144,10 +144,7 @@ impl<'a> ReplicaRequest<'a> {
             Some(permits) => (permits.hedge, Some(permits.admission)),
             None => (None, None),
         };
-        let hedge_config = hedge.as_ref().map(|_| RequestConfig {
-            max_attempts: Some(1),
-            ..self.config.clone()
-        });
+        let hedge_config = hedge.as_ref().map(|_| self.config.single_attempt());
         let _hedge = hedge;
         let request = PieceRequest {
             bucket,
@@ -158,19 +155,19 @@ impl<'a> ReplicaRequest<'a> {
         let result = BucketOperation {
             downloader: self.downloader,
             request,
+            timeline: &self.timelines[index],
             deadline: self.deadline,
             unknown_latency: self.unknown_latency(),
             probe,
         }
         .execute(
             admission,
-            &self.timelines[index],
-            async |_, _admission, observation| {
+            async |request, timeline, _, _admission, observation| {
                 if self.timelines.iter().any(RequestTimeline::in_flight) {
                     self.hedged.store(true, Ordering::Relaxed);
                 }
                 self.downloader
-                    .fetch_piece(request, observation, &self.timelines[index])
+                    .fetch_piece(request, observation, timeline)
                     .await
             },
         )

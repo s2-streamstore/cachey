@@ -88,7 +88,9 @@ impl RequestTimeline {
 }
 
 /// A phase is late only once it has taken strictly longer than its tail, so a response that arrives
-/// exactly at the tail does not start a hedge.
+/// exactly at the tail does not start a hedge. Tokio already rounds timers up to the next
+/// millisecond tick, so this changes when one fires only if its deadline lies on a tick or within a
+/// microsecond before one, as whole-millisecond tails on a paused test clock do.
 const LATE_BY: Duration = Duration::from_micros(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +108,8 @@ pub(super) struct HedgeTimer<'a> {
     model: LatencyModel,
     primary: &'a RequestTimeline,
     deadline: Instant,
+    /// Positive whenever a phase is due.
+    first_byte_hedge: Duration,
     next: Option<Phase>,
 }
 
@@ -116,14 +120,15 @@ impl<'a> HedgeTimer<'a> {
         deadline: Instant,
         enabled: bool,
     ) -> Self {
+        let first_byte_hedge = model
+            .first_byte_hedge()
+            .filter(|hedge| enabled && !hedge.is_zero());
         Self {
             model,
             primary,
             deadline,
-            next: model
-                .first_byte_hedge()
-                .filter(|hedge| enabled && !hedge.is_zero())
-                .map(|_| Phase::FirstByte),
+            first_byte_hedge: first_byte_hedge.unwrap_or_default(),
+            next: first_byte_hedge.map(|_| Phase::FirstByte),
         }
     }
 
@@ -132,15 +137,16 @@ impl<'a> HedgeTimer<'a> {
     }
 
     fn due_at(&self) -> Option<(Phase, Instant)> {
-        let first_byte_hedge = self.model.first_byte_hedge()?;
         let (phase, at) = match (self.next?, self.primary.headers.get()) {
             (_, Some(headers)) => {
                 let body_hedge = self.model.body_hedge(headers.body_bytes)?;
                 (
                     Phase::Body,
-                    headers
-                        .at
-                        .checked_add(body_hedge.max(first_byte_hedge).saturating_add(LATE_BY))?,
+                    headers.at.checked_add(
+                        body_hedge
+                            .max(self.first_byte_hedge)
+                            .saturating_add(LATE_BY),
+                    )?,
                 )
             }
             (Phase::FirstByte, None) => (
@@ -148,7 +154,7 @@ impl<'a> HedgeTimer<'a> {
                 self.primary
                     .started
                     .get()?
-                    .checked_add(first_byte_hedge.saturating_add(LATE_BY))?,
+                    .checked_add(self.first_byte_hedge.saturating_add(LATE_BY))?,
             ),
             (Phase::Body, None) => return None,
         };

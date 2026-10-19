@@ -194,12 +194,15 @@ fn histogram(now: Instant) -> ExponentialDecayHistogram {
     builder.build()
 }
 
-/// The first sample whose preceding weight reaches `quantile`, as `Snapshot::value` defines it, but
-/// independent of the reservoir's random order. Equal values are treated as equal-weight samples,
-/// as they are when recorded in the same second, rather than in whatever order their weights fall.
-/// A tolerance absorbs floating-point sums that land exactly on the quantile.
-fn quantile(snapshot: &Snapshot, quantile: f64) -> i64 {
+/// For each of the ascending `quantiles`, the first sample whose preceding weight reaches it, as
+/// `Snapshot::value` defines it, but independent of the reservoir's random order. Equal values are
+/// treated as equal-weight samples, as they are when recorded in the same second, rather than in
+/// whatever order their weights fall. A tolerance absorbs floating-point sums that land exactly on
+/// a quantile.
+fn quantiles<const N: usize>(snapshot: &Snapshot, quantiles: [f64; N]) -> [i64; N] {
     const TOLERANCE: f64 = 1e-9;
+    let mut values = [0; N];
+    let mut resolved = 0;
     let mut samples = snapshot.exemplars().map(|(value, &())| value).peekable();
     let mut preceding = 0.0;
     let mut last = 0;
@@ -209,43 +212,81 @@ fn quantile(snapshot: &Snapshot, quantile: f64) -> i64 {
             count += 1;
         }
         let last_sample_start = preceding + weight * f64::from(count - 1) / f64::from(count);
-        if last_sample_start >= quantile - TOLERANCE {
-            return value;
+        while resolved < N && last_sample_start >= quantiles[resolved] - TOLERANCE {
+            values[resolved] = value;
+            resolved += 1;
+        }
+        if resolved == N {
+            return values;
         }
         preceding += weight;
         last = value;
     }
-    last
+    values[resolved..].fill(last);
+    values
 }
 
 fn summarize(histogram: &ExponentialDecayHistogram) -> Option<Summary> {
     let snapshot = histogram.snapshot();
-    (snapshot.count() > 0).then(|| Summary {
-        mean: Duration::from_micros(snapshot.mean().round() as u64),
-        hedge: Duration::from_micros(quantile(&snapshot, HEDGE_QUANTILE) as u64),
-        slow: Duration::from_micros(quantile(&snapshot, 0.99) as u64),
+    (snapshot.count() > 0).then(|| {
+        let [hedge, slow] = quantiles(&snapshot, [HEDGE_QUANTILE, 0.99]);
+        Summary {
+            mean: Duration::from_micros(snapshot.mean().round() as u64),
+            hedge: Duration::from_micros(hedge as u64),
+            slow: Duration::from_micros(slow as u64),
+        }
     })
+}
+
+/// One phase's histogram, summarized again only after it changes.
+#[derive(Debug)]
+struct PhaseHistogram {
+    histogram: ExponentialDecayHistogram,
+    summary: Option<Summary>,
+    changed: bool,
+}
+
+impl PhaseHistogram {
+    fn new(now: Instant) -> Self {
+        Self {
+            histogram: histogram(now),
+            summary: None,
+            changed: false,
+        }
+    }
+
+    fn update(&mut self, now: std::time::Instant, value: Duration) {
+        self.histogram.update_at(now, histogram_micros(value));
+        self.changed = true;
+    }
+
+    fn summary(&mut self) -> Option<Summary> {
+        if std::mem::take(&mut self.changed) {
+            self.summary = summarize(&self.histogram);
+        }
+        self.summary
+    }
 }
 
 #[derive(Debug)]
 struct LatencyHistograms {
-    latency: ExponentialDecayHistogram,
-    first_byte: ExponentialDecayHistogram,
-    small_body: ExponentialDecayHistogram,
-    body_pace: ExponentialDecayHistogram,
+    latency: PhaseHistogram,
+    first_byte: PhaseHistogram,
+    small_body: PhaseHistogram,
+    body_pace: PhaseHistogram,
 }
 
 impl LatencyHistograms {
     fn new(now: Instant) -> Self {
         Self {
-            latency: histogram(now),
-            first_byte: histogram(now),
-            small_body: histogram(now),
-            body_pace: histogram(now),
+            latency: PhaseHistogram::new(now),
+            first_byte: PhaseHistogram::new(now),
+            small_body: PhaseHistogram::new(now),
+            body_pace: PhaseHistogram::new(now),
         }
     }
 
-    fn body_histogram(&mut self, bytes: u64) -> &mut ExponentialDecayHistogram {
+    fn body_histogram(&mut self, bytes: u64) -> &mut PhaseHistogram {
         if is_small_body(bytes) {
             &mut self.small_body
         } else {
@@ -255,27 +296,26 @@ impl LatencyHistograms {
 
     /// Starts over the histograms a sample measures, keeping the body size class it did not reach.
     fn reset_measured(&mut self, now: Instant, sample: &Sample) {
-        self.latency = histogram(now);
-        self.first_byte = histogram(now);
-        *self.body_histogram(sample.body.bytes) = histogram(now);
+        self.latency = PhaseHistogram::new(now);
+        self.first_byte = PhaseHistogram::new(now);
+        *self.body_histogram(sample.body.bytes) = PhaseHistogram::new(now);
     }
 
     fn record(&mut self, now: Instant, sample: &Sample) {
         let now = now.into_std();
-        self.latency
-            .update_at(now, histogram_micros(sample.latency()));
-        self.first_byte
-            .update_at(now, histogram_micros(sample.first_byte));
+        self.latency.update(now, sample.latency());
+        self.first_byte.update(now, sample.first_byte);
         self.body_histogram(sample.body.bytes)
-            .update_at(now, histogram_micros(sample.body.measure()));
+            .update(now, sample.body.measure());
     }
 
-    fn model(&self) -> LatencyModel {
+    /// Summarizes only the histograms updated since the last model.
+    fn model(&mut self) -> LatencyModel {
         LatencyModel {
-            latency: summarize(&self.latency),
-            first_byte: summarize(&self.first_byte),
-            small_body: summarize(&self.small_body),
-            body_pace: summarize(&self.body_pace),
+            latency: self.latency.summary(),
+            first_byte: self.first_byte.summary(),
+            small_body: self.small_body.summary(),
+            body_pace: self.body_pace.summary(),
         }
     }
 
@@ -287,8 +327,8 @@ impl LatencyHistograms {
             &self.small_body,
             &self.body_pace,
         ]
-        .map(|histogram| {
-            let snapshot = histogram.snapshot();
+        .map(|phase| {
+            let snapshot = phase.histogram.snapshot();
             (snapshot.count(), snapshot.exemplars().count())
         })
     }
@@ -309,8 +349,6 @@ struct BucketStats {
     routing_latency: Duration,
     best_latency: Option<Duration>,
     histograms: LatencyHistograms,
-    /// Whether the histograms changed since `model` summarized them.
-    histograms_changed: bool,
     model: LatencyModel,
     model_at: Instant,
 }
@@ -332,7 +370,6 @@ impl Default for BucketStats {
             routing_latency: Duration::ZERO,
             best_latency: None,
             histograms: LatencyHistograms::new(now),
-            histograms_changed: false,
             model: LatencyModel::default(),
             model_at: now - LATENCY_SNAPSHOT_INTERVAL,
         }
@@ -351,10 +388,7 @@ impl BucketStats {
 
     fn model(&mut self, now: Instant) -> LatencyModel {
         if now.duration_since(self.model_at) >= LATENCY_SNAPSHOT_INTERVAL {
-            if self.histograms_changed {
-                self.model = self.histograms.model();
-                self.histograms_changed = false;
-            }
+            self.model = self.histograms.model();
             self.model_at = now;
         }
         self.model
@@ -369,7 +403,6 @@ impl BucketStats {
             self.histograms.reset_measured(now, sample);
         }
         self.histograms.record(now, sample);
-        self.histograms_changed = true;
         let latency = sample.latency();
         self.routing_latency = if replace_history || self.best_latency.is_none() {
             latency
@@ -818,7 +851,7 @@ mod tests {
 
     use super::{
         BucketMetrics, BucketedStats, MIB, MIN_THROUGHPUT_SAMPLE_BYTES, Outcome, ProbePermit,
-        RECOVERY_SUCCESSES, Sample, histogram, quantile,
+        RECOVERY_SUCCESSES, Sample, histogram, quantiles,
     };
     use crate::types::{BucketName, BucketNameSet};
 
@@ -1020,10 +1053,11 @@ mod tests {
             samples.update_at(now.into_std(), value);
         }
         let snapshot = samples.snapshot();
-        for q in [
+        let ascending = [
             0.0, 0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 0.99, 1.0,
-        ] {
-            assert_eq!(quantile(&snapshot, q), snapshot.value(q), "{q}");
+        ];
+        for (q, value) in ascending.into_iter().zip(quantiles(&snapshot, ascending)) {
+            assert_eq!(value, snapshot.value(q), "{q}");
         }
     }
 

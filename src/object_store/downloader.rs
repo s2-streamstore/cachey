@@ -210,6 +210,7 @@ impl PieceRequest<'_> {
 struct BucketOperation<'a> {
     downloader: &'a Downloader,
     request: PieceRequest<'a>,
+    timeline: &'a RequestTimeline,
     deadline: Instant,
     unknown_latency: Duration,
     probe: Option<ProbePermit>,
@@ -222,8 +223,13 @@ impl BucketOperation<'_> {
     async fn execute<T>(
         self,
         admission: Option<DownloadPermit>,
-        timeline: &RequestTimeline,
-        fetch: impl AsyncFnOnce(Instant, DownloadPermit, &BucketObservation) -> Result<T, DownloadError>,
+        fetch: impl AsyncFnOnce(
+            PieceRequest<'_>,
+            &RequestTimeline,
+            Instant,
+            DownloadPermit,
+            &BucketObservation,
+        ) -> Result<T, DownloadError>,
     ) -> Result<T, DownloadError> {
         let admission = match admission {
             Some(permit) => permit,
@@ -252,7 +258,7 @@ impl BucketOperation<'_> {
             .begin(self.request.bucket, self.probe);
         let result = select! {
             biased;
-            result = fetch(now + budget, admission, &observation) => result,
+            result = fetch(self.request, self.timeline, now + budget, admission, &observation) => result,
             () = sleep_until(now + budget) => Err(DownloadError::Timeout {
                 bucket: self.request.bucket.clone(), timeout: budget,
             }),
@@ -262,7 +268,7 @@ impl BucketOperation<'_> {
             Err(error) => error.health_outcome(
                 observation
                     .model()
-                    .reached_tail(timeline.announced_body_bytes())
+                    .reached_tail(self.timeline.announced_body_bytes())
                     .unwrap_or(
                         self.unknown_latency
                             .min(self.downloader.limits.bucket_timeout)
@@ -346,14 +352,18 @@ impl Downloader {
             let (piece, hedged) = BucketOperation {
                 downloader: self,
                 request,
+                timeline: &timeline,
                 deadline,
                 unknown_latency: self.limits.page_timeout,
                 probe: None,
             }
-            .execute(None, &timeline, async |deadline, admission, observation| {
-                self.fetch_with_hedge(request, admission, observation, &timeline, deadline)
-                    .await
-            })
+            .execute(
+                None,
+                async |request, timeline, deadline, admission, observation| {
+                    self.fetch_with_hedge(request, admission, observation, timeline, deadline)
+                        .await
+                },
+            )
             .await?;
             DownloadOutput {
                 piece,
@@ -402,10 +412,7 @@ impl Downloader {
                 break permits;
             }
         };
-        let hedge_config = RequestConfig {
-            max_attempts: Some(1),
-            ..request.config.clone()
-        };
+        let hedge_config = request.config.single_attempt();
         let secondary_timeline = RequestTimeline::default();
         let mut secondary = Box::pin(async {
             let _permits = permits;
@@ -1672,15 +1679,12 @@ mod tests {
                 range: &(0..4),
                 config: &RequestConfig::default(),
             },
+            timeline: &RequestTimeline::default(),
             deadline: tokio::time::Instant::now(),
             unknown_latency: Duration::from_millis(10),
             probe: None,
         }
-        .execute(
-            Some(permit),
-            &RequestTimeline::default(),
-            async |_, _, _| Ok(()),
-        )
+        .execute(Some(permit), async |_, _, _, _, _| Ok(()))
         .await;
         assert!(matches!(result, Err(DownloadError::Timeout { .. })));
         assert_eq!(script.requests.load(Ordering::SeqCst), 0);
