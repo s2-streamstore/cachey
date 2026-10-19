@@ -32,6 +32,8 @@ struct ControlState {
     copies: Vec<Copy>,
     active_copies: usize,
     peak_copies: usize,
+    active_bytes: u64,
+    peak_bytes: u64,
     completed_reads: usize,
 }
 
@@ -57,6 +59,7 @@ pub(super) fn recovery_delay() -> Option<Duration> {
 pub(super) struct CopyGuard {
     controls: Arc<Controls>,
     index: usize,
+    bytes: u64,
 }
 
 impl Drop for CopyGuard {
@@ -65,10 +68,15 @@ impl Drop for CopyGuard {
         let now = state.epoch.elapsed().as_micros() as u64;
         state.copies[self.index].end_us = now;
         state.active_copies -= 1;
+        state.active_bytes -= self.bytes;
     }
 }
 
-pub(super) fn record_copy(object: &ObjectKey, bucket: &BucketName) -> Option<CopyGuard> {
+pub(super) fn record_copy(
+    object: &ObjectKey,
+    bucket: &BucketName,
+    bytes: u64,
+) -> Option<CopyGuard> {
     CONTROLS
         .try_with(|controls| {
             let read = object
@@ -86,6 +94,8 @@ pub(super) fn record_copy(object: &ObjectKey, bucket: &BucketName) -> Option<Cop
             let start_us = state.epoch.elapsed().as_micros() as u64;
             state.active_copies += 1;
             state.peak_copies = state.peak_copies.max(state.active_copies);
+            state.active_bytes += bytes;
+            state.peak_bytes = state.peak_bytes.max(state.active_bytes);
             state.copies.push(Copy {
                 read,
                 replica,
@@ -95,6 +105,7 @@ pub(super) fn record_copy(object: &ObjectKey, bucket: &BucketName) -> Option<Cop
             CopyGuard {
                 controls: controls.clone(),
                 index,
+                bytes,
             }
         })
         .ok()
@@ -113,6 +124,8 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
             copies: vec![],
             active_copies: 0,
             peak_copies: 0,
+            active_bytes: 0,
+            peak_bytes: 0,
             completed_reads: 0,
         }),
     });
@@ -152,11 +165,11 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     .map(|index| BucketName::new(format!("replica-{index}")).unwrap()),
             )
             .unwrap();
-            let range = 0..scenario.request_bytes();
             for (replica, bucket) in buckets.iter().enumerate() {
                 let singleton = BucketNameSet::from(bucket.clone());
                 for warm in 0..scenario.warmup_per_replica {
                     let id = WARM_READ + replica as u64 * 1_000_000 + u64::from(warm);
+                    let range = 0..scenario.read_request_bytes(seed, id);
                     // Calibration needs to measure even a replica that cannot meet the campaign
                     // deadline.
                     let calibration = downloader
@@ -187,18 +200,20 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 state.epoch = epoch;
                 state.copies.clear();
                 state.peak_copies = 0;
+                state.peak_bytes = 0;
             }
             let reads = futures::future::join_all((0..scenario.reads()).map(|id| {
                 let downloader = &downloader;
                 let buckets = &buckets;
                 let scenario = &scenario;
-                let range = &range;
                 async move {
                     let at_ms = id as u64 * scenario.interval_ms;
                     sleep_until(epoch + Duration::from_millis(at_ms)).await;
                     let object = ObjectKey::new(format!("read-{id}")).unwrap();
                     let config = RequestConfig::default();
-                    let operation = downloader.download(buckets, object, range, &config);
+                    let body_bytes = scenario.read_body_bytes(seed, id as u64);
+                    let range = 0..scenario.read_request_bytes(seed, id as u64);
+                    let operation = downloader.download(buckets, object, &range, &config);
                     tokio::pin!(operation);
                     let result = if let Some(cancel_ms) = scenario.cancel_read_after_ms {
                         tokio::select! {
@@ -218,7 +233,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     });
                     let (error, primary, winner, hedged) = match result {
                         Some(Ok(output)) => {
-                            assert_eq!(output.piece.data.len(), scenario.body_bytes);
+                            assert_eq!(output.piece.data.len(), body_bytes);
                             (
                                 None,
                                 Some(output.primary_bucket_idx),
@@ -245,6 +260,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     health.sort_by_key(|health| health.replica);
                     Read {
                         id: id as u64,
+                        body_bytes,
                         completion_order,
                         arrival_us: at_ms * 1000,
                         end_us,
@@ -268,10 +284,10 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     "exact-retention histogram evicted samples"
                 );
             }
-            let (copies, peak_copies) = {
+            let (copies, peak_copies, peak_bytes) = {
                 let state = controls.state.lock();
                 assert_eq!(state.active_copies, 0);
-                (state.copies.clone(), state.peak_copies)
+                (state.copies.clone(), state.peak_copies, state.peak_bytes)
             };
             Report::new(
                 (*scenario).clone(),
@@ -281,6 +297,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 reads,
                 copies,
                 peak_copies,
+                peak_bytes,
                 &backend.state.lock(),
                 client_finished_us,
                 histograms,
@@ -302,6 +319,9 @@ async fn simulation_guarantees() {
         "sdk_retry",
         "guarded_recovery",
         "delayed_cancellation",
+        "single_bucket_header_stalls",
+        "single_bucket_slow_bodies",
+        "mixed_sizes_header_stalls_page_admission",
     ] {
         let mut scenario = model::scenarios()
             .into_iter()

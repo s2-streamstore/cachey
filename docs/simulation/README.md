@@ -44,6 +44,9 @@ Fault timing uses read arrival by default; `clock_at_arrival=false` evaluates ea
 wire attempt instead. Healthy downloads calibrate replicas before measurement;
 a run with zero warmup reads exercises cold starts. `request_bytes` controls admission
 reservations independently of `body_bytes`; page-admission fixtures reserve 16 MiB.
+`short_body` gives a seeded share of reads a shorter response: the last page of an
+object, or an exact-range read when `request_bytes` is unset. A replica's
+`body_ms_per_mib` adds body time in proportion to the response length.
 
 Seeds control faults, latency jitter, and recovery probes. SDK retries use the real
 classifier and quota with deterministic backoff. The default histogram reservoir
@@ -56,11 +59,17 @@ Completion includes **every scheduled arrival**, including admission failures an
 caller cancellations. Reports separate successful latency from all-arrival latency,
 and admitted copies from SDK invocations and wire attempts. Service work measures
 occupied slot time; post-read work is the portion after the originating read finishes.
-Recovery timestamps are sampled when reads complete.
+Recovery timestamps are sampled when reads complete. Fixtures with short bodies also
+report successful latency by response length.
 
 The model omits connection setup, network contention, and interactions among cachey
 instances. Millisecond timing and prescribed service distributions limit conclusions
-about real S3 or Capacitor latency.
+about real S3 or Capacitor latency. Whole-millisecond timing makes responses land
+exactly on a learned tail far more often than real ones do. Each server fixes its
+response schedule when it starts serving, and the reading task delivers headers and
+body chunks on its own timers, so a response landing on the tail reaches the
+downloader before a hedge timer firing on the same tick, and such ties do not spend
+the budget.
 
 Compare revisions with the same harness, fixtures, and controls; retain patches for
 dirty trees. Assess completion first, then latency and extra backend work. See the

@@ -1,12 +1,18 @@
+use bytesize::MIB;
 use serde::{Deserialize, Serialize};
 
-use crate::object_store::DownloadLimits;
+use crate::{object_store::DownloadLimits, service::PAGE_SIZE};
+
+const SHORT_BODY_DOMAIN: u64 = 2000;
+const PPM: u32 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Replica {
     pub headers_ms: u64,
     pub body_ms: u64,
+    /// Body time added per MiB of response, so larger bodies take proportionally longer.
+    pub body_ms_per_mib: u64,
     pub slots: u32,
     pub queue: u32,
 }
@@ -16,10 +22,26 @@ impl Default for Replica {
         Self {
             headers_ms: 1,
             body_ms: 2,
+            body_ms_per_mib: 0,
             slots: 1024,
             queue: 1024,
         }
     }
+}
+
+impl Replica {
+    pub fn body_ms(&self, body_bytes: usize) -> u64 {
+        self.body_ms + self.body_ms_per_mib * body_bytes as u64 / MIB
+    }
+}
+
+/// A share of reads whose response is shorter than `body_bytes`: the last page of an object, or
+/// an exact-range read when the scenario requests no fixed page size.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShortBody {
+    pub bytes: usize,
+    pub probability_ppm: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +94,7 @@ pub struct Scenario {
     pub interval_ms: u64,
     pub warmup_per_replica: u32,
     pub body_bytes: usize,
+    pub short_body: Option<ShortBody>,
     pub request_bytes: Option<u64>,
     pub chunks: u32,
     pub jitter_percent: u32,
@@ -96,6 +119,7 @@ impl Default for Scenario {
             interval_ms: 20,
             warmup_per_replica: 16,
             body_bytes: 1024,
+            short_body: None,
             request_bytes: None,
             chunks: 4,
             jitter_percent: 0,
@@ -131,7 +155,12 @@ impl Scenario {
             "invalid arrival schedule"
         );
         eyre::ensure!(
-            self.body_bytes > 0 && self.body_bytes <= 16 * 1024 * 1024 && self.chunks > 0,
+            self.body_bytes > 0
+                && self.body_bytes as u64 <= PAGE_SIZE
+                && self.chunks > 0
+                && self.short_body.as_ref().is_none_or(|short| {
+                    short.bytes > 0 && short.bytes < self.body_bytes && short.probability_ppm <= PPM
+                }),
             "invalid body shape"
         );
         eyre::ensure!(
@@ -145,7 +174,7 @@ impl Scenario {
         for fault in &self.faults {
             eyre::ensure!(
                 fault.start_ms < fault.end_ms
-                    && fault.probability_ppm <= 1_000_000
+                    && fault.probability_ppm <= PPM
                     && fault
                         .replicas
                         .iter()
@@ -154,8 +183,8 @@ impl Scenario {
             );
         }
         eyre::ensure!(
-            self.request_bytes() >= self.body_bytes as u64
-                && self.request_bytes() <= 16 * 1024 * 1024,
+            self.request_bytes
+                .is_none_or(|bytes| bytes >= self.body_bytes as u64 && bytes <= PAGE_SIZE),
             "requested range must cover the response and fit a cache page"
         );
         self.limits().validate()
@@ -171,8 +200,24 @@ impl Scenario {
         }
     }
 
-    pub fn request_bytes(&self) -> u64 {
-        self.request_bytes.unwrap_or(self.body_bytes as u64)
+    pub fn read_body_bytes(&self, seed: u64, read: u64) -> usize {
+        match &self.short_body {
+            Some(short)
+                if occurs(
+                    draw(seed, read, 0, 0, 0, SHORT_BODY_DOMAIN),
+                    short.probability_ppm,
+                ) =>
+            {
+                short.bytes
+            }
+            _ => self.body_bytes,
+        }
+    }
+
+    /// A fixed page when `request_bytes` is set, otherwise exactly the response.
+    pub fn read_request_bytes(&self, seed: u64, read: u64) -> u64 {
+        self.request_bytes
+            .unwrap_or_else(|| self.read_body_bytes(seed, read) as u64)
     }
 
     pub fn reads(&self) -> usize {
@@ -206,4 +251,9 @@ pub fn draw(
         ^ mix(u64::from(invocation) + 200)
         ^ mix(u64::from(attempt) + 300)
         ^ mix(domain))
+}
+
+/// Whether a draw falls within a probability given in parts per million.
+pub fn occurs(draw: u64, probability_ppm: u32) -> bool {
+    draw % u64::from(PPM) < u64::from(probability_ppm)
 }
