@@ -24,9 +24,10 @@ pub(super) const MIB: u64 = 1024 * 1024;
 /// Smaller bodies take a few round trips regardless of size, so their duration is tracked directly
 /// rather than as throughput.
 const MIN_THROUGHPUT_SAMPLE_BYTES: u64 = MIB;
-/// Hedges start at a lower quantile than the tail used for timeouts and rescue. Stalls and slow
-/// transfers past this quantile keep being hedged instead of pulling the hedge delay up to their
-/// own duration, while normal variance stays well within the default hedge budget.
+/// Hedges start at a lower quantile than the tail used for timeouts and rescue, so normal variance
+/// stays well within the default hedge budget. Copies a hedge supersedes are not recorded, so
+/// stalls keep being hedged at this delay rather than pulling it up to their own duration, until
+/// they outgrow the budget and complete unhedged.
 const HEDGE_QUANTILE: f64 = 0.98;
 
 #[derive(Debug, Clone)]
@@ -85,8 +86,7 @@ impl BodySample {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Sample {
     pub first_byte: Duration,
-    /// Absent for a request superseded before its response headers arrived.
-    pub body: Option<BodySample>,
+    pub body: BodySample,
 }
 
 impl Sample {
@@ -94,16 +94,15 @@ impl Sample {
     pub fn from_millis(first_byte_ms: u64, body_bytes: u64, body_ms: u64) -> Self {
         Self {
             first_byte: Duration::from_millis(first_byte_ms),
-            body: Some(BodySample {
+            body: BodySample {
                 bytes: body_bytes,
                 elapsed: Duration::from_millis(body_ms),
-            }),
+            },
         }
     }
 
     fn latency(&self) -> Duration {
-        self.first_byte
-            .saturating_add(self.body.map_or(Duration::ZERO, |body| body.elapsed))
+        self.first_byte.saturating_add(self.body.elapsed)
     }
 }
 
@@ -171,10 +170,7 @@ impl LatencyModel {
     }
 
     fn covers(&self, sample: &Sample) -> bool {
-        self.latency.is_some()
-            && sample
-                .body
-                .is_none_or(|body| self.body_summary(body.bytes).is_some())
+        self.latency.is_some() && self.body_summary(sample.body.bytes).is_some()
     }
 }
 
@@ -253,18 +249,11 @@ impl LatencyHistograms {
         }
     }
 
-    /// Starts over the histograms a sample measures, keeping a body size class it did not reach.
+    /// Starts over the histograms a sample measures, keeping the body size class it did not reach.
     fn reset_measured(&mut self, now: Instant, sample: &Sample) {
         self.latency = histogram(now);
         self.first_byte = histogram(now);
-        if let Some(body) = sample.body {
-            *self.body_histogram(body.bytes) = histogram(now);
-        }
-    }
-
-    fn record_body(&mut self, now: std::time::Instant, body: BodySample) {
-        self.body_histogram(body.bytes)
-            .update_at(now, histogram_micros(body.measure()));
+        *self.body_histogram(sample.body.bytes) = histogram(now);
     }
 
     fn record(&mut self, now: Instant, sample: &Sample) {
@@ -273,34 +262,8 @@ impl LatencyHistograms {
             .update_at(now, histogram_micros(sample.latency()));
         self.first_byte
             .update_at(now, histogram_micros(sample.first_byte));
-        if let Some(body) = sample.body {
-            self.record_body(now, body);
-        }
-    }
-
-    /// Records a request that another copy superseded. Each phase counts only once the request has
-    /// run past that phase's tail, whether or not the phase finished: the time to first byte is
-    /// exact if headers arrived and a lower bound otherwise, and an unfinished body is a lower
-    /// bound. Copies cancelled early therefore neither lower the estimates nor contribute only
-    /// their fast responses. Request latency is left alone: it sets the stall threshold for
-    /// routing, which accounts for in-flight and cancelled requests itself, so raising it on a
-    /// stall would hide the next one. Returns whether anything was recorded.
-    fn record_superseded(&mut self, now: Instant, model: &LatencyModel, sample: &Sample) -> bool {
-        let now = now.into_std();
-        let exceeds =
-            |tail: Option<Duration>, elapsed: Duration| tail.is_some_and(|tail| elapsed > tail);
-        let first_byte = exceeds(model.first_byte_tail(), sample.latency());
-        if first_byte {
-            self.first_byte
-                .update_at(now, histogram_micros(sample.first_byte));
-        }
-        let body = sample
-            .body
-            .filter(|body| exceeds(model.body_tail(body.bytes), body.elapsed));
-        if let Some(body) = body {
-            self.record_body(now, body);
-        }
-        first_byte || body.is_some()
+        self.body_histogram(sample.body.bytes)
+            .update_at(now, histogram_micros(sample.body.measure()));
     }
 
     fn model(&self) -> LatencyModel {
@@ -412,14 +375,6 @@ impl BucketStats {
         self.best_latency = Some(self.best_latency.map_or(latency, |best| best.min(latency)));
         if replace_history || !self.model.covers(sample) {
             self.model_at = now - LATENCY_SNAPSHOT_INTERVAL;
-        }
-    }
-
-    /// Routing latency is left to completed requests and cancelled operations.
-    fn record_superseded(&mut self, now: Instant, sample: &Sample) {
-        let model = self.model(now);
-        if self.histograms.record_superseded(now, &model, sample) {
-            self.histograms_changed = true;
         }
     }
 
@@ -779,12 +734,6 @@ impl BucketedStats {
         )
     }
 
-    pub(super) fn record_superseded(&self, bucket: &BucketName, sample: &Sample) {
-        self.entry(bucket)
-            .lock()
-            .record_superseded(Instant::now(), sample);
-    }
-
     #[cfg(test)]
     pub(super) fn seed(&self, bucket: &BucketName, sample: Sample) {
         let observation = self.begin(bucket, None);
@@ -1104,33 +1053,6 @@ mod tests {
             Some(Duration::from_secs(16))
         );
         assert!((exported(&stats).throughput_p1 - MIB as f64).abs() < 1e-6);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn superseded_requests_record_lower_bounds_only_beyond_the_tail() {
-        let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        stats.seed(&bucket, Sample::from_millis(20, 4096, 100));
-        stats.record_superseded(
-            &bucket,
-            &Sample {
-                first_byte: Duration::from_millis(10),
-                body: None,
-            },
-        );
-        stats.record_superseded(&bucket, &Sample::from_millis(2, 4096, 3));
-        stats.record_superseded(&bucket, &Sample::from_millis(130, 4096, 5));
-        stats.record_superseded(&bucket, &Sample::from_millis(30, 4096, 150));
-        advance(Duration::from_secs(1)).await;
-        let metrics = exported(&stats);
-        assert_eq!(metrics.latency_p99, Duration::from_millis(120));
-        assert_eq!(metrics.first_byte_mean, Duration::from_millis(60));
-        assert_eq!(metrics.small_body_mean, Duration::from_millis(125));
-        assert_eq!(metrics.small_body_p99, Duration::from_millis(150));
-        assert_eq!(
-            stats.entry(&bucket).lock().routing_latency,
-            Duration::from_millis(120)
-        );
     }
 
     #[tokio::test(start_paused = true)]

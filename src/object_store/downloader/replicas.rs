@@ -133,12 +133,6 @@ impl<'a> ReplicaRequest<'a> {
         }
     }
 
-    fn record_superseded(&self) {
-        for (bucket, timeline) in self.buckets.iter().zip(&self.timelines) {
-            self.downloader.record_superseded(bucket, timeline);
-        }
-    }
-
     async fn attempt(
         &self,
         index: usize,
@@ -229,10 +223,7 @@ impl Downloader {
                 biased;
                 Some((index, result)) = active.next() => {
                     match result {
-                        Ok(piece) => {
-                            request.record_superseded();
-                            return Ok(request.output(piece, primary, index, start));
-                        }
+                        Ok(piece) => return Ok(request.output(piece, primary, index, start)),
                         Err(error) => {
                             if !error.should_attempt_fallback_bucket() { return Err(error); }
                             fallback_errors.record(error);

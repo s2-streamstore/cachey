@@ -73,30 +73,15 @@ impl RequestTimeline {
         self.headers.get().map(|headers| headers.body_bytes)
     }
 
-    /// Measurements of a request still in flight, where the time spent in its current phase is a
-    /// lower bound.
-    pub fn in_flight_sample(&self) -> Option<Sample> {
-        if self.finished.load(Ordering::Relaxed) {
-            return None;
-        }
-        self.sample()
-    }
-
-    /// Measurements so far. For a request that has not finished, the time spent in its current
-    /// phase is a lower bound.
+    /// Measurements of a request whose body has just been read in full.
     pub fn sample(&self) -> Option<Sample> {
         let started = *self.started.get()?;
-        Some(match self.headers.get() {
-            None => Sample {
-                first_byte: started.elapsed(),
-                body: None,
-            },
-            Some(headers) => Sample {
-                first_byte: headers.at.saturating_duration_since(started),
-                body: Some(BodySample {
-                    bytes: headers.body_bytes,
-                    elapsed: headers.at.elapsed(),
-                }),
+        let headers = self.headers.get()?;
+        Some(Sample {
+            first_byte: headers.at.saturating_duration_since(started),
+            body: BodySample {
+                bytes: headers.body_bytes,
+                elapsed: headers.at.elapsed(),
             },
         })
     }
@@ -155,7 +140,7 @@ impl<'a> HedgeTimer<'a> {
                     Phase::Body,
                     headers
                         .at
-                        .checked_add(body_hedge.max(first_byte_hedge) + LATE_BY)?,
+                        .checked_add(body_hedge.max(first_byte_hedge).saturating_add(LATE_BY))?,
                 )
             }
             (Phase::FirstByte, None) => (
@@ -163,7 +148,7 @@ impl<'a> HedgeTimer<'a> {
                 self.primary
                     .started
                     .get()?
-                    .checked_add(first_byte_hedge + LATE_BY)?,
+                    .checked_add(first_byte_hedge.saturating_add(LATE_BY))?,
             ),
             (Phase::Body, None) => return None,
         };
@@ -270,5 +255,19 @@ mod tests {
             timeline.receive_headers(16 * MIB);
             assert_eq!(due_after(&mut timer).await, expected);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_too_long_to_time_is_not_hedged() {
+        let timeline = RequestTimeline::default();
+        let mut timer = HedgeTimer::new(
+            model(20, 4 * MIB, 5_000_000_000),
+            &timeline,
+            deadline(),
+            true,
+        );
+        let _in_flight = timeline.start();
+        timeline.receive_headers(u64::MAX);
+        assert_eq!(due_after(&mut timer).await, None);
     }
 }
