@@ -11,7 +11,7 @@ use tokio::{
 
 use super::{
     BucketOperation, DownloadError, DownloadOutput, Downloader, HedgeTimer, ObjectPiece,
-    OperationError, PieceRequest, RequestTimeline,
+    PieceRequest, RequestTimeline,
 };
 use crate::{
     object_store::{
@@ -67,8 +67,8 @@ impl FallbackErrors {
 }
 
 pub(super) struct AttemptPermits {
-    admission: DownloadPermit,
-    hedge: Option<HedgePermit>,
+    pub admission: DownloadPermit,
+    pub hedge: Option<HedgePermit>,
 }
 
 struct PrimaryAttempt {
@@ -147,15 +147,12 @@ impl ReplicaRequest<'_> {
             unknown_latency: self.unknown_latency(),
             probe,
         }
-        .execute(admission, async |observation, _admission, _| {
+        .execute(admission, async || {
             if self.copies_in_flight.fetch_add(1, Ordering::Relaxed) > 0 {
                 self.hedged.store(true, Ordering::Relaxed);
             }
             let _in_flight = InFlightCopy(&self.copies_in_flight);
-            self.downloader
-                .fetch_piece(request, observation, timeline)
-                .await
-                .map_err(OperationError::from)
+            self.downloader.fetch_piece(request, timeline).await
         })
         .await;
         (index, result)

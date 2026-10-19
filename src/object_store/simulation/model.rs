@@ -1,9 +1,7 @@
+use bytesize::MIB;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    object_store::{DownloadLimits, stats::MIB},
-    service::PAGE_SIZE,
-};
+use crate::{object_store::DownloadLimits, service::PAGE_SIZE};
 
 const SHORT_BODY_DOMAIN: u64 = 2000;
 const PPM: u32 = 1_000_000;
@@ -219,7 +217,7 @@ impl Scenario {
     /// A fixed page when `request_bytes` is set, otherwise exactly the response.
     pub fn read_request_bytes(&self, seed: u64, read: u64) -> u64 {
         self.request_bytes
-            .unwrap_or(self.read_body_bytes(seed, read) as u64)
+            .unwrap_or_else(|| self.read_body_bytes(seed, read) as u64)
     }
 
     pub fn reads(&self) -> usize {

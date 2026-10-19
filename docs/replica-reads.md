@@ -58,13 +58,13 @@ hedge supersedes are not measured, so stalls and slow transfers keep being hedge
 they outgrow the budget, instead of pulling the hedge delay up to their own duration. A
 phase whose tail is zero, or a body in a size class the bucket has not yet served, is
 not hedged early. Each phase is one opportunity, so a hedge that cannot start before
-headers may still start during the body. A copy of a single-bucket hedge that fails
-transiently waits for its peer only until the bucket deadline. If both copies fail, an
-error that waiting would not change, such as a missing object, is reported over a
-transient failure, and a transient failure over a timeout; between equals, the
-primary's error is reported. Bucket health takes the more severe of the two copies'
-outcomes, so throttling or a failure in one copy still counts when the other reports a
-missing object. By default, the shared
+headers may still start during the body. Each copy of a single-bucket hedge is its own
+bucket operation, bounded by the primary's bucket deadline, and records its own health
+outcome, as copies on different buckets do, so throttling or a failure in one copy counts
+even when its peer succeeds. A copy that fails transiently waits for its peer. If both
+copies fail, an error that waiting would not change, such as a missing object, is
+reported over a transient failure, and a transient failure over a timeout; between
+equals, the primary's error is reported. By default, the shared
 budget permits one startup hedge and earns another per 20 successful pages. Setting
 the budget to zero disables early hedges; fallback and deadline rescue remain
 available. When every bucket has recently reported overload, early hedges stop and

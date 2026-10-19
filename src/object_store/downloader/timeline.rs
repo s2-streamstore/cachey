@@ -89,10 +89,7 @@ impl<'a> HedgeTimer<'a> {
             model,
             primary,
             deadline,
-            next: model
-                .first_byte_tail()
-                .filter(|_| enabled)
-                .map(|_| Phase::FirstByte),
+            next: (enabled && model.first_byte_tail().is_some()).then_some(Phase::FirstByte),
         }
     }
 
@@ -163,11 +160,12 @@ impl<'a> HedgeTimer<'a> {
 mod tests {
     use std::time::Duration;
 
+    use bytesize::MIB;
     use tokio::time::{Instant, advance, sleep, timeout};
 
     use super::{HedgeTimer, RequestTimeline};
     use crate::{
-        object_store::stats::{BucketedStats, LatencyModel, MIB, Sample},
+        object_store::stats::{BucketedStats, LatencyModel, Sample},
         types::BucketName,
     };
 

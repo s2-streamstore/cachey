@@ -1,12 +1,13 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::Duration,
 };
 
+use bytesize::MIB;
 use dashmap::DashMap;
 use exponential_decay_histogram::{ExponentialDecayHistogram, Snapshot};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use tokio::time::Instant;
 
 use crate::{
@@ -20,7 +21,6 @@ const LATENCY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const RECOVERY_SUCCESSES: u32 = 20;
 const OVERLOAD_INTERVAL: Duration = Duration::from_secs(1);
-pub(super) const MIB: u64 = 1024 * 1024;
 /// Smaller bodies take a few round trips regardless of size, so their duration is tracked directly
 /// rather than as throughput.
 const MIN_THROUGHPUT_SAMPLE_BYTES: u64 = MIB;
@@ -125,20 +125,13 @@ impl LatencyModel {
     /// Slow body time after headers announce `bytes`, or `None` before the bucket has served a body
     /// in the same size class.
     pub fn body_tail(&self, bytes: u64) -> Option<Duration> {
-        let slow = self.body_summary(bytes)?.slow;
-        Some(if is_small_body(bytes) {
-            slow
-        } else {
-            Duration::try_from_secs_f64(slow.as_secs_f64() * bytes as f64 / MIB as f64)
-                .unwrap_or(Duration::MAX)
-        })
-    }
-
-    fn body_summary(&self, bytes: u64) -> Option<Summary> {
         if is_small_body(bytes) {
-            self.small_body
+            self.small_body.map(|small_body| small_body.slow)
         } else {
-            self.body_pace
+            self.body_pace.map(|pace| {
+                Duration::try_from_secs_f64(pace.slow.as_secs_f64() * bytes as f64 / MIB as f64)
+                    .unwrap_or(Duration::MAX)
+            })
         }
     }
 
@@ -154,7 +147,7 @@ impl LatencyModel {
     }
 
     fn covers(&self, sample: &Sample) -> bool {
-        self.latency.is_some() && self.body_summary(sample.body.bytes).is_some()
+        self.latency.is_some() && self.body_tail(sample.body.bytes).is_some()
     }
 }
 
@@ -407,16 +400,20 @@ struct BucketState {
 }
 
 impl BucketState {
-    /// Summarizes the histograms again once the model is due, while concurrent operations keep the
-    /// previous model. The histograms stay locked until the new model is stored, so an earlier
-    /// summary never replaces a later one.
-    fn refresh_model(&self, now: Instant) {
-        if !self.stats.lock().claim_model_refresh(now) {
-            return;
+    /// Locks the statistics, first summarizing the histograms again once the model is due, while
+    /// concurrent operations keep the previous model. The histograms stay locked until the new
+    /// model is stored, so an earlier summary never replaces a later one.
+    fn lock_stats(&self, now: Instant) -> MutexGuard<'_, BucketStats> {
+        let mut stats = self.stats.lock();
+        if !stats.claim_model_refresh(now) {
+            return stats;
         }
+        drop(stats);
         let mut histograms = self.histograms.lock();
         let model = histograms.model();
-        self.stats.lock().model = model;
+        let mut stats = self.stats.lock();
+        stats.model = model;
+        stats
     }
 }
 
@@ -443,7 +440,7 @@ pub(super) struct BucketObservation {
     /// The bucket's latency model when the operation began.
     model: LatencyModel,
     /// The validated request's measurements, applied when the observation ends.
-    sample: OnceLock<Sample>,
+    sample: Option<Sample>,
     started: Instant,
     generation: u64,
     probe: Option<ProbePermit>,
@@ -453,16 +450,12 @@ pub(super) struct BucketObservation {
 impl BucketObservation {
     /// A probe's measurements replace the history of the phases and body size class they cover, so
     /// a recovering bucket is judged by how it performs now.
-    pub fn record(&self, sample: &Sample) {
-        let _ = self.sample.set(*sample);
+    pub fn record(&mut self, sample: &Sample) {
+        self.sample = Some(*sample);
     }
 
     pub fn model(&self) -> LatencyModel {
         self.model
-    }
-
-    pub fn overloaded(&self) -> bool {
-        self.bucket.stats.lock().overloaded(Instant::now())
     }
 
     pub fn complete(mut self, outcome: Outcome) {
@@ -473,7 +466,7 @@ impl BucketObservation {
 impl Drop for BucketObservation {
     fn drop(&mut self) {
         let now = Instant::now();
-        let sample = self.sample.get();
+        let sample = self.sample.as_ref();
         if let Some(sample) = sample {
             self.bucket
                 .histograms
@@ -719,9 +712,8 @@ impl BucketedStats {
     ) -> BucketObservation {
         let state = self.entry(bucket);
         let started = Instant::now();
-        state.refresh_model(started);
         let (model, generation) = {
-            let mut stats = state.stats.lock();
+            let mut stats = state.lock_stats(started);
             if probe.is_some() {
                 stats.probe_after = started + recovery_delay();
             }
@@ -731,7 +723,7 @@ impl BucketedStats {
         BucketObservation {
             bucket: state,
             model,
-            sample: OnceLock::new(),
+            sample: None,
             started,
             generation,
             probe,
@@ -748,8 +740,7 @@ impl BucketedStats {
                 .enumerate()
                 .map(|(index, bucket)| {
                     let state = self.entry(bucket);
-                    state.refresh_model(now);
-                    let stats = state.stats.lock();
+                    let stats = state.lock_stats(now);
                     if index == 0 {
                         preferred_latency = stats.routing_latency;
                     }
@@ -774,7 +765,7 @@ impl BucketedStats {
 
     #[cfg(test)]
     pub(super) fn seed(&self, bucket: &BucketName, sample: Sample) {
-        let observation = self.begin(bucket, None);
+        let mut observation = self.begin(bucket, None);
         observation.record(&sample);
         observation.complete(Outcome::Success);
     }
@@ -787,9 +778,7 @@ impl BucketedStats {
 
     #[cfg(test)]
     pub(super) fn model(&self, bucket: &BucketName) -> LatencyModel {
-        let state = self.entry(bucket);
-        state.refresh_model(Instant::now());
-        state.stats.lock().model
+        self.entry(bucket).lock_stats(Instant::now()).model
     }
 
     #[cfg(test)]
@@ -806,8 +795,7 @@ impl BucketedStats {
             .by_bucket
             .iter()
             .map(|entry| {
-                entry.value().refresh_model(now);
-                let stats = entry.value().stats.lock();
+                let stats = entry.value().lock_stats(now);
                 let model = stats.model;
                 let latency = model.latency.unwrap_or_default();
                 let first_byte = model.first_byte.unwrap_or_default();
@@ -849,10 +837,11 @@ fn locality_adjusted(latency: Duration, index: usize) -> Duration {
 mod tests {
     use std::time::Duration;
 
+    use bytesize::MIB;
     use tokio::time::{Instant, advance};
 
     use super::{
-        BucketMetrics, BucketedStats, MIB, MIN_THROUGHPUT_SAMPLE_BYTES, Outcome, ProbePermit,
+        BucketMetrics, BucketedStats, MIN_THROUGHPUT_SAMPLE_BYTES, Outcome, ProbePermit,
         RECOVERY_SUCCESSES, Sample, histogram, quantile,
     };
     use crate::types::{BucketName, BucketNameSet};
@@ -951,7 +940,7 @@ mod tests {
                 stats.snapshot(&buckets).primary(Duration::from_secs(1)).0,
                 1
             );
-            let observation = stats.begin(&buckets[0], probe);
+            let mut observation = stats.begin(&buckets[0], probe);
             advance(Duration::from_millis(3)).await;
             observation.record(&Sample::from_millis(3, 4, 0));
             observation.complete(Outcome::Success);
@@ -977,7 +966,7 @@ mod tests {
             advance(Duration::from_secs(37)).await;
             let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
             assert_eq!(index, 0);
-            let observation = stats.begin(&buckets[0], probe);
+            let mut observation = stats.begin(&buckets[0], probe);
             advance(Duration::from_millis(9)).await;
             if probe_succeeds {
                 observation.record(&Sample::from_millis(9, 4, 0));
@@ -1118,7 +1107,7 @@ mod tests {
         let probe = ProbePermit {
             bucket: stats.entry(&bucket),
         };
-        let observation = stats.begin(&bucket, Some(probe));
+        let mut observation = stats.begin(&bucket, Some(probe));
         observation.record(&Sample::from_millis(9, 4096, 1));
         observation.complete(Outcome::Success);
         let model = stats.model(&bucket);
