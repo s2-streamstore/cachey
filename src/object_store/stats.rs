@@ -24,6 +24,10 @@ const MIB: u64 = 1024 * 1024;
 /// Smaller bodies take a few round trips regardless of size, so their duration is tracked directly
 /// rather than as throughput.
 const MIN_THROUGHPUT_SAMPLE_BYTES: u64 = MIB;
+/// Hedges start at a lower quantile than the tail used for timeouts and rescue. Stalls and slow
+/// transfers past this quantile keep being hedged instead of pulling the hedge delay up to their
+/// own duration, while normal variance stays well within the default hedge budget.
+const HEDGE_QUANTILE: f64 = 0.98;
 
 #[derive(Debug, Clone)]
 pub struct BucketMetrics {
@@ -50,6 +54,7 @@ pub struct BucketMetrics {
 #[derive(Debug, Clone, Copy, Default)]
 struct Summary {
     mean: Duration,
+    hedge: Duration,
     slow: Duration,
 }
 
@@ -127,15 +132,29 @@ impl LatencyModel {
         self.first_byte.map(|first_byte| first_byte.slow)
     }
 
+    pub fn first_byte_hedge(&self) -> Option<Duration> {
+        self.first_byte.map(|first_byte| first_byte.hedge)
+    }
+
     /// Slow body time after headers announce `bytes`, or `None` before the bucket has served a body
     /// in the same size class.
     pub fn body_tail(&self, bytes: u64) -> Option<Duration> {
+        self.body_time(bytes, |summary| summary.slow)
+    }
+
+    pub fn body_hedge(&self, bytes: u64) -> Option<Duration> {
+        self.body_time(bytes, |summary| summary.hedge)
+    }
+
+    fn body_time(&self, bytes: u64, quantile: impl Fn(Summary) -> Duration) -> Option<Duration> {
         if is_small_body(bytes) {
-            self.small_body.map(|small_body| small_body.slow)
+            self.small_body.map(quantile)
         } else {
             self.body_pace.map(|pace| {
-                Duration::try_from_secs_f64(pace.slow.as_secs_f64() * bytes as f64 / MIB as f64)
-                    .unwrap_or(Duration::MAX)
+                Duration::try_from_secs_f64(
+                    quantile(pace).as_secs_f64() * bytes as f64 / MIB as f64,
+                )
+                .unwrap_or(Duration::MAX)
             })
         }
     }
@@ -204,6 +223,7 @@ fn summarize(histogram: &ExponentialDecayHistogram) -> Option<Summary> {
     let snapshot = histogram.snapshot();
     (snapshot.count() > 0).then(|| Summary {
         mean: Duration::from_micros(snapshot.mean().round() as u64),
+        hedge: Duration::from_micros(quantile(&snapshot, HEDGE_QUANTILE) as u64),
         slow: Duration::from_micros(quantile(&snapshot, 0.99) as u64),
     })
 }
@@ -1044,6 +1064,22 @@ mod tests {
         ] {
             assert_eq!(quantile(&snapshot, q), snapshot.value(q), "{q}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hedges_start_below_the_tail_used_for_timeouts() {
+        let stats = BucketedStats::default();
+        let bucket = BucketName::new("local").unwrap();
+        for _ in 0..99 {
+            stats.seed(&bucket, Sample::from_millis(10, 4 * MIB, 40));
+        }
+        stats.seed(&bucket, Sample::from_millis(1000, 4 * MIB, 4000));
+        advance(Duration::from_secs(1)).await;
+        let model = stats.model(&bucket);
+        assert_eq!(model.first_byte_hedge(), Some(Duration::from_millis(10)));
+        assert_eq!(model.first_byte_tail(), Some(Duration::from_secs(1)));
+        assert_eq!(model.body_hedge(4 * MIB), Some(Duration::from_millis(40)));
+        assert_eq!(model.body_tail(4 * MIB), Some(Duration::from_secs(4)));
     }
 
     #[tokio::test(start_paused = true)]
