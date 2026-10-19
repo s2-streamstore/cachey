@@ -16,9 +16,12 @@ classification also split each request into phases. Time to first byte runs from
 starting a request to successful response headers, including SDK retries. Bodies under
 1 MiB are tracked by duration, since they take a few round trips regardless of size;
 larger bodies are tracked by time per byte, so the slowest transfers set the body
-tail. Only validated requests are measured. A successful recovery probe replaces the
-history of the phases and body size class it measured, so the bucket is judged by the
-probe's measurements; a size class the probe did not serve keeps its history.
+tail. Each tail is the nearest-rank p99 of samples decayed with a 5-second half-life,
+so a long-decayed sample cannot set it. Only validated requests are measured. A
+successful recovery probe replaces the history of time to first byte and of the body
+size class it measured, so hedges and timeouts judge the bucket by the probe's
+measurements. A size class the probe did not serve keeps its history, as does complete
+request latency, which spans size classes.
 
 A backend `InvalidRange` (HTTP 416) response also permits fallback: an empty or
 shorter copy in one bucket does not establish the object size in another. If no
@@ -28,11 +31,11 @@ Empty or reversed request ranges are rejected before contacting any bucket.
 A single backend failure immediately deprioritizes a bucket, favoring prompt failover
 at the cost of extra cross-zone reads after isolated errors. Missing objects, invalid
 or unsatisfied ranges, cancellation, and admission failures do not affect health.
-Timeouts count against health when the copy had its tail time for the phases it
-reached: response headers, then a body of the announced length. Before a bucket has
-measured those phases, including a body in the announced size class, a timeout counts
-once the copy had half its share of the page deadline, capped at half the bucket
-deadline. The error fraction
+Timeouts count against health when the copy had the sum of the tail times for the
+phases it reached: response headers, then a body of the announced length. A phase the
+bucket has not yet measured, including a body in a size class it has not served, is
+allowed half the copy's share of the page deadline, capped at half the bucket deadline.
+The error fraction
 decays, but restoring normal preference requires 20 successful operations started
 after the latest failure. After 24–36 seconds, a previously competitive bucket—or one
 that failed before its first successful read—can receive an exclusive recovery probe,
@@ -53,7 +56,8 @@ when available or the same bucket otherwise. Before response headers arrive, a h
 starts at the p99 time to first byte after the primary request starts, excluding
 admission wait. Once headers arrive, the hedge is rearmed for the announced
 body length: it starts when the body has taken longer than both its p99 body time and
-the p99 time to first byte. These are the same tails that classify timeouts. Copies a
+the p99 time to first byte. Timeout classification sums the same tails from the request
+start instead, and allows for phases the bucket has not measured. Copies a
 hedge supersedes are not measured, so stalls and slow transfers keep being hedged until
 they outgrow the budget, instead of pulling the hedge delay up to their own duration. A
 phase whose tail is zero, or a body in a size class the bucket has not yet served, is
@@ -106,9 +110,9 @@ an authoritative size or replica agreement.
 
 | Measurement | Meaning |
 |-------------|---------|
-| `cachey_bucket_latency_{mean,p99}_seconds` | Time from starting a request to its validated body, including SDK retries |
-| `cachey_bucket_first_byte_{mean,p99}_seconds` | Time from starting a request to successful response headers, including SDK retries |
-| `cachey_bucket_small_body_{mean,p99}_seconds` | Time to read a body under 1 MiB after its headers |
+| `cachey_bucket_latency_{mean,p99}_seconds` | Time from starting a request to its validated body, including SDK retries; absent until measured |
+| `cachey_bucket_first_byte_{mean,p99}_seconds` | Time from starting a request to successful response headers, including SDK retries; absent until measured |
+| `cachey_bucket_small_body_{mean,p99}_seconds` | Time to read a body under 1 MiB after its headers; absent until measured |
 | `cachey_bucket_throughput_{mean,p1}_bytes_per_second` | Body throughput after headers, for bodies of at least 1 MiB, from the mean and p99 time per byte; absent until such a body is measured, or while bodies arrive too fast to time |
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |

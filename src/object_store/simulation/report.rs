@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::Serialize;
 
@@ -16,21 +16,23 @@ pub struct Copy {
     pub end_us: u64,
 }
 
-/// A bucket's exported latency model. Zero durations mean not yet measured.
+/// A bucket's exported latency model, with each estimate absent until measured.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct Estimates {
-    latency_p99_us: u64,
-    first_byte_p99_us: u64,
-    small_body_p99_us: u64,
+    latency_p99_us: Option<u64>,
+    first_byte_p99_us: Option<u64>,
+    small_body_p99_us: Option<u64>,
     throughput_p1_bytes_per_second: Option<u64>,
 }
 
 impl From<&BucketMetrics> for Estimates {
     fn from(metrics: &BucketMetrics) -> Self {
+        let micros =
+            |duration: Option<Duration>| duration.map(|duration| duration.as_micros() as u64);
         Self {
-            latency_p99_us: metrics.latency_p99.as_micros() as u64,
-            first_byte_p99_us: metrics.first_byte_p99.as_micros() as u64,
-            small_body_p99_us: metrics.small_body_p99.as_micros() as u64,
+            latency_p99_us: micros(metrics.latency_p99),
+            first_byte_p99_us: micros(metrics.first_byte_p99),
+            small_body_p99_us: micros(metrics.small_body_p99),
             throughput_p1_bytes_per_second: metrics
                 .throughput_p1
                 .map(|throughput| throughput as u64),

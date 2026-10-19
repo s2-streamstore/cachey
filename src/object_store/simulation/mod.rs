@@ -423,7 +423,7 @@ async fn simulation_repeatability_and_cancellation() {
 async fn simulation_rescue_preserves_availability_and_work_under_overload() {
     for (name, completed, attempts) in [
         ("finite_capacity", 1806, 3100),
-        ("finite_capacity_sdk_retries", 1807, 3550),
+        ("finite_capacity_sdk_retries", 1799, 3550),
     ] {
         let scenario = model::scenarios()
             .into_iter()

@@ -12,6 +12,10 @@ use crate::{
     types::{BucketName, ObjectKind},
 };
 
+fn seconds(duration: Option<Duration>) -> Option<f64> {
+    duration.map(|duration| duration.as_secs_f64())
+}
+
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     type BucketGauge = (GaugeVec, fn(&BucketMetrics) -> Option<f64>);
 
@@ -30,42 +34,42 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
                     "cachey_bucket_latency_mean_seconds",
                     "Mean time from starting a request to its validated body, including SDK retries",
                 ),
-                |metrics| Some(metrics.latency_mean.as_secs_f64()),
+                |metrics| seconds(metrics.latency_mean),
             ),
             (
                 gauge(
                     "cachey_bucket_latency_p99_seconds",
                     "p99 time from starting a request to its validated body, including SDK retries",
                 ),
-                |metrics| Some(metrics.latency_p99.as_secs_f64()),
+                |metrics| seconds(metrics.latency_p99),
             ),
             (
                 gauge(
                     "cachey_bucket_first_byte_mean_seconds",
                     "Mean time from starting a request to successful response headers, including SDK retries",
                 ),
-                |metrics| Some(metrics.first_byte_mean.as_secs_f64()),
+                |metrics| seconds(metrics.first_byte_mean),
             ),
             (
                 gauge(
                     "cachey_bucket_first_byte_p99_seconds",
                     "p99 time from starting a request to successful response headers, including SDK retries",
                 ),
-                |metrics| Some(metrics.first_byte_p99.as_secs_f64()),
+                |metrics| seconds(metrics.first_byte_p99),
             ),
             (
                 gauge(
                     "cachey_bucket_small_body_mean_seconds",
                     "Mean time to read a response body under 1 MiB after its headers",
                 ),
-                |metrics| Some(metrics.small_body_mean.as_secs_f64()),
+                |metrics| seconds(metrics.small_body_mean),
             ),
             (
                 gauge(
                     "cachey_bucket_small_body_p99_seconds",
                     "p99 time to read a response body under 1 MiB after its headers",
                 ),
-                |metrics| Some(metrics.small_body_p99.as_secs_f64()),
+                |metrics| seconds(metrics.small_body_p99),
             ),
             (
                 gauge(
@@ -103,8 +107,11 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     });
 
     for (gauge, value) in &*GAUGES {
-        if let Some(value) = value(metrics) {
-            gauge.with_label_values(&[bucket]).set(value);
+        match value(metrics) {
+            Some(value) => gauge.with_label_values(&[bucket]).set(value),
+            None => {
+                let _ = gauge.remove_label_values(&[bucket]);
+            }
         }
     }
     DEPRIORITIZED
