@@ -76,7 +76,7 @@ an authoritative size or replica agreement.
 |-------------|---------|
 | `cachey_bucket_latency_mean_seconds` | Mean successful complete-operation duration |
 | `cachey_bucket_latency_hedge_seconds` | Successful-operation p99 |
-| `cachey_bucket_error_rate` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
+| `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |
 | `cachey_first_chunk_latency_seconds` | Handler time to first available chunk, including cache lookup and coalescing |

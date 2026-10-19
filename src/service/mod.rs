@@ -652,7 +652,7 @@ mod tests {
             ("coalesced", 1),
             ("cache_hit", 0),
         ] {
-            let prefix = format!("cachey_page_request_total{{kind=\"{kind}\",type=\"{typ}\"}} ");
+            let prefix = format!("cachey_page_requests_total{{kind=\"{kind}\",type=\"{typ}\"}} ");
             let value = text
                 .lines()
                 .find_map(|line| line.strip_prefix(&prefix))
