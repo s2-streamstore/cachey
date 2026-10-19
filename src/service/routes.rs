@@ -520,7 +520,7 @@ mod tests {
             assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
             let snapshot = metrics::gather();
             assert!(std::str::from_utf8(&snapshot).unwrap().contains(&format!(
-                "cachey_fetch_requests_total{{kind=\"timeout-error\",method=\"GET\",status=\"failed:{phase}:timeout\"}} 1\n"
+                "cachey_fetch_request_total{{kind=\"timeout-error\",method=\"GET\",status=\"failed:{phase}:timeout\"}} 1\n"
             )));
         }
     }
@@ -546,7 +546,7 @@ mod tests {
         }
         let snapshot = metrics::gather();
         assert!(std::str::from_utf8(&snapshot).unwrap().contains(
-            "cachey_fetch_requests_total{kind=\"overload-error\",method=\"GET\",status=\"failed:init:overloaded\"} 3\n"
+            "cachey_fetch_request_total{kind=\"overload-error\",method=\"GET\",status=\"failed:init:overloaded\"} 3\n"
         ));
     }
 
