@@ -390,7 +390,11 @@ impl Downloader {
         req_config: &RequestConfig,
     ) -> Result<ObjectPiece, DownloadError> {
         #[cfg(test)]
-        let _simulation_copy = crate::object_store::simulation::record_copy(object, bucket);
+        let _simulation_copy = crate::object_store::simulation::record_copy(
+            object,
+            bucket,
+            byterange.end - byterange.start,
+        );
         let request = self
             .s3
             .get_object()

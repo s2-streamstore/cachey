@@ -677,5 +677,97 @@
     ],
     "request_bytes": 16777216,
     "hedge_percent": 5
+  },
+  {
+    "name": "single_bucket_header_stalls",
+    "body_bytes": 2097152,
+    "short_body": {
+      "bytes": 65536,
+      "probability_ppm": 100000
+    },
+    "jitter_percent": 10,
+    "hedge_percent": 5,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 2,
+        "body_ms_per_mib": 10
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0
+        ],
+        "kind": "header_stall",
+        "probability_ppm": 20000
+      }
+    ]
+  },
+  {
+    "name": "single_bucket_slow_bodies",
+    "body_bytes": 2097152,
+    "short_body": {
+      "bytes": 65536,
+      "probability_ppm": 100000
+    },
+    "jitter_percent": 10,
+    "hedge_percent": 5,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 2,
+        "body_ms_per_mib": 10
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0
+        ],
+        "kind": "slow",
+        "probability_ppm": 20000,
+        "duration_ms": 1000
+      }
+    ]
+  },
+  {
+    "name": "mixed_sizes_header_stalls_page_admission",
+    "body_bytes": 2097152,
+    "short_body": {
+      "bytes": 65536,
+      "probability_ppm": 100000
+    },
+    "jitter_percent": 10,
+    "hedge_percent": 5,
+    "request_bytes": 16777216,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 2,
+        "body_ms_per_mib": 10
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 4,
+        "body_ms_per_mib": 10
+      },
+      {
+        "headers_ms": 1,
+        "body_ms": 5,
+        "body_ms_per_mib": 10
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0,
+          1,
+          2
+        ],
+        "kind": "header_stall",
+        "probability_ppm": 20000
+      }
+    ]
   }
 ]

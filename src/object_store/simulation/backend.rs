@@ -11,11 +11,11 @@ use http_body_util::StreamBody;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::{
-    sync::{Semaphore, mpsc, oneshot},
-    time::{Instant, sleep},
+    sync::{Semaphore, oneshot},
+    time::{Instant, sleep, sleep_until},
 };
 
-use super::model::{FaultKind, Scenario, draw};
+use super::model::{FaultKind, Scenario, draw, occurs};
 
 pub const WARM_READ: u64 = 1 << 60;
 
@@ -149,15 +149,17 @@ impl Backend {
                 (fault.replicas.contains(&replica)
                     && (fault.start_ms..fault.end_ms).contains(&time_ms)
                     && (!fault.first_sdk_attempt_only || attempt == 1)
-                    && draw(
-                        self.seed,
-                        read,
-                        destination,
-                        operation,
-                        wire_attempt,
-                        index as u64,
-                    ) % 1_000_000
-                        < u64::from(fault.probability_ppm))
+                    && occurs(
+                        draw(
+                            self.seed,
+                            read,
+                            destination,
+                            operation,
+                            wire_attempt,
+                            index as u64,
+                        ),
+                        fault.probability_ppm,
+                    ))
                 .then_some((fault.kind, fault.duration_ms))
             })
     }
@@ -231,11 +233,36 @@ impl Drop for ServerGuard {
     }
 }
 
-struct Head {
-    status: u16,
-    error: Option<&'static str>,
+/// The response a server commits to when it starts serving a request. The server and the reading
+/// client each follow it on their own timers, so the downloader wakes for every response event in
+/// its own task. Were events sent from the server task instead, the order in which tasks woken on
+/// the same tick run would decide whether a response landing exactly on a learned tail beats the
+/// hedge timer.
+#[derive(Debug, Clone, Copy)]
+struct Response {
+    headers_at: Instant,
+    error: Option<(u16, &'static str)>,
+    body_ms: u64,
+    body_bytes: usize,
+    chunks: u32,
+    fails_mid_body: bool,
 }
-type BodyFrame = Result<Frame<Bytes>, io::Error>;
+
+impl Response {
+    fn chunk_at(&self, chunk: u32) -> Instant {
+        self.headers_at
+            + Duration::from_millis(self.body_ms * u64::from(chunk + 1) / u64::from(self.chunks))
+    }
+
+    fn chunk_bytes(&self, chunk: u32) -> usize {
+        let offset = |chunk: u32| self.body_bytes * chunk as usize / self.chunks as usize;
+        offset(chunk + 1) - offset(chunk)
+    }
+
+    fn fails_at(&self, chunk: u32) -> bool {
+        self.fails_mid_body && chunk == self.chunks / 2
+    }
+}
 
 impl HttpConnector for Backend {
     #[allow(clippy::too_many_lines)]
@@ -306,14 +333,14 @@ impl HttpConnector for Backend {
         }
         drop(state);
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
-        let (head_tx, head_rx) = oneshot::channel();
-        let (body_tx, mut body_rx) = mpsc::channel::<BodyFrame>(1);
+        let (response_tx, response_rx) = oneshot::channel();
         let mut client = ClientGuard {
             state: self.state.clone(),
             index,
             cancel: Some(cancel_tx),
             complete: false,
         };
+        let body_bytes = self.scenario.read_body_bytes(self.seed, read);
         let backend = self.clone();
         tokio::spawn(async move {
             let mut server = ServerGuard {
@@ -325,11 +352,16 @@ impl HttpConnector for Backend {
             };
             let work = async {
                 if rejected {
-                    sleep(Duration::from_millis(1)).await;
-                    let _ = head_tx.send(Head {
-                        status: 503,
-                        error: Some("SlowDown"),
-                    });
+                    let response = Response {
+                        headers_at: Instant::now() + Duration::from_millis(1),
+                        error: Some((503, "SlowDown")),
+                        body_ms: 0,
+                        body_bytes,
+                        chunks: backend.scenario.chunks,
+                        fails_mid_body: false,
+                    };
+                    let _ = response_tx.send(response);
+                    sleep_until(response.headers_at).await;
                     return;
                 }
                 let _permit = backend.slots[replica]
@@ -337,7 +369,7 @@ impl HttpConnector for Backend {
                     .await
                     .expect("server semaphore open");
                 server.start();
-                backend.serve(index, fault, head_tx, body_tx).await;
+                backend.serve(index, fault, body_bytes, response_tx).await;
             };
             tokio::pin!(work);
             tokio::select! {
@@ -354,38 +386,45 @@ impl HttpConnector for Backend {
                 }
             }
         });
-        let body_bytes = self.scenario.body_bytes;
         HttpConnectorFuture::new(async move {
-            let head = head_rx
+            let response = response_rx
                 .await
-                .expect("server sends headers while client is alive");
-            let body = if let Some(code) = head.error {
+                .expect("server responds while client is alive");
+            sleep_until(response.headers_at).await;
+            let (status, body) = if let Some((status, code)) = response.error {
                 client.finish();
-                SdkBody::from(format!("<Error><Code>{code}</Code></Error>"))
+                (
+                    status,
+                    SdkBody::from(format!("<Error><Code>{code}</Code></Error>")),
+                )
             } else {
                 let stream = async_stream::stream! {
-                    while let Some(frame) = body_rx.recv().await {
-                        if let Ok(frame) = &frame && let Some(data) = frame.data_ref() {
-                            client.delivered(data.len());
+                    for chunk in 0..response.chunks {
+                        sleep_until(response.chunk_at(chunk)).await;
+                        if response.fails_at(chunk) {
+                            client.finish();
+                            yield Err(io::Error::other("simulated body failure"));
+                            break;
                         }
-                        if frame.is_err() { client.finish(); }
-                        yield frame;
+                        let bytes = response.chunk_bytes(chunk);
+                        client.delivered(bytes);
+                        yield Ok(Frame::data(Bytes::from(vec![0x5a; bytes])));
                     }
                     client.finish();
                 };
-                SdkBody::from_body_1_x(StreamBody::new(stream))
+                (206, SdkBody::from_body_1_x(StreamBody::new(stream)))
             };
-            let mut response = HttpResponse::new(head.status.try_into().unwrap(), body);
-            if head.error.is_none() {
-                response.headers_mut().insert(
+            let mut http_response = HttpResponse::new(status.try_into().unwrap(), body);
+            if response.error.is_none() {
+                http_response.headers_mut().insert(
                     "content-range",
                     format!("bytes 0-{}/{body_bytes}", body_bytes - 1),
                 );
-                response
+                http_response
                     .headers_mut()
                     .insert("content-length", body_bytes.to_string());
             }
-            Ok(response)
+            Ok(http_response)
         })
     }
 }
@@ -395,8 +434,8 @@ impl Backend {
         &self,
         index: usize,
         fault: Option<(FaultKind, u64)>,
-        head: oneshot::Sender<Head>,
-        body: mpsc::Sender<BodyFrame>,
+        body_bytes: usize,
+        response_tx: oneshot::Sender<Response>,
     ) {
         let transport = self.state.lock().transports[index].clone();
         let replica = &self.scenario.replicas[transport.replica];
@@ -415,7 +454,7 @@ impl Backend {
             (i128::from(millis) * (10_000 + percent * adjustment) / 10_000) as u64
         };
         let mut headers_ms = jitter(replica.headers_ms, 1000);
-        let mut body_ms = jitter(replica.body_ms, 1001);
+        let mut body_ms = jitter(replica.body_ms(body_bytes), 1001);
         if let Some((kind, duration)) = fault {
             match kind {
                 FaultKind::HeaderStall
@@ -425,47 +464,31 @@ impl Backend {
                 FaultKind::BodyStall | FaultKind::BodyError | FaultKind::Slow => body_ms = duration,
             }
         }
-        sleep(Duration::from_millis(headers_ms)).await;
-        let error = match fault.map(|value| value.0) {
-            Some(FaultKind::ServiceError) => Some((500, "InternalError")),
-            Some(FaultKind::Missing) => Some((404, "NoSuchKey")),
-            Some(FaultKind::Overload) => Some((503, "SlowDown")),
-            _ => None,
+        let response = Response {
+            headers_at: Instant::now() + Duration::from_millis(headers_ms),
+            error: match fault.map(|value| value.0) {
+                Some(FaultKind::ServiceError) => Some((500, "InternalError")),
+                Some(FaultKind::Missing) => Some((404, "NoSuchKey")),
+                Some(FaultKind::Overload) => Some((503, "SlowDown")),
+                _ => None,
+            },
+            body_ms,
+            body_bytes,
+            chunks: self.scenario.chunks,
+            fails_mid_body: matches!(fault, Some((FaultKind::BodyError, _))),
         };
-        if let Some((status, code)) = error {
-            let _ = head.send(Head {
-                status,
-                error: Some(code),
-            });
+        let _ = response_tx.send(response);
+        sleep_until(response.headers_at).await;
+        if response.error.is_some() {
             return;
         }
-        let _ = head.send(Head {
-            status: 206,
-            error: None,
-        });
-        let body_start = Instant::now();
-        for chunk in 0..self.scenario.chunks {
-            tokio::time::sleep_until(
-                body_start
-                    + Duration::from_millis(
-                        body_ms * u64::from(chunk + 1) / u64::from(self.scenario.chunks),
-                    ),
-            )
-            .await;
-            if chunk == self.scenario.chunks / 2 && matches!(fault, Some((FaultKind::BodyError, _)))
-            {
-                let _ = body
-                    .send(Err(io::Error::other("simulated body failure")))
-                    .await;
+        for chunk in 0..response.chunks {
+            sleep_until(response.chunk_at(chunk)).await;
+            if response.fails_at(chunk) {
                 return;
             }
-            let start = self.scenario.body_bytes * chunk as usize / self.scenario.chunks as usize;
-            let end =
-                self.scenario.body_bytes * (chunk + 1) as usize / self.scenario.chunks as usize;
-            self.state.lock().transports[index].produced_bytes += (end - start) as u64;
-            let _ = body
-                .send(Ok(Frame::data(Bytes::from(vec![0x5a; end - start]))))
-                .await;
+            self.state.lock().transports[index].produced_bytes +=
+                response.chunk_bytes(chunk) as u64;
         }
     }
 }

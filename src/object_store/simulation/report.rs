@@ -26,6 +26,7 @@ pub struct Health {
 #[derive(Debug, Clone, Serialize)]
 pub struct Read {
     pub id: u64,
+    pub body_bytes: usize,
     pub completion_order: usize,
     pub arrival_us: u64,
     pub end_us: u64,
@@ -88,11 +89,14 @@ pub struct Report {
     fault_window_arrivals: usize,
     fault_window_failures: usize,
     success_latency: Latency,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    success_latency_by_body_bytes: BTreeMap<usize, Latency>,
     all_arrival_latency: Latency,
     copy_operations: usize,
     pub transport_attempts: usize,
     sdk_invocations: usize,
     peak_copy_operations: usize,
+    peak_copy_bytes: u64,
     peak_transport_concurrency: usize,
     peak_server_concurrency: usize,
     peak_server_queue: usize,
@@ -127,6 +131,7 @@ impl Report {
         reads: Vec<Read>,
         copies: Vec<Copy>,
         peak_copies: usize,
+        peak_bytes: u64,
         state: &State,
         last_read_us: u64,
         mut histograms: Vec<(u64, usize)>,
@@ -143,7 +148,7 @@ impl Report {
         }
         let completed = reads.iter().filter(|read| read.error.is_none()).count();
         assert!(peak_copies <= scenario.max_inflight_requests as usize);
-        assert!(peak_copies as u64 * scenario.request_bytes() <= scenario.max_inflight_bytes);
+        assert!(peak_bytes <= scenario.max_inflight_bytes);
         let service_after = |transport: &Transport, time: u64| {
             transport.service_start_us.map_or(0, |start| {
                 transport
@@ -187,6 +192,15 @@ impl Report {
                 .any(|fault| (fault.start_ms..fault.end_ms).contains(&(read.arrival_us / 1000)))
         };
         histograms.sort_unstable();
+        let mut latency_by_body_bytes = BTreeMap::<usize, Vec<u64>>::new();
+        if scenario.short_body.is_some() {
+            for read in reads.iter().filter(|read| read.error.is_none()) {
+                latency_by_body_bytes
+                    .entry(read.body_bytes)
+                    .or_default()
+                    .push(read.end_us - read.arrival_us);
+            }
+        }
         Self {
             seed,
             histogram_mode: if native {
@@ -218,6 +232,10 @@ impl Report {
                     .map(|read| read.end_us - read.arrival_us)
                     .collect(),
             ),
+            success_latency_by_body_bytes: latency_by_body_bytes
+                .into_iter()
+                .map(|(bytes, latencies)| (bytes, Latency::new(latencies)))
+                .collect(),
             all_arrival_latency: Latency::new(
                 reads
                     .iter()
@@ -232,6 +250,7 @@ impl Report {
                 .filter(|transport| transport.attempt == 1)
                 .count(),
             peak_copy_operations: peak_copies,
+            peak_copy_bytes: peak_bytes,
             peak_transport_concurrency: state.peak_client,
             peak_server_concurrency: state.peak_server,
             peak_server_queue: state.peak_queued,
@@ -263,7 +282,11 @@ impl Report {
                 })
                 .max()
                 .unwrap_or(0),
-            requested_bytes: state.transports.len() as u64 * scenario.request_bytes(),
+            requested_bytes: state
+                .transports
+                .iter()
+                .map(|transport| scenario.read_request_bytes(seed, transport.read))
+                .sum(),
             produced_bytes: state
                 .transports
                 .iter()
@@ -274,7 +297,11 @@ impl Report {
                 .iter()
                 .map(|transport| transport.delivered_bytes)
                 .sum(),
-            useful_bytes: completed as u64 * scenario.body_bytes as u64,
+            useful_bytes: reads
+                .iter()
+                .filter(|read| read.error.is_none())
+                .map(|read| read.body_bytes as u64)
+                .sum(),
             overlapping_reads: reads.iter().filter(|read| read.hedged).count(),
             wins_by_replica: wins,
             recoveries,
