@@ -18,7 +18,7 @@ use crate::{
         admission::{DownloadAdmission, DownloadPermit},
         budget::AttemptBudget,
         config::{DownloadLimits, RequestConfig},
-        stats::{BucketObservation, BucketedStats, LatencyModel, Outcome, ProbePermit},
+        stats::{BucketObservation, BucketedStats, Outcome, ProbePermit},
     },
     service::SlidingThroughput,
     types::{BucketName, BucketNameSet, ObjectKey},
@@ -105,13 +105,13 @@ impl DownloadError {
         }
     }
 
-    fn health_outcome(&self, expected: impl Fn() -> Duration) -> Outcome {
+    fn health_outcome(&self, expected: Duration) -> Outcome {
         match self {
             Self::Overloaded(_) => Outcome::Overload,
             Self::InvalidResponse(_) | Self::BodyStreaming(_) | Self::Unknown(_) => {
                 Outcome::Failure
             }
-            Self::Timeout { timeout, .. } if *timeout >= expected() => Outcome::Failure,
+            Self::Timeout { timeout, .. } if *timeout >= expected => Outcome::Failure,
             _ => Outcome::Neutral,
         }
     }
@@ -218,12 +218,7 @@ impl BucketOperation<'_> {
         self,
         admission: Option<DownloadPermit>,
         timeline: &RequestTimeline,
-        fetch: impl AsyncFnOnce(
-            Instant,
-            DownloadPermit,
-            &BucketObservation,
-            &RequestTimeline,
-        ) -> Result<T, DownloadError>,
+        fetch: impl AsyncFnOnce(Instant, DownloadPermit, &BucketObservation) -> Result<T, DownloadError>,
     ) -> Result<T, DownloadError> {
         let admission = match admission {
             Some(permit) => permit,
@@ -252,14 +247,14 @@ impl BucketOperation<'_> {
             .begin(self.request.bucket, self.probe);
         let result = select! {
             biased;
-            result = fetch(now + budget, admission, &observation, timeline) => result,
+            result = fetch(now + budget, admission, &observation) => result,
             () = sleep_until(now + budget) => Err(DownloadError::Timeout {
                 bucket: self.request.bucket.clone(), timeout: budget,
             }),
         };
         let outcome = match &result {
             Ok(_) => Outcome::Success,
-            Err(error) => error.health_outcome(|| {
+            Err(error) => error.health_outcome(
                 observation
                     .model()
                     .reached_tail(timeline.announced_body_bytes())
@@ -267,8 +262,8 @@ impl BucketOperation<'_> {
                         self.unknown_latency
                             .min(self.downloader.limits.bucket_timeout)
                             / 2,
-                    )
-            }),
+                    ),
+            ),
         };
         observation.complete(outcome);
         result
@@ -342,6 +337,7 @@ impl Downloader {
                 range: byterange,
                 config: req_config,
             };
+            let timeline = RequestTimeline::default();
             let (piece, hedged) = BucketOperation {
                 downloader: self,
                 request,
@@ -349,14 +345,10 @@ impl Downloader {
                 unknown_latency: self.limits.page_timeout,
                 probe: None,
             }
-            .execute(
-                None,
-                &RequestTimeline::default(),
-                async |deadline, admission, observation, timeline| {
-                    self.fetch_with_hedge(request, admission, observation, timeline, deadline)
-                        .await
-                },
-            )
+            .execute(None, &timeline, async |deadline, admission, observation| {
+                self.fetch_with_hedge(request, admission, observation, &timeline, deadline)
+                    .await
+            })
             .await?;
             DownloadOutput {
                 piece,
@@ -388,17 +380,21 @@ impl Downloader {
             self.fetch_piece(request, observation, timeline).await
         };
         tokio::pin!(primary);
-        let mut hedge = self.hedge_timer(observation.model(), timeline, deadline);
+        let mut hedge = HedgeTimer::new(
+            observation.model(),
+            timeline,
+            deadline,
+            self.limits.hedge_budget_percent > 0,
+        );
         let permits = loop {
             select! {
                 biased;
                 result = &mut primary => return result.map(|piece| (piece, false)),
                 () = hedge.due() => {},
             }
-            if observation.overloaded() {
-                continue;
-            }
-            if let Some(permits) = self.hedge_permits(request.bucket, request.bytes()) {
+            if !observation.overloaded()
+                && let Some(permits) = self.hedge_permits(request.bucket, request.bytes())
+            {
                 break permits;
             }
         };
@@ -422,47 +418,32 @@ impl Downloader {
         let result = select! {
             biased;
             result = &mut primary => match result {
-                Ok(piece) => {
-                    self.record_superseded(request.bucket, &secondary_timeline);
-                    Ok(piece)
-                }
                 Err(error) if error.should_wait_for_hedged_peer() => secondary
                     .as_mut()
                     .await
                     .map_err(|secondary_error| DownloadError::of_hedged_pair(error, secondary_error)),
-                Err(error) => Err(error),
+                result => result,
             },
             result = &mut secondary => match result {
-                Ok(piece) => {
-                    self.record_superseded(request.bucket, timeline);
-                    Ok(piece)
-                }
-                Err(error) if !error.should_wait_for_hedged_peer() => Err(error),
-                Err(error) => primary
+                Err(error) if error.should_wait_for_hedged_peer() => primary
                     .await
                     .map_err(|primary_error| DownloadError::of_hedged_pair(primary_error, error)),
+                result => result,
             },
         };
+        if result.is_ok() {
+            self.record_superseded(request.bucket, timeline);
+            self.record_superseded(request.bucket, &secondary_timeline);
+        }
         result.map(|piece| (piece, true))
     }
 
+    /// Records a copy still in flight when another copy of its page succeeded. Copies that finished
+    /// or never started record nothing here.
     fn record_superseded(&self, bucket: &BucketName, timeline: &RequestTimeline) {
-        if let Some(sample) = timeline.sample() {
+        if let Some(sample) = timeline.in_flight_sample() {
             self.bucketed_stats.record_superseded(bucket, &sample);
         }
-    }
-
-    fn hedge_timer<'a>(
-        &self,
-        model: LatencyModel,
-        primary: &'a RequestTimeline,
-        deadline: Instant,
-    ) -> HedgeTimer<'a> {
-        let mut hedge = HedgeTimer::new(model, primary, deadline);
-        if self.limits.hedge_budget_percent == 0 {
-            hedge.disarm();
-        }
-        hedge
     }
 
     /// Records the request's measurements only once its body is validated.
@@ -488,7 +469,7 @@ impl Downloader {
             .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
 
-        let started = timeline.start();
+        let in_flight = timeline.start();
         let output = if req_config.is_noop() {
             request.send().await
         } else {
@@ -513,7 +494,9 @@ impl Downloader {
                 .send()
                 .await
         }
-        .map_err(|error| map_get_object_error(bucket, byterange, started.elapsed(), error))?;
+        .map_err(|error| {
+            map_get_object_error(bucket, byterange, in_flight.started.elapsed(), error)
+        })?;
         let piece = self.read_response(byterange, output, timeline).await?;
         if let Some(sample) = timeline.sample() {
             observation.record(&sample);
@@ -619,7 +602,7 @@ mod tests {
         RequestTimeline, map_get_object_error,
     };
     use crate::{
-        object_store::stats::{Outcome, Sample},
+        object_store::stats::{MIB, Outcome, Sample},
         service::SlidingThroughput,
         types::{BucketName, BucketNameSet, ObjectKey},
     };
@@ -759,10 +742,9 @@ mod tests {
     }
 
     fn seed_latency(downloader: &Downloader, bucket: &str, millis: u64) {
-        downloader.bucketed_stats.seed(
-            &BucketName::new(bucket).unwrap(),
-            Sample::from_millis(millis, 4, 0),
-        );
+        downloader
+            .bucketed_stats
+            .seed_latency(&BucketName::new(bucket).unwrap(), millis);
     }
 
     async fn metrics(downloader: &Downloader, bucket: &str) -> BucketMetrics {
@@ -1145,7 +1127,7 @@ mod tests {
             .unwrap();
         downloader.bucketed_stats.seed(
             &BucketName::new("bucket").unwrap(),
-            Sample::from_millis(5, 4 * 1024 * 1024, 4000),
+            Sample::from_millis(5, 4 * MIB, 4000),
         );
         assert!(matches!(
             fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
@@ -1676,7 +1658,7 @@ mod tests {
         .execute(
             Some(permit),
             &RequestTimeline::default(),
-            async |_, _, _, _| Ok(()),
+            async |_, _, _| Ok(()),
         )
         .await;
         assert!(matches!(result, Err(DownloadError::Timeout { .. })));

@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::object_store::DownloadLimits;
+use crate::{
+    object_store::{DownloadLimits, stats::MIB},
+    service::PAGE_SIZE,
+};
 
-const MIB: u64 = 1024 * 1024;
-const MAX_PAGE_BYTES: u64 = 16 * MIB;
 const SHORT_BODY_DOMAIN: u64 = 2000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,7 +157,7 @@ impl Scenario {
         );
         eyre::ensure!(
             self.body_bytes > 0
-                && self.body_bytes as u64 <= MAX_PAGE_BYTES
+                && self.body_bytes as u64 <= PAGE_SIZE
                 && self.chunks > 0
                 && self.short_body.as_ref().is_none_or(|short| {
                     short.bytes > 0
@@ -186,7 +187,7 @@ impl Scenario {
         }
         eyre::ensure!(
             self.request_bytes
-                .is_none_or(|bytes| bytes >= self.body_bytes as u64 && bytes <= MAX_PAGE_BYTES),
+                .is_none_or(|bytes| bytes >= self.body_bytes as u64 && bytes <= PAGE_SIZE),
             "requested range must cover the response and fit a cache page"
         );
         self.limits().validate()

@@ -1,4 +1,10 @@
-use std::{sync::OnceLock, time::Duration};
+use std::{
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use tokio::{
     select,
@@ -14,22 +20,43 @@ struct Headers {
     body_bytes: u64,
 }
 
-/// When a backend request started, and when response headers with a validated range arrived with
-/// the announced body length.
+/// When a backend request started, when response headers with a validated range arrived with the
+/// announced body length, and whether the request has finished.
 #[derive(Debug, Default)]
 pub(super) struct RequestTimeline {
     started: OnceLock<Instant>,
     headers: OnceLock<Headers>,
+    finished: AtomicBool,
     changed: Notify,
 }
 
+/// Marks its request finished when dropped, whether it completed, failed or was cancelled.
+#[must_use]
+pub(super) struct InFlight<'a> {
+    timeline: &'a RequestTimeline,
+    pub started: Instant,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.timeline.finished.store(true, Ordering::Relaxed);
+    }
+}
+
 impl RequestTimeline {
-    pub fn start(&self) -> Instant {
+    pub fn start(&self) -> InFlight<'_> {
         let now = Instant::now();
         if self.started.set(now).is_ok() {
             self.changed.notify_one();
         }
-        now
+        InFlight {
+            timeline: self,
+            started: now,
+        }
+    }
+
+    pub fn in_flight(&self) -> bool {
+        self.started.get().is_some() && !self.finished.load(Ordering::Relaxed)
     }
 
     pub fn receive_headers(&self, body_bytes: u64) {
@@ -44,6 +71,15 @@ impl RequestTimeline {
 
     pub fn announced_body_bytes(&self) -> Option<u64> {
         self.headers.get().map(|headers| headers.body_bytes)
+    }
+
+    /// Measurements of a request still in flight, where the time spent in its current phase is a
+    /// lower bound.
+    pub fn in_flight_sample(&self) -> Option<Sample> {
+        if self.finished.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.sample()
     }
 
     /// Measurements so far. For a request that has not finished, the time spent in its current
@@ -89,14 +125,19 @@ pub(super) struct HedgeTimer<'a> {
 }
 
 impl<'a> HedgeTimer<'a> {
-    pub fn new(model: LatencyModel, primary: &'a RequestTimeline, deadline: Instant) -> Self {
+    pub fn new(
+        model: LatencyModel,
+        primary: &'a RequestTimeline,
+        deadline: Instant,
+        enabled: bool,
+    ) -> Self {
         Self {
             model,
             primary,
             deadline,
             next: model
                 .first_byte_hedge()
-                .filter(|tail| !tail.is_zero())
+                .filter(|hedge| enabled && !hedge.is_zero())
                 .map(|_| Phase::FirstByte),
         }
     }
@@ -161,11 +202,9 @@ mod tests {
 
     use super::{HedgeTimer, RequestTimeline};
     use crate::{
-        object_store::stats::{BucketedStats, LatencyModel, Sample},
+        object_store::stats::{BucketedStats, LatencyModel, MIB, Sample},
         types::BucketName,
     };
-
-    const MIB: u64 = 1024 * 1024;
 
     fn model(first_byte_ms: u64, body_bytes: u64, body_ms: u64) -> LatencyModel {
         let stats = BucketedStats::default();
@@ -192,12 +231,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn first_byte_phase_is_timed_from_the_request_start() {
         let timeline = RequestTimeline::default();
-        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline());
+        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline(), true);
         let start = Instant::now();
         tokio::join!(
             async {
                 sleep(Duration::from_millis(50)).await;
-                timeline.start();
+                let _in_flight = timeline.start();
             },
             timer.due(),
         );
@@ -207,8 +246,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hedge_not_taken_before_headers_can_be_taken_during_the_body() {
         let timeline = RequestTimeline::default();
-        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline());
-        timeline.start();
+        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline(), true);
+        let _in_flight = timeline.start();
         assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(21)));
         sleep(Duration::from_millis(10)).await;
         timeline.receive_headers(4096);
@@ -226,8 +265,8 @@ mod tests {
                 Some(body_ms) => model(20, 4 * MIB, body_ms),
             };
             let timeline = RequestTimeline::default();
-            let mut timer = HedgeTimer::new(model, &timeline, deadline());
-            timeline.start();
+            let mut timer = HedgeTimer::new(model, &timeline, deadline(), true);
+            let _in_flight = timeline.start();
             timeline.receive_headers(16 * MIB);
             assert_eq!(due_after(&mut timer).await, expected);
         }

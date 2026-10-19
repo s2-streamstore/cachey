@@ -314,6 +314,7 @@ impl HttpConnector for Backend {
             cancel: Some(cancel_tx),
             complete: false,
         };
+        let body_bytes = self.scenario.read_body_bytes(self.seed, read);
         let backend = self.clone();
         tokio::spawn(async move {
             let mut server = ServerGuard {
@@ -337,7 +338,9 @@ impl HttpConnector for Backend {
                     .await
                     .expect("server semaphore open");
                 server.start();
-                backend.serve(index, fault, head_tx, body_tx).await;
+                backend
+                    .serve(index, fault, body_bytes, head_tx, body_tx)
+                    .await;
             };
             tokio::pin!(work);
             tokio::select! {
@@ -354,7 +357,6 @@ impl HttpConnector for Backend {
                 }
             }
         });
-        let body_bytes = self.scenario.read_body_bytes(self.seed, read);
         HttpConnectorFuture::new(async move {
             let head = head_rx
                 .await
@@ -395,12 +397,12 @@ impl Backend {
         &self,
         index: usize,
         fault: Option<(FaultKind, u64)>,
+        body_bytes: usize,
         head: oneshot::Sender<Head>,
         body: mpsc::Sender<BodyFrame>,
     ) {
         let transport = self.state.lock().transports[index].clone();
         let replica = &self.scenario.replicas[transport.replica];
-        let body_bytes = self.scenario.read_body_bytes(self.seed, transport.read);
         let jitter = |millis: u64, domain| {
             let percent = i128::from(self.scenario.jitter_percent);
             let adjustment = i128::from(

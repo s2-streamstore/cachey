@@ -1,4 +1,8 @@
-use std::{ops::Range, time::Duration};
+use std::{
+    ops::Range,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::{
@@ -7,8 +11,8 @@ use tokio::{
 };
 
 use super::{
-    BucketOperation, DownloadError, DownloadOutput, Downloader, ObjectPiece, PieceRequest,
-    RequestConfig, RequestTimeline,
+    BucketOperation, DownloadError, DownloadOutput, Downloader, HedgeTimer, ObjectPiece,
+    PieceRequest, RequestConfig, RequestTimeline,
 };
 use crate::{
     object_store::{
@@ -75,23 +79,6 @@ struct PrimaryAttempt {
     backup_admission: Option<DownloadPermit>,
 }
 
-struct Progress {
-    /// Whether each bucket's copy is admitted and fetching.
-    active: Vec<bool>,
-    hedged: bool,
-}
-
-struct ActiveCopy<'a> {
-    progress: &'a parking_lot::Mutex<Progress>,
-    index: usize,
-}
-
-impl Drop for ActiveCopy<'_> {
-    fn drop(&mut self) {
-        self.progress.lock().active[self.index] = false;
-    }
-}
-
 /// Each bucket is tried at most once, so each has one request timeline.
 struct ReplicaRequest<'a> {
     downloader: &'a Downloader,
@@ -101,7 +88,8 @@ struct ReplicaRequest<'a> {
     config: &'a RequestConfig,
     deadline: Instant,
     timelines: Vec<RequestTimeline>,
-    progress: parking_lot::Mutex<Progress>,
+    /// Whether a copy started while another was in flight.
+    hedged: AtomicBool,
 }
 
 impl<'a> ReplicaRequest<'a> {
@@ -121,10 +109,7 @@ impl<'a> ReplicaRequest<'a> {
             config,
             deadline,
             timelines: buckets.iter().map(|_| RequestTimeline::default()).collect(),
-            progress: parking_lot::Mutex::new(Progress {
-                active: vec![false; buckets.len()],
-                hedged: false,
-            }),
+            hedged: AtomicBool::new(false),
         }
     }
 
@@ -139,24 +124,18 @@ impl<'a> ReplicaRequest<'a> {
         used: usize,
         start: Instant,
     ) -> DownloadOutput {
-        let progress = self.progress.lock();
         DownloadOutput {
             piece,
             primary_bucket_idx: primary,
             used_bucket_idx: used,
             latency: start.elapsed(),
-            hedged: progress.hedged,
+            hedged: self.hedged.load(Ordering::Relaxed),
         }
     }
 
-    /// Copies still fetching when another succeeds record what their unfinished phases showed.
     fn record_superseded(&self) {
-        let progress = self.progress.lock();
-        for (index, active) in progress.active.iter().enumerate() {
-            if *active {
-                self.downloader
-                    .record_superseded(&self.buckets[index], &self.timelines[index]);
-            }
+        for (bucket, timeline) in self.buckets.iter().zip(&self.timelines) {
+            self.downloader.record_superseded(bucket, timeline);
         }
     }
 
@@ -192,18 +171,12 @@ impl<'a> ReplicaRequest<'a> {
         .execute(
             admission,
             &self.timelines[index],
-            async |_, _admission, observation, timeline| {
-                let _active = {
-                    let mut progress = self.progress.lock();
-                    progress.hedged |= progress.active.contains(&true);
-                    progress.active[index] = true;
-                    ActiveCopy {
-                        progress: &self.progress,
-                        index,
-                    }
-                };
+            async |_, _admission, observation| {
+                if self.timelines.iter().any(RequestTimeline::in_flight) {
+                    self.hedged.store(true, Ordering::Relaxed);
+                }
                 self.downloader
-                    .fetch_piece(request, observation, timeline)
+                    .fetch_piece(request, observation, &self.timelines[index])
                     .await
             },
         )
@@ -238,14 +211,12 @@ impl Downloader {
         let mut tried = vec![false; buckets.len()];
         tried[primary] = true;
         let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
-        let mut hedge = self.hedge_timer(
+        let mut hedge = HedgeTimer::new(
             routing.model(primary),
             &request.timelines[primary],
             deadline,
+            self.limits.hedge_budget_percent > 0 && probe.is_none(),
         );
-        if probe.is_some() {
-            hedge.disarm();
-        }
         let mut active = FuturesUnordered::new();
         active.push(request.attempt(primary, probe, primary_permits));
         let mut fallback_errors = FallbackErrors::default();
