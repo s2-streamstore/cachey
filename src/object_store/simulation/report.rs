@@ -6,7 +6,7 @@ use super::{
     backend::{State, Transport},
     model::Scenario,
 };
-use crate::object_store::DownloadError;
+use crate::object_store::{BucketMetrics, DownloadError};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Copy {
@@ -16,16 +16,56 @@ pub struct Copy {
     pub end_us: u64,
 }
 
+/// A bucket's exported latency model. Zero means not yet measured.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Estimates {
+    latency_p99_us: u64,
+    first_byte_p99_us: u64,
+    small_body_p99_us: u64,
+    throughput_p1_bytes_per_second: u64,
+}
+
+impl From<&BucketMetrics> for Estimates {
+    fn from(metrics: &BucketMetrics) -> Self {
+        Self {
+            latency_p99_us: metrics.latency_p99.as_micros() as u64,
+            first_byte_p99_us: metrics.first_byte_p99.as_micros() as u64,
+            small_body_p99_us: metrics.small_body_p99.as_micros() as u64,
+            throughput_p1_bytes_per_second: metrics.throughput_p1 as u64,
+        }
+    }
+}
+
+impl Estimates {
+    fn slowest(self, other: Self) -> Self {
+        let throughput = match (
+            self.throughput_p1_bytes_per_second,
+            other.throughput_p1_bytes_per_second,
+        ) {
+            (0, measured) | (measured, 0) => measured,
+            (left, right) => left.min(right),
+        };
+        Self {
+            latency_p99_us: self.latency_p99_us.max(other.latency_p99_us),
+            first_byte_p99_us: self.first_byte_p99_us.max(other.first_byte_p99_us),
+            small_body_p99_us: self.small_body_p99_us.max(other.small_body_p99_us),
+            throughput_p1_bytes_per_second: throughput,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Health {
     pub replica: usize,
     pub deprioritized: bool,
     pub recovery_successes: u32,
+    pub estimates: Estimates,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Read {
     pub id: u64,
+    pub body_bytes: usize,
     pub completion_order: usize,
     pub arrival_us: u64,
     pub end_us: u64,
@@ -88,6 +128,8 @@ pub struct Report {
     fault_window_arrivals: usize,
     fault_window_failures: usize,
     success_latency: Latency,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    success_latency_by_body_bytes: BTreeMap<usize, Latency>,
     all_arrival_latency: Latency,
     copy_operations: usize,
     pub transport_attempts: usize,
@@ -106,8 +148,13 @@ pub struct Report {
     produced_bytes: u64,
     delivered_bytes: u64,
     useful_bytes: u64,
-    overlapping_reads: usize,
+    pub overlapping_reads: usize,
     wins_by_replica: Vec<usize>,
+    /// Each bucket's estimates after the last read completed.
+    final_estimates: Vec<Estimates>,
+    /// Each bucket's slowest estimates observed after any read: highest durations, lowest
+    /// throughput.
+    slowest_estimates: Vec<Estimates>,
     pub recoveries: Vec<Recovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reads: Option<Vec<Read>>,
@@ -143,7 +190,7 @@ impl Report {
         }
         let completed = reads.iter().filter(|read| read.error.is_none()).count();
         assert!(peak_copies <= scenario.max_inflight_requests as usize);
-        assert!(peak_copies as u64 * scenario.request_bytes() <= scenario.max_inflight_bytes);
+        assert!(peak_copies as u64 * scenario.min_request_bytes() <= scenario.max_inflight_bytes);
         let service_after = |transport: &Transport, time: u64| {
             transport.service_start_us.map_or(0, |start| {
                 transport
@@ -166,8 +213,13 @@ impl Report {
         chronological.sort_by_key(|read| read.completion_order);
         let mut impaired = vec![None; scenario.replicas.len()];
         let mut recoveries = vec![];
+        let mut final_estimates = vec![Estimates::default(); scenario.replicas.len()];
+        let mut slowest_estimates = final_estimates.clone();
         for read in chronological {
             for health in &read.health {
+                final_estimates[health.replica] = health.estimates;
+                slowest_estimates[health.replica] =
+                    slowest_estimates[health.replica].slowest(health.estimates);
                 if health.deprioritized {
                     impaired[health.replica].get_or_insert(read.end_us);
                 } else if let Some(since) = impaired[health.replica].take() {
@@ -187,6 +239,15 @@ impl Report {
                 .any(|fault| (fault.start_ms..fault.end_ms).contains(&(read.arrival_us / 1000)))
         };
         histograms.sort_unstable();
+        let mut latency_by_body_bytes = BTreeMap::<usize, Vec<u64>>::new();
+        if scenario.short_body.is_some() {
+            for read in reads.iter().filter(|read| read.error.is_none()) {
+                latency_by_body_bytes
+                    .entry(read.body_bytes)
+                    .or_default()
+                    .push(read.end_us - read.arrival_us);
+            }
+        }
         Self {
             seed,
             histogram_mode: if native {
@@ -218,6 +279,10 @@ impl Report {
                     .map(|read| read.end_us - read.arrival_us)
                     .collect(),
             ),
+            success_latency_by_body_bytes: latency_by_body_bytes
+                .into_iter()
+                .map(|(bytes, latencies)| (bytes, Latency::new(latencies)))
+                .collect(),
             all_arrival_latency: Latency::new(
                 reads
                     .iter()
@@ -263,7 +328,11 @@ impl Report {
                 })
                 .max()
                 .unwrap_or(0),
-            requested_bytes: state.transports.len() as u64 * scenario.request_bytes(),
+            requested_bytes: state
+                .transports
+                .iter()
+                .map(|transport| scenario.read_request_bytes(seed, transport.read))
+                .sum(),
             produced_bytes: state
                 .transports
                 .iter()
@@ -274,9 +343,15 @@ impl Report {
                 .iter()
                 .map(|transport| transport.delivered_bytes)
                 .sum(),
-            useful_bytes: completed as u64 * scenario.body_bytes as u64,
+            useful_bytes: reads
+                .iter()
+                .filter(|read| read.error.is_none())
+                .map(|read| read.body_bytes as u64)
+                .sum(),
             overlapping_reads: reads.iter().filter(|read| read.hedged).count(),
             wins_by_replica: wins,
+            final_estimates,
+            slowest_estimates,
             recoveries,
             scenario,
             reads: trace.then_some(reads),

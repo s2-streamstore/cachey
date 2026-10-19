@@ -354,7 +354,7 @@ impl HttpConnector for Backend {
                 }
             }
         });
-        let body_bytes = self.scenario.body_bytes;
+        let body_bytes = self.scenario.read_body_bytes(self.seed, read);
         HttpConnectorFuture::new(async move {
             let head = head_rx
                 .await
@@ -400,6 +400,7 @@ impl Backend {
     ) {
         let transport = self.state.lock().transports[index].clone();
         let replica = &self.scenario.replicas[transport.replica];
+        let body_bytes = self.scenario.read_body_bytes(self.seed, transport.read);
         let jitter = |millis: u64, domain| {
             let percent = i128::from(self.scenario.jitter_percent);
             let adjustment = i128::from(
@@ -415,7 +416,7 @@ impl Backend {
             (i128::from(millis) * (10_000 + percent * adjustment) / 10_000) as u64
         };
         let mut headers_ms = jitter(replica.headers_ms, 1000);
-        let mut body_ms = jitter(replica.body_ms, 1001);
+        let mut body_ms = jitter(replica.body_ms(body_bytes), 1001);
         if let Some((kind, duration)) = fault {
             match kind {
                 FaultKind::HeaderStall
@@ -459,9 +460,8 @@ impl Backend {
                     .await;
                 return;
             }
-            let start = self.scenario.body_bytes * chunk as usize / self.scenario.chunks as usize;
-            let end =
-                self.scenario.body_bytes * (chunk + 1) as usize / self.scenario.chunks as usize;
+            let start = body_bytes * chunk as usize / self.scenario.chunks as usize;
+            let end = body_bytes * (chunk + 1) as usize / self.scenario.chunks as usize;
             self.state.lock().transports[index].produced_bytes += (end - start) as u64;
             let _ = body
                 .send(Ok(Frame::data(Bytes::from(vec![0x5a; end - start]))))

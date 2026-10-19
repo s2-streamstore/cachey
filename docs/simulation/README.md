@@ -44,6 +44,10 @@ Fault timing uses read arrival by default; `clock_at_arrival=false` evaluates ea
 wire attempt instead. Healthy downloads calibrate replicas before measurement;
 a run with zero warmup reads exercises cold starts. `request_bytes` controls admission
 reservations independently of `body_bytes`; page-admission fixtures reserve 16 MiB.
+`short_body` gives a seeded share of reads a shorter response: the last page of an
+object, or an exact-range read when `request_bytes` is unset. A replica's
+`body_ms_per_mib` adds body time in proportion to the response length, so mixed sizes
+exercise the per-size-class latency model.
 
 Seeds control faults, latency jitter, and recovery probes. SDK retries use the real
 classifier and quota with deterministic backoff. The default histogram reservoir
@@ -56,11 +60,16 @@ Completion includes **every scheduled arrival**, including admission failures an
 caller cancellations. Reports separate successful latency from all-arrival latency,
 and admitted copies from SDK invocations and wire attempts. Service work measures
 occupied slot time; post-read work is the portion after the originating read finishes.
-Recovery timestamps are sampled when reads complete.
+Recovery timestamps are sampled when reads complete. Fixtures with short bodies also
+report successful latency by response length. Each bucket's exported latency estimates
+are sampled after every read; reports give the final values and the slowest seen
+(highest p99 durations, lowest p1 throughput), which show how far stalls moved them.
 
 The model omits connection setup, network contention, and interactions among cachey
 instances. Millisecond timing and prescribed service distributions limit conclusions
-about real S3 or Capacitor latency.
+about real S3 or Capacitor latency. Whole-millisecond timing makes responses land
+exactly on a learned tail far more often than real ones do; hedges start only once a
+phase has taken strictly longer than its tail, so such ties do not spend the budget.
 
 Compare revisions with the same harness, fixtures, and controls; retain patches for
 dirty trees. Assess completion first, then latency and extra backend work. See the

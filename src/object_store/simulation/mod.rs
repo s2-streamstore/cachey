@@ -152,11 +152,11 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     .map(|index| BucketName::new(format!("replica-{index}")).unwrap()),
             )
             .unwrap();
-            let range = 0..scenario.request_bytes();
             for (replica, bucket) in buckets.iter().enumerate() {
                 let singleton = BucketNameSet::from(bucket.clone());
                 for warm in 0..scenario.warmup_per_replica {
                     let id = WARM_READ + replica as u64 * 1_000_000 + u64::from(warm);
+                    let range = 0..scenario.read_request_bytes(seed, id);
                     // Calibration needs to measure even a replica that cannot meet the campaign
                     // deadline.
                     let calibration = downloader
@@ -192,13 +192,14 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 let downloader = &downloader;
                 let buckets = &buckets;
                 let scenario = &scenario;
-                let range = &range;
                 async move {
                     let at_ms = id as u64 * scenario.interval_ms;
                     sleep_until(epoch + Duration::from_millis(at_ms)).await;
                     let object = ObjectKey::new(format!("read-{id}")).unwrap();
                     let config = RequestConfig::default();
-                    let operation = downloader.download(buckets, object, range, &config);
+                    let body_bytes = scenario.read_body_bytes(seed, id as u64);
+                    let range = 0..scenario.read_request_bytes(seed, id as u64);
+                    let operation = downloader.download(buckets, object, &range, &config);
                     tokio::pin!(operation);
                     let result = if let Some(cancel_ms) = scenario.cancel_read_after_ms {
                         tokio::select! {
@@ -218,7 +219,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     });
                     let (error, primary, winner, hedged) = match result {
                         Some(Ok(output)) => {
-                            assert_eq!(output.piece.data.len(), scenario.body_bytes);
+                            assert_eq!(output.piece.data.len(), body_bytes);
                             (
                                 None,
                                 Some(output.primary_bucket_idx),
@@ -240,11 +241,13 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                             replica: bucket.strip_prefix("replica-").unwrap().parse().unwrap(),
                             deprioritized: metrics.deprioritized,
                             recovery_successes: metrics.recovery_successes,
+                            estimates: metrics.into(),
                         });
                     });
                     health.sort_by_key(|health| health.replica);
                     Read {
                         id: id as u64,
+                        body_bytes,
                         completion_order,
                         arrival_us: at_ms * 1000,
                         end_us,
@@ -302,6 +305,9 @@ async fn simulation_guarantees() {
         "sdk_retry",
         "guarded_recovery",
         "delayed_cancellation",
+        "single_bucket_header_stalls",
+        "single_bucket_slow_bodies",
+        "mixed_sizes_header_stalls_page_admission",
     ] {
         let mut scenario = model::scenarios()
             .into_iter()
@@ -334,6 +340,17 @@ async fn simulation_guarantees() {
             assert!(report.post_read_service_us >= 40_000);
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn simulation_reads_finishing_at_their_tail_are_not_hedged() {
+    let scenario = model::scenarios()
+        .into_iter()
+        .find(|scenario| scenario.name == "healthy_zonal_page_admission")
+        .unwrap();
+    let report = simulate(scenario, 7, false, false).await;
+    assert_eq!(report.completed, report.arrivals, "{report:?}");
+    assert_eq!(report.overlapping_reads, 0, "{report:?}");
 }
 
 #[tokio::test(start_paused = true)]
