@@ -6,7 +6,7 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
-use crate::object_store::stats::{BodySample, LatencyModel, Sample};
+use crate::object_store::stats::{LatencyModel, Sample};
 
 #[derive(Debug, Clone, Copy)]
 struct Headers {
@@ -52,10 +52,8 @@ impl RequestTimeline {
         let headers = self.headers.get()?;
         Some(Sample {
             first_byte: headers.at.saturating_duration_since(started),
-            body: BodySample {
-                bytes: headers.body_bytes,
-                elapsed: headers.at.elapsed(),
-            },
+            body_bytes: headers.body_bytes,
+            body: headers.at.elapsed(),
         })
     }
 }

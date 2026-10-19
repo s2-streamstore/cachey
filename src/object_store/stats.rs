@@ -59,30 +59,13 @@ fn is_small_body(bytes: u64) -> bool {
     bytes < MIN_THROUGHPUT_SAMPLE_BYTES
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct BodySample {
-    pub bytes: u64,
-    /// Time from response headers to the end of the body.
-    pub elapsed: Duration,
-}
-
-impl BodySample {
-    /// Duration for a small body. A larger one is measured per MiB, so slow transfers form the
-    /// upper tail like other durations.
-    fn measure(self) -> Duration {
-        if is_small_body(self.bytes) {
-            self.elapsed
-        } else {
-            self.elapsed.mul_f64(MIB as f64 / self.bytes as f64)
-        }
-    }
-}
-
 /// Measurements from one backend request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Sample {
     pub first_byte: Duration,
-    pub body: BodySample,
+    pub body_bytes: u64,
+    /// Time from response headers to the end of the body.
+    pub body: Duration,
 }
 
 impl Sample {
@@ -90,15 +73,23 @@ impl Sample {
     pub fn from_millis(first_byte_ms: u64, body_bytes: u64, body_ms: u64) -> Self {
         Self {
             first_byte: Duration::from_millis(first_byte_ms),
-            body: BodySample {
-                bytes: body_bytes,
-                elapsed: Duration::from_millis(body_ms),
-            },
+            body_bytes,
+            body: Duration::from_millis(body_ms),
         }
     }
 
     fn latency(&self) -> Duration {
-        self.first_byte.saturating_add(self.body.elapsed)
+        self.first_byte.saturating_add(self.body)
+    }
+
+    /// Body time for a small body. A larger one is measured per MiB, so slow transfers form the
+    /// upper tail like other durations.
+    fn measured_body(&self) -> Duration {
+        if is_small_body(self.body_bytes) {
+            self.body
+        } else {
+            self.body.mul_f64(MIB as f64 / self.body_bytes as f64)
+        }
     }
 }
 
@@ -261,13 +252,13 @@ impl LatencyHistograms {
     fn record(&mut self, now: Instant, sample: &Sample, replace_history: bool) {
         if replace_history {
             self.first_byte = PhaseHistogram::new(now);
-            *self.body_histogram(sample.body.bytes) = PhaseHistogram::new(now);
+            *self.body_histogram(sample.body_bytes) = PhaseHistogram::new(now);
         }
         let now = now.into_std();
         self.latency.update(now, sample.latency());
         self.first_byte.update(now, sample.first_byte);
-        self.body_histogram(sample.body.bytes)
-            .update(now, sample.body.measure());
+        self.body_histogram(sample.body_bytes)
+            .update(now, sample.measured_body());
     }
 
     fn model(&mut self, due: bool) -> LatencyModel {
@@ -389,7 +380,8 @@ impl BucketStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Outcome {
-    Success,
+    /// With the validated request's measurements, when it was timed.
+    Success(Option<Sample>),
     Failure,
     Overload,
     Neutral,
@@ -409,8 +401,6 @@ pub(super) struct BucketObservation {
     stats: Arc<Mutex<BucketStats>>,
     /// The bucket's latency model when the operation began.
     model: LatencyModel,
-    /// The validated request's measurements, applied when the observation ends.
-    sample: Option<Sample>,
     started: Instant,
     generation: u64,
     probe: Option<ProbePermit>,
@@ -418,13 +408,6 @@ pub(super) struct BucketObservation {
 }
 
 impl BucketObservation {
-    /// A probe's measurements replace the history of the time to first byte and the body size
-    /// class they cover, so a recovering bucket's hedges and timeouts are judged by how it performs
-    /// now.
-    pub fn record(&mut self, sample: &Sample) {
-        self.sample = Some(*sample);
-    }
-
     pub fn model(&self) -> LatencyModel {
         self.model
     }
@@ -444,9 +427,6 @@ impl Drop for BucketObservation {
                 stats.active.remove(&self.started);
             }
         }
-        if let Some(sample) = &self.sample {
-            stats.record(now, sample, self.probe.is_some());
-        }
         let Some(outcome) = self.outcome else {
             let increase = now
                 .duration_since(self.started)
@@ -457,7 +437,10 @@ impl Drop for BucketObservation {
         };
         let error_rate = stats.error_rate(now);
         match outcome {
-            Outcome::Success => {
+            Outcome::Success(sample) => {
+                if let Some(sample) = &sample {
+                    stats.record(now, sample, self.probe.is_some());
+                }
                 if self.generation == stats.generation {
                     stats.error_rate = error_rate * (1.0 - ERROR_ALPHA);
                     stats.consecutive_failures = 0;
@@ -687,7 +670,6 @@ impl BucketedStats {
         BucketObservation {
             stats,
             model,
-            sample: None,
             started,
             generation,
             probe,
@@ -729,9 +711,8 @@ impl BucketedStats {
 
     #[cfg(test)]
     pub(super) fn seed(&self, bucket: &BucketName, sample: Sample) {
-        let mut observation = self.begin(bucket, None);
-        observation.record(&sample);
-        observation.complete(Outcome::Success);
+        self.begin(bucket, None)
+            .complete(Outcome::Success(Some(sample)));
     }
 
     /// Seeds a request for the 4-byte objects tests read, whose latency is all time to first byte.
@@ -869,7 +850,7 @@ mod tests {
             .collect::<Vec<_>>();
         stats.begin(bucket, None).complete(Outcome::Failure);
         for observation in old {
-            observation.complete(Outcome::Success);
+            observation.complete(Outcome::Success(None));
         }
         advance(Duration::from_secs(300)).await;
         assert!(stats.entry(bucket).lock().deprioritized);
@@ -901,10 +882,9 @@ mod tests {
                 stats.snapshot(&buckets).primary(Duration::from_secs(1)).0,
                 1
             );
-            let mut observation = stats.begin(&buckets[0], probe);
+            let observation = stats.begin(&buckets[0], probe);
             advance(Duration::from_millis(3)).await;
-            observation.record(&Sample::from_millis(3, 4, 0));
-            observation.complete(Outcome::Success);
+            observation.complete(Outcome::Success(Some(Sample::from_millis(3, 4, 0))));
             assert_eq!(
                 stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
                 Some(1)
@@ -930,11 +910,10 @@ mod tests {
             advance(Duration::from_secs(37)).await;
             let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
             assert_eq!(index, 0);
-            let mut observation = stats.begin(&buckets[0], probe);
+            let observation = stats.begin(&buckets[0], probe);
             advance(Duration::from_millis(3)).await;
             if probe_succeeds {
-                observation.record(&Sample::from_millis(3, 4, 0));
-                observation.complete(Outcome::Success);
+                observation.complete(Outcome::Success(Some(Sample::from_millis(3, 4, 0))));
             } else {
                 observation.complete(Outcome::Failure);
             }
@@ -1101,9 +1080,8 @@ mod tests {
         let probe = ProbePermit {
             stats: stats.entry(&bucket),
         };
-        let mut observation = stats.begin(&bucket, Some(probe));
-        observation.record(&Sample::from_millis(9, 4096, 1));
-        observation.complete(Outcome::Success);
+        let observation = stats.begin(&bucket, Some(probe));
+        observation.complete(Outcome::Success(Some(Sample::from_millis(9, 4096, 1))));
         let model = stats.model(&bucket);
         assert_eq!(model.first_byte_tail(), Some(Duration::from_millis(9)));
         assert_eq!(model.body_tail(4096), Some(Duration::from_millis(1)));

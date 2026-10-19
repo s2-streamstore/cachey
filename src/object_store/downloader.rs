@@ -230,7 +230,7 @@ impl BucketOperation<'_> {
                 timeout: budget,
             });
         }
-        let mut observation = self
+        let observation = self
             .downloader
             .bucketed_stats
             .begin(self.request.bucket, self.probe);
@@ -242,12 +242,7 @@ impl BucketOperation<'_> {
             }),
         };
         let outcome = match &result {
-            Ok(_) => {
-                if let Some(sample) = self.timeline.sample() {
-                    observation.record(&sample);
-                }
-                Outcome::Success
-            }
+            Ok(_) => Outcome::Success(self.timeline.sample()),
             Err(error) => error.health_outcome(
                 observation.model().reached_tail(
                     self.timeline.announced_body_bytes(),
@@ -484,7 +479,7 @@ mod tests {
         RequestTimeline, map_get_object_error,
     };
     use crate::{
-        object_store::stats::{BodySample, Outcome, Sample},
+        object_store::stats::{Outcome, Sample},
         service::SlidingThroughput,
         types::{BucketName, BucketNameSet, ObjectKey},
     };
@@ -1228,10 +1223,8 @@ mod tests {
                 &BucketName::new("bucket").unwrap(),
                 Sample {
                     first_byte: Duration::from_millis(10),
-                    body: BodySample {
-                        bytes: 4,
-                        elapsed: Duration::from_micros(body_tail_us),
-                    },
+                    body_bytes: 4,
+                    body: Duration::from_micros(body_tail_us),
                 },
             );
             let result =
