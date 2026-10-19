@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::sync::OnceLock;
 
 use tokio::{
     select,
@@ -20,43 +14,22 @@ struct Headers {
     body_bytes: u64,
 }
 
-/// When a backend request started, when response headers with a validated range arrived with the
-/// announced body length, and whether the request has finished.
+/// When a backend request started, and when response headers with a validated range arrived with
+/// the announced body length.
 #[derive(Debug, Default)]
 pub(super) struct RequestTimeline {
     started: OnceLock<Instant>,
     headers: OnceLock<Headers>,
-    finished: AtomicBool,
     changed: Notify,
 }
 
-/// Marks its request finished when dropped, whether it completed, failed or was cancelled.
-#[must_use]
-pub(super) struct InFlight<'a> {
-    timeline: &'a RequestTimeline,
-    pub started: Instant,
-}
-
-impl Drop for InFlight<'_> {
-    fn drop(&mut self) {
-        self.timeline.finished.store(true, Ordering::Relaxed);
-    }
-}
-
 impl RequestTimeline {
-    pub fn start(&self) -> InFlight<'_> {
+    pub fn start(&self) -> Instant {
         let now = Instant::now();
         if self.started.set(now).is_ok() {
             self.changed.notify_waiters();
         }
-        InFlight {
-            timeline: self,
-            started: now,
-        }
-    }
-
-    pub fn in_flight(&self) -> bool {
-        self.started.get().is_some() && !self.finished.load(Ordering::Relaxed)
+        now
     }
 
     pub fn receive_headers(&self, body_bytes: u64) {
@@ -87,12 +60,6 @@ impl RequestTimeline {
     }
 }
 
-/// A phase is late only once it has taken strictly longer than its tail, so a response that arrives
-/// exactly at the tail does not start a hedge. Tokio already rounds timers up to the next
-/// millisecond tick, so this changes when one fires only if its deadline lies on a tick or within a
-/// microsecond before one, as whole-millisecond tails on a paused test clock do.
-const LATE_BY: Duration = Duration::from_micros(1);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     FirstByte,
@@ -102,8 +69,8 @@ enum Phase {
 /// Times a page's early hedge against its primary request in two phases: the p99 time to first
 /// byte after the request starts, then, once headers announce the body length, when the body has
 /// taken longer than both its p99 time and the p99 time to first byte. Each phase is due at most
-/// once, so a hedge that cannot start before headers may still start during the body. A body in a
-/// size class the bucket has not served is not hedged early.
+/// once, so a hedge that cannot start before headers may still start during the body. A phase whose
+/// tail is zero, or a body in a size class the bucket has not served, is not hedged early.
 pub(super) struct HedgeTimer<'a> {
     model: LatencyModel,
     primary: &'a RequestTimeline,
@@ -124,7 +91,7 @@ impl<'a> HedgeTimer<'a> {
             deadline,
             next: model
                 .first_byte_tail()
-                .filter(|tail| enabled && !tail.is_zero())
+                .filter(|_| enabled)
                 .map(|_| Phase::FirstByte),
         }
     }
@@ -136,25 +103,25 @@ impl<'a> HedgeTimer<'a> {
     fn due_at(&self) -> Option<(Phase, Instant)> {
         let next = self.next?;
         let first_byte_tail = self.model.first_byte_tail()?;
-        let (phase, at) = match (next, self.primary.headers.get()) {
-            (_, Some(headers)) => {
-                let body_tail = self.model.body_tail(headers.body_bytes)?;
-                (
-                    Phase::Body,
-                    headers
-                        .at
-                        .checked_add(body_tail.max(first_byte_tail).saturating_add(LATE_BY))?,
-                )
-            }
+        let (phase, since, tail) = match (next, self.primary.headers.get()) {
+            (_, Some(headers)) => (
+                Phase::Body,
+                headers.at,
+                self.model
+                    .body_tail(headers.body_bytes)?
+                    .max(first_byte_tail),
+            ),
             (Phase::FirstByte, None) => (
                 Phase::FirstByte,
-                self.primary
-                    .started
-                    .get()?
-                    .checked_add(first_byte_tail.saturating_add(LATE_BY))?,
+                *self.primary.started.get()?,
+                first_byte_tail,
             ),
             (Phase::Body, None) => return None,
         };
+        if tail.is_zero() {
+            return None;
+        }
+        let at = since.checked_add(tail)?;
         (at < self.deadline).then_some((phase, at))
     }
 
@@ -196,7 +163,7 @@ impl<'a> HedgeTimer<'a> {
 mod tests {
     use std::time::Duration;
 
-    use tokio::time::{Instant, sleep, timeout};
+    use tokio::time::{Instant, advance, sleep, timeout};
 
     use super::{HedgeTimer, RequestTimeline};
     use crate::{
@@ -234,38 +201,51 @@ mod tests {
         tokio::join!(
             async {
                 sleep(Duration::from_millis(50)).await;
-                let _in_flight = timeline.start();
+                timeline.start();
             },
             timer.due(),
         );
-        assert_eq!(start.elapsed(), Duration::from_millis(71));
+        assert_eq!(start.elapsed(), Duration::from_millis(70));
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_hedge_not_taken_before_headers_can_be_taken_during_the_body() {
         let timeline = RequestTimeline::default();
         let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline(), true);
-        let _in_flight = timeline.start();
-        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(21)));
+        timeline.start();
+        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
         sleep(Duration::from_millis(10)).await;
         timeline.receive_headers(4096);
-        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(21)));
+        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
         assert_eq!(due_after(&mut timer).await, None);
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_zero_first_byte_tail_still_times_the_body() {
+        let timeline = RequestTimeline::default();
+        let mut timer = HedgeTimer::new(model(0, 4096, 30), &timeline, deadline(), true);
+        timeline.start();
+        let (due, ()) = tokio::join!(due_after(&mut timer), async {
+            sleep(Duration::from_millis(5)).await;
+            timeline.receive_headers(4096);
+        });
+        assert_eq!(due, Some(Duration::from_millis(35)));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_timer_rounded_past_the_deadline_does_not_hedge() {
+        advance(Duration::from_micros(500)).await;
         let timeline = RequestTimeline::default();
         let deadline = Instant::now() + Duration::from_micros(20_002);
         let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline, true);
-        let _in_flight = timeline.start();
+        timeline.start();
         assert_eq!(due_after(&mut timer).await, None);
     }
 
     #[tokio::test(start_paused = true)]
     async fn bodies_are_hedged_by_their_announced_size_class() {
         for (large_body_ms, expected) in
-            [(None, None), (Some(250), Some(Duration::from_millis(1001)))]
+            [(None, None), (Some(250), Some(Duration::from_millis(1000)))]
         {
             let model = match large_body_ms {
                 None => model(20, 4096, 3),
@@ -273,7 +253,7 @@ mod tests {
             };
             let timeline = RequestTimeline::default();
             let mut timer = HedgeTimer::new(model, &timeline, deadline(), true);
-            let _in_flight = timeline.start();
+            timeline.start();
             timeline.receive_headers(16 * MIB);
             assert_eq!(due_after(&mut timer).await, expected);
         }
@@ -288,7 +268,7 @@ mod tests {
             deadline(),
             true,
         );
-        let _in_flight = timeline.start();
+        timeline.start();
         timeline.receive_headers(u64::MAX);
         assert_eq!(due_after(&mut timer).await, None);
     }

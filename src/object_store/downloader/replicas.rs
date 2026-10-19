@@ -1,6 +1,5 @@
 use std::{
-    ops::Range,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -12,7 +11,7 @@ use tokio::{
 
 use super::{
     BucketOperation, DownloadError, DownloadOutput, Downloader, HedgeTimer, ObjectPiece,
-    PieceRequest, RequestConfig, RequestTimeline,
+    OperationError, PieceRequest, RequestTimeline,
 };
 use crate::{
     object_store::{
@@ -20,7 +19,7 @@ use crate::{
         budget::HedgePermit,
         stats::{ProbePermit, RoutingSnapshot},
     },
-    types::{BucketNameSet, ObjectKey},
+    types::BucketNameSet,
 };
 
 const MAX_CONCURRENT_COPIES: usize = 3;
@@ -79,15 +78,21 @@ struct PrimaryAttempt {
     backup_admission: Option<DownloadPermit>,
 }
 
-/// Each bucket is tried at most once, so each has one request timeline.
+struct InFlightCopy<'a>(&'a AtomicUsize);
+
+impl Drop for InFlightCopy<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 struct ReplicaRequest<'a> {
     downloader: &'a Downloader,
     buckets: &'a BucketNameSet,
-    object: &'a ObjectKey,
-    range: &'a Range<u64>,
-    config: &'a RequestConfig,
+    /// The preferred bucket's request, which each copy redirects to its own bucket.
+    request: PieceRequest<'a>,
     deadline: Instant,
-    timelines: Vec<RequestTimeline>,
+    copies_in_flight: AtomicUsize,
     /// Whether a copy started while another was in flight.
     hedged: AtomicBool,
 }
@@ -113,44 +118,45 @@ impl ReplicaRequest<'_> {
         }
     }
 
+    /// The primary shares its timeline with the hedge timer; other copies keep their own.
     async fn attempt(
         &self,
         index: usize,
+        primary_timeline: Option<&RequestTimeline>,
         probe: Option<ProbePermit>,
         permits: Option<AttemptPermits>,
     ) -> Completion {
-        let bucket = &self.buckets[index];
+        let own_timeline = RequestTimeline::default();
+        let timeline = primary_timeline.unwrap_or(&own_timeline);
         let (hedge, admission) = match permits {
             Some(permits) => (permits.hedge, Some(permits.admission)),
             None => (None, None),
         };
-        let hedge_config = hedge.as_ref().map(|_| self.config.single_attempt());
+        let hedge_config = hedge.as_ref().map(|_| self.request.config.single_attempt());
         let _hedge = hedge;
         let request = PieceRequest {
-            bucket,
-            object: self.object,
-            range: self.range,
-            config: hedge_config.as_ref().unwrap_or(self.config),
+            bucket: &self.buckets[index],
+            config: hedge_config.as_ref().unwrap_or(self.request.config),
+            ..self.request
         };
         let result = BucketOperation {
             downloader: self.downloader,
             request,
-            timeline: &self.timelines[index],
+            timeline,
             deadline: self.deadline,
             unknown_latency: self.unknown_latency(),
             probe,
         }
-        .execute(
-            admission,
-            async |request, timeline, _, _admission, observation| {
-                if self.timelines.iter().any(RequestTimeline::in_flight) {
-                    self.hedged.store(true, Ordering::Relaxed);
-                }
-                self.downloader
-                    .fetch_piece(request, observation, timeline)
-                    .await
-            },
-        )
+        .execute(admission, async |observation, _admission, _| {
+            if self.copies_in_flight.fetch_add(1, Ordering::Relaxed) > 0 {
+                self.hedged.store(true, Ordering::Relaxed);
+            }
+            let _in_flight = InFlightCopy(&self.copies_in_flight);
+            self.downloader
+                .fetch_piece(request, observation, timeline)
+                .await
+                .map_err(OperationError::from)
+        })
         .await;
         (index, result)
     }
@@ -160,23 +166,20 @@ impl Downloader {
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
-        object: &ObjectKey,
-        range: &Range<u64>,
-        config: &RequestConfig,
+        request: PieceRequest<'_>,
         start: Instant,
         deadline: Instant,
     ) -> Result<DownloadOutput, DownloadError> {
+        let bytes = request.bytes();
         let request = ReplicaRequest {
             downloader: self,
             buckets,
-            object,
-            range,
-            config,
+            request,
             deadline,
-            timelines: buckets.iter().map(|_| RequestTimeline::default()).collect(),
+            copies_in_flight: AtomicUsize::new(0),
             hedged: AtomicBool::new(false),
         };
-        let bytes = range.end - range.start;
+        let primary_timeline = RequestTimeline::default();
         let routing = self.bucketed_stats.snapshot(buckets);
         let PrimaryAttempt {
             index: primary,
@@ -193,12 +196,12 @@ impl Downloader {
         let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
         let mut hedge = HedgeTimer::new(
             routing.model(primary),
-            &request.timelines[primary],
+            &primary_timeline,
             deadline,
             self.limits.hedge_budget_percent > 0 && probe.is_none(),
         );
         let mut active = FuturesUnordered::new();
-        active.push(request.attempt(primary, probe, primary_permits));
+        active.push(request.attempt(primary, Some(&primary_timeline), probe, primary_permits));
         let mut fallback_errors = FallbackErrors::default();
         let mut retry_budget_exhausted = false;
         while !active.is_empty() {
@@ -253,7 +256,7 @@ impl Downloader {
                 })
             };
             tried[index] = true;
-            active.push(request.attempt(index, None, permits));
+            active.push(request.attempt(index, None, None, permits));
         }
         Err(match fallback_errors.into_error() {
             None | Some(DownloadError::NoSuchKey) if retry_budget_exhausted => {

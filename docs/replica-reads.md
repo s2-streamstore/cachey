@@ -29,7 +29,10 @@ A single backend failure immediately deprioritizes a bucket, favoring prompt fai
 at the cost of extra cross-zone reads after isolated errors. Missing objects, invalid
 or unsatisfied ranges, cancellation, and admission failures do not affect health.
 Timeouts count against health when the copy had its tail time for the phases it
-reached: response headers, then a body of the announced length. The error fraction
+reached: response headers, then a body of the announced length. Before a bucket has
+measured those phases, including a body in the announced size class, a timeout counts
+once the copy had half its share of the page deadline, capped at half the bucket
+deadline. The error fraction
 decays, but restoring normal preference requires 20 successful operations started
 after the latest failure. After 24–36 seconds, a previously competitive bucket—or one
 that failed before its first successful read—can receive an exclusive recovery probe,
@@ -47,18 +50,21 @@ result wins and cancels the others.
 
 Early hedges are timed in two phases and use one SDK attempt, against another bucket
 when available or the same bucket otherwise. Before response headers arrive, a hedge
-starts once the primary request has waited longer than the p99 time to first byte,
-excluding admission wait. Once headers arrive, the hedge is rearmed for the announced
+starts at the p99 time to first byte after the primary request starts, excluding
+admission wait. Once headers arrive, the hedge is rearmed for the announced
 body length: it starts when the body has taken longer than both its p99 body time and
 the p99 time to first byte. These are the same tails that classify timeouts. Copies a
 hedge supersedes are not measured, so stalls and slow transfers keep being hedged until
 they outgrow the budget, instead of pulling the hedge delay up to their own duration. A
-body in a size class the bucket has not yet served is not hedged early. Each phase is
-one opportunity, so a hedge that cannot start before headers may still start during
-the body. If both copies
-of a single-bucket hedge fail, an error that waiting would not change, such as a
-missing object, is reported over a transient failure, and a transient failure over a
-timeout; between equals, the primary's error is reported. By default, the shared
+phase whose tail is zero, or a body in a size class the bucket has not yet served, is
+not hedged early. Each phase is one opportunity, so a hedge that cannot start before
+headers may still start during the body. A copy of a single-bucket hedge that fails
+transiently waits for its peer only until the bucket deadline. If both copies fail, an
+error that waiting would not change, such as a missing object, is reported over a
+transient failure, and a transient failure over a timeout; between equals, the
+primary's error is reported. Bucket health takes the more severe of the two copies'
+outcomes, so throttling or a failure in one copy still counts when the other reports a
+missing object. By default, the shared
 budget permits one startup hedge and earns another per 20 successful pages. Setting
 the budget to zero disables early hedges; fallback and deadline rescue remain
 available. When every bucket has recently reported overload, early hedges stop and
@@ -103,7 +109,7 @@ an authoritative size or replica agreement.
 | `cachey_bucket_latency_{mean,p99}_seconds` | Time from starting a request to its validated body, including SDK retries |
 | `cachey_bucket_first_byte_{mean,p99}_seconds` | Time from starting a request to successful response headers, including SDK retries |
 | `cachey_bucket_small_body_{mean,p99}_seconds` | Time to read a body under 1 MiB after its headers |
-| `cachey_bucket_throughput_{mean,p1}_bytes_per_second` | Body throughput after headers, for bodies of at least 1 MiB, from the mean and p99 time per byte; absent until such a body is measured |
+| `cachey_bucket_throughput_{mean,p1}_bytes_per_second` | Body throughput after headers, for bodies of at least 1 MiB, from the mean and p99 time per byte; absent until such a body is measured, or while bodies arrive too fast to time |
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |

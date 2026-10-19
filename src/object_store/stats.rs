@@ -41,9 +41,9 @@ pub struct BucketMetrics {
     /// Time to read a body smaller than `MIN_THROUGHPUT_SAMPLE_BYTES` after its headers.
     pub small_body_mean: Duration,
     pub small_body_p99: Duration,
-    /// Body bytes per second after headers, for larger bodies, or `None` before one is measured.
-    /// Derived from the time per byte, so the mean is harmonic and p1 reflects the slowest
-    /// transfers.
+    /// Body bytes per second after headers, for larger bodies, or `None` before one is measured or
+    /// while bodies arrive too fast to time, as when already buffered with their headers. Derived
+    /// from the time per byte, so the mean is harmonic and p1 reflects the slowest transfers.
     pub throughput_mean: Option<f64>,
     pub throughput_p1: Option<f64>,
 }
@@ -143,16 +143,13 @@ impl LatencyModel {
     }
 
     /// Slow time to finish the phases a request reached: response headers, then any body whose
-    /// length they announced. A body in a size class the bucket has not served falls back to the
-    /// slow complete request latency across the sizes it has.
+    /// length they announced. `None` until the bucket has measured each of those phases, including
+    /// a body in the announced size class.
     pub fn reached_tail(&self, announced_body_bytes: Option<u64>) -> Option<Duration> {
         let first_byte = self.first_byte_tail()?;
         match announced_body_bytes {
             None => Some(first_byte),
-            Some(bytes) => self
-                .body_tail(bytes)
-                .map(|body| first_byte.saturating_add(body))
-                .or_else(|| self.tail()),
+            Some(bytes) => Some(first_byte.saturating_add(self.body_tail(bytes)?)),
         }
     }
 
@@ -247,8 +244,9 @@ struct LatencyHistograms {
     body_pace: PhaseHistogram,
 }
 
-impl LatencyHistograms {
-    fn new(now: Instant) -> Self {
+impl Default for LatencyHistograms {
+    fn default() -> Self {
+        let now = Instant::now();
         Self {
             latency: PhaseHistogram::new(now),
             first_byte: PhaseHistogram::new(now),
@@ -256,7 +254,9 @@ impl LatencyHistograms {
             body_pace: PhaseHistogram::new(now),
         }
     }
+}
 
+impl LatencyHistograms {
     fn body_histogram(&mut self, bytes: u64) -> &mut PhaseHistogram {
         if is_small_body(bytes) {
             &mut self.small_body
@@ -265,14 +265,14 @@ impl LatencyHistograms {
         }
     }
 
-    /// Starts over the histograms a sample measures, keeping the body size class it did not reach.
-    fn reset_measured(&mut self, now: Instant, sample: &Sample) {
-        self.latency = PhaseHistogram::new(now);
-        self.first_byte = PhaseHistogram::new(now);
-        *self.body_histogram(sample.body.bytes) = PhaseHistogram::new(now);
-    }
-
-    fn record(&mut self, now: Instant, sample: &Sample) {
+    /// Replacing history starts over the histograms the sample measures, keeping the body size
+    /// class it did not reach.
+    fn record(&mut self, now: Instant, sample: &Sample, replace_history: bool) {
+        if replace_history {
+            self.latency = PhaseHistogram::new(now);
+            self.first_byte = PhaseHistogram::new(now);
+            *self.body_histogram(sample.body.bytes) = PhaseHistogram::new(now);
+        }
         let now = now.into_std();
         self.latency.update(now, sample.latency());
         self.first_byte.update(now, sample.first_byte);
@@ -319,7 +319,6 @@ struct BucketStats {
     active: BTreeMap<Instant, usize>,
     routing_latency: Duration,
     best_latency: Option<Duration>,
-    histograms: LatencyHistograms,
     model: LatencyModel,
     model_at: Instant,
 }
@@ -340,7 +339,6 @@ impl Default for BucketStats {
             active: BTreeMap::new(),
             routing_latency: Duration::ZERO,
             best_latency: None,
-            histograms: LatencyHistograms::new(now),
             model: LatencyModel::default(),
             model_at: now - LATENCY_SNAPSHOT_INTERVAL,
         }
@@ -357,12 +355,13 @@ impl BucketStats {
             .exp()
     }
 
-    fn model(&mut self, now: Instant) -> LatencyModel {
-        if now.duration_since(self.model_at) >= LATENCY_SNAPSHOT_INTERVAL {
-            self.model = self.histograms.model();
+    /// Whether the model is due to be summarized again, which the caller then takes on.
+    fn claim_model_refresh(&mut self, now: Instant) -> bool {
+        let due = now.duration_since(self.model_at) >= LATENCY_SNAPSHOT_INTERVAL;
+        if due {
             self.model_at = now;
         }
-        self.model
+        due
     }
 
     fn overloaded(&self, now: Instant) -> bool {
@@ -370,10 +369,6 @@ impl BucketStats {
     }
 
     fn record(&mut self, now: Instant, sample: &Sample, replace_history: bool) {
-        if replace_history {
-            self.histograms.reset_measured(now, sample);
-        }
-        self.histograms.record(now, sample);
         let latency = sample.latency();
         self.routing_latency = if replace_history || self.best_latency.is_none() {
             latency
@@ -403,7 +398,29 @@ impl BucketStats {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A bucket's statistics, with its latency histograms under their own lock so that summarizing
+/// them does not block the bucket's operations.
+#[derive(Debug, Default)]
+struct BucketState {
+    stats: Mutex<BucketStats>,
+    histograms: Mutex<LatencyHistograms>,
+}
+
+impl BucketState {
+    /// Summarizes the histograms again once the model is due, while concurrent operations keep the
+    /// previous model. The histograms stay locked until the new model is stored, so an earlier
+    /// summary never replaces a later one.
+    fn refresh_model(&self, now: Instant) {
+        if !self.stats.lock().claim_model_refresh(now) {
+            return;
+        }
+        let mut histograms = self.histograms.lock();
+        let model = histograms.model();
+        self.stats.lock().model = model;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Outcome {
     Success,
     Failure,
@@ -412,17 +429,17 @@ pub(super) enum Outcome {
 }
 
 pub(super) struct ProbePermit {
-    stats: Arc<Mutex<BucketStats>>,
+    bucket: Arc<BucketState>,
 }
 
 impl Drop for ProbePermit {
     fn drop(&mut self) {
-        self.stats.lock().probing = false;
+        self.bucket.stats.lock().probing = false;
     }
 }
 
 pub(super) struct BucketObservation {
-    stats: Arc<Mutex<BucketStats>>,
+    bucket: Arc<BucketState>,
     /// The bucket's latency model when the operation began.
     model: LatencyModel,
     /// The validated request's measurements, applied when the observation ends.
@@ -445,7 +462,7 @@ impl BucketObservation {
     }
 
     pub fn overloaded(&self) -> bool {
-        self.stats.lock().overloaded(Instant::now())
+        self.bucket.stats.lock().overloaded(Instant::now())
     }
 
     pub fn complete(mut self, outcome: Outcome) {
@@ -455,15 +472,22 @@ impl BucketObservation {
 
 impl Drop for BucketObservation {
     fn drop(&mut self) {
-        let mut stats = self.stats.lock();
+        let now = Instant::now();
+        let sample = self.sample.get();
+        if let Some(sample) = sample {
+            self.bucket
+                .histograms
+                .lock()
+                .record(now, sample, self.probe.is_some());
+        }
+        let mut stats = self.bucket.stats.lock();
         if let Some(count) = stats.active.get_mut(&self.started) {
             *count -= 1;
             if *count == 0 {
                 stats.active.remove(&self.started);
             }
         }
-        let now = Instant::now();
-        if let Some(sample) = self.sample.get() {
+        if let Some(sample) = sample {
             stats.record(now, sample, self.probe.is_some());
         }
         let Some(outcome) = self.outcome else {
@@ -524,11 +548,11 @@ fn recovery_delay() -> Duration {
 
 #[derive(Debug, Clone, Default)]
 pub struct BucketedStats {
-    by_bucket: Arc<DashMap<BucketName, Arc<Mutex<BucketStats>>>>,
+    by_bucket: Arc<DashMap<BucketName, Arc<BucketState>>>,
 }
 
 struct BucketSnapshot {
-    stats: Arc<Mutex<BucketStats>>,
+    bucket: Arc<BucketState>,
     model: LatencyModel,
     latency: Duration,
     deprioritized: bool,
@@ -642,11 +666,11 @@ impl RoutingSnapshot {
             return (winner, None);
         }
         let now = Instant::now();
-        for (index, bucket) in self.0.iter().enumerate() {
+        for (index, snapshot) in self.0.iter().enumerate() {
             if index == winner {
                 continue;
             }
-            let mut stats = bucket.stats.lock();
+            let mut stats = snapshot.bucket.stats.lock();
             let stale = stats.best_latency.is_some()
                 && now.duration_since(stats.last_outcome) >= RECOVERY_INTERVAL;
             if (stats.deprioritized || stale)
@@ -659,7 +683,7 @@ impl RoutingSnapshot {
                 return (
                     index,
                     Some(ProbePermit {
-                        stats: bucket.stats.clone(),
+                        bucket: snapshot.bucket.clone(),
                     }),
                 );
             }
@@ -681,9 +705,9 @@ impl RoutingSnapshot {
 }
 
 impl BucketedStats {
-    fn entry(&self, bucket: &BucketName) -> Arc<Mutex<BucketStats>> {
-        if let Some(stats) = self.by_bucket.get(bucket) {
-            return stats.clone();
+    fn entry(&self, bucket: &BucketName) -> Arc<BucketState> {
+        if let Some(state) = self.by_bucket.get(bucket) {
+            return state.clone();
         }
         self.by_bucket.entry(bucket.clone()).or_default().clone()
     }
@@ -693,18 +717,19 @@ impl BucketedStats {
         bucket: &BucketName,
         probe: Option<ProbePermit>,
     ) -> BucketObservation {
-        let stats = self.entry(bucket);
-        let (model, started, generation) = {
-            let mut stats = stats.lock();
-            let started = Instant::now();
+        let state = self.entry(bucket);
+        let started = Instant::now();
+        state.refresh_model(started);
+        let (model, generation) = {
+            let mut stats = state.stats.lock();
             if probe.is_some() {
                 stats.probe_after = started + recovery_delay();
             }
             *stats.active.entry(started).or_default() += 1;
-            (stats.model(started), started, stats.generation)
+            (stats.model, stats.generation)
         };
         BucketObservation {
-            stats,
+            bucket: state,
             model,
             sample: OnceLock::new(),
             started,
@@ -722,19 +747,20 @@ impl BucketedStats {
                 .iter()
                 .enumerate()
                 .map(|(index, bucket)| {
-                    let entry = self.entry(bucket);
-                    let mut stats = entry.lock();
+                    let state = self.entry(bucket);
+                    state.refresh_model(now);
+                    let stats = state.stats.lock();
                     if index == 0 {
                         preferred_latency = stats.routing_latency;
                     }
-                    let model = stats.model(now);
+                    let model = stats.model;
                     let tail = model.tail();
                     let mut latency = stats.routing_latency(now, tail.unwrap_or_default());
                     if index > 0 && tail.is_none() {
                         latency = latency.max(preferred_latency);
                     }
                     BucketSnapshot {
-                        stats: entry.clone(),
+                        bucket: state.clone(),
                         model,
                         latency: locality_adjusted(latency, index),
                         deprioritized: stats.deprioritized,
@@ -761,14 +787,16 @@ impl BucketedStats {
 
     #[cfg(test)]
     pub(super) fn model(&self, bucket: &BucketName) -> LatencyModel {
-        self.entry(bucket).lock().model(Instant::now())
+        let state = self.entry(bucket);
+        state.refresh_model(Instant::now());
+        state.stats.lock().model
     }
 
     #[cfg(test)]
     pub(super) fn simulation_histograms(&self) -> Vec<(u64, usize)> {
         self.by_bucket
             .iter()
-            .flat_map(|entry| entry.value().lock().histograms.retention())
+            .flat_map(|entry| entry.value().histograms.lock().retention())
             .collect()
     }
 
@@ -778,12 +806,14 @@ impl BucketedStats {
             .by_bucket
             .iter()
             .map(|entry| {
-                let mut stats = entry.value().lock();
-                let model = stats.model(now);
+                entry.value().refresh_model(now);
+                let stats = entry.value().stats.lock();
+                let model = stats.model;
                 let latency = model.latency.unwrap_or_default();
                 let first_byte = model.first_byte.unwrap_or_default();
                 let small_body = model.small_body.unwrap_or_default();
-                let throughput = |pace: Duration| MIB as f64 / pace.as_secs_f64();
+                let throughput =
+                    |pace: Duration| (!pace.is_zero()).then(|| MIB as f64 / pace.as_secs_f64());
                 let metrics = BucketMetrics {
                     error_rate: stats.error_rate(now),
                     deprioritized: stats.deprioritized,
@@ -795,8 +825,8 @@ impl BucketedStats {
                     first_byte_p99: first_byte.slow,
                     small_body_mean: small_body.mean,
                     small_body_p99: small_body.slow,
-                    throughput_mean: model.body_pace.map(|pace| throughput(pace.mean)),
-                    throughput_p1: model.body_pace.map(|pace| throughput(pace.slow)),
+                    throughput_mean: model.body_pace.and_then(|pace| throughput(pace.mean)),
+                    throughput_p1: model.body_pace.and_then(|pace| throughput(pace.slow)),
                 };
                 (entry.key().clone(), metrics)
             })
@@ -892,14 +922,14 @@ mod tests {
             observation.complete(Outcome::Success);
         }
         advance(Duration::from_secs(300)).await;
-        assert!(stats.entry(bucket).lock().deprioritized);
-        assert_eq!(stats.entry(bucket).lock().recovery_successes, 0);
+        assert!(stats.entry(bucket).stats.lock().deprioritized);
+        assert_eq!(stats.entry(bucket).stats.lock().recovery_successes, 0);
         for _ in 0..RECOVERY_SUCCESSES - 1 {
             stats.seed_latency(bucket, 3);
         }
-        assert!(stats.entry(bucket).lock().deprioritized);
+        assert!(stats.entry(bucket).stats.lock().deprioritized);
         stats.seed_latency(bucket, 3);
-        assert!(!stats.entry(bucket).lock().deprioritized);
+        assert!(!stats.entry(bucket).stats.lock().deprioritized);
     }
 
     #[tokio::test(start_paused = true)]
@@ -961,7 +991,7 @@ mod tests {
                 Some(Duration::from_millis(tail))
             );
             assert_eq!(
-                stats.entry(&buckets[0]).lock().best_latency,
+                stats.entry(&buckets[0]).stats.lock().best_latency,
                 Some(Duration::from_millis(3))
             );
         }
@@ -982,7 +1012,7 @@ mod tests {
                 .try_get_mut(bucket)
                 .try_unwrap()
                 .expect("metrics callbacks must not hold a map lock");
-            assert!(entry.value().try_lock().is_some());
+            assert!(entry.value().stats.try_lock().is_some());
             exported += 1;
         });
         assert_eq!(exported, buckets.len());
@@ -1049,12 +1079,44 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn bodies_too_fast_to_time_report_no_throughput() {
+        let stats = BucketedStats::default();
+        let bucket = BucketName::new("local").unwrap();
+        stats.seed(&bucket, Sample::from_millis(10, 16 * MIB, 0));
+        advance(Duration::from_secs(1)).await;
+        let metrics = exported(&stats);
+        assert_eq!(metrics.throughput_mean, None);
+        assert_eq!(metrics.throughput_p1, None);
+    }
+
+    #[test]
+    fn operations_keep_the_previous_model_while_another_summarizes() {
+        let stats = BucketedStats::default();
+        let bucket = BucketName::new("local").unwrap();
+        stats.seed_latency(&bucket, 3);
+        let previous = stats.model(&bucket);
+        stats.seed(&bucket, Sample::from_millis(3, 4 * MIB, 10));
+        let state = stats.entry(&bucket);
+        assert!(state.stats.lock().claim_model_refresh(Instant::now()));
+        let summarizing = state.histograms.lock();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| sender.send(stats.begin(&bucket, None).model()).unwrap());
+            let model = receiver.recv_timeout(Duration::from_secs(5));
+            drop(summarizing);
+            let model = model.expect("an operation waited for the model summary");
+            assert_eq!(model.tail(), previous.tail());
+            assert_eq!(model.body_tail(4 * MIB), None);
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_probe_keeps_history_for_a_size_class_it_did_not_measure() {
         let stats = BucketedStats::default();
         let bucket = BucketName::new("local").unwrap();
         stats.seed(&bucket, Sample::from_millis(3, 4 * MIB, 250));
         let probe = ProbePermit {
-            stats: stats.entry(&bucket),
+            bucket: stats.entry(&bucket),
         };
         let observation = stats.begin(&bucket, Some(probe));
         observation.record(&Sample::from_millis(9, 4096, 1));
@@ -1075,8 +1137,12 @@ mod tests {
         assert_eq!(model.body_tail(16 * MIN_THROUGHPUT_SAMPLE_BYTES), None);
         assert_eq!(model.reached_tail(None), Some(Duration::from_millis(20)));
         assert_eq!(
-            model.reached_tail(Some(16 * MIN_THROUGHPUT_SAMPLE_BYTES)),
+            model.reached_tail(Some(4096)),
             Some(Duration::from_millis(23))
+        );
+        assert_eq!(
+            model.reached_tail(Some(16 * MIN_THROUGHPUT_SAMPLE_BYTES)),
+            None
         );
 
         stats.seed(
@@ -1164,7 +1230,7 @@ mod tests {
             let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
             assert_eq!(index, 0);
             assert!(probe.is_none());
-            assert!(!stats.entry(&buckets[0]).lock().deprioritized);
+            assert!(!stats.entry(&buckets[0]).stats.lock().deprioritized);
         }
     }
 }

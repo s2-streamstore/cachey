@@ -81,7 +81,6 @@ impl RequestConfig {
         self == &Self::default()
     }
 
-    /// This config limited to one SDK attempt, as hedges use.
     #[must_use]
     pub(super) fn single_attempt(&self) -> Self {
         Self {

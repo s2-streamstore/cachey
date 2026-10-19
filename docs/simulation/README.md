@@ -68,8 +68,11 @@ are sampled after every read; reports give the final values and the slowest seen
 The model omits connection setup, network contention, and interactions among cachey
 instances. Millisecond timing and prescribed service distributions limit conclusions
 about real S3 or Capacitor latency. Whole-millisecond timing makes responses land
-exactly on a learned tail far more often than real ones do; hedges start only once a
-phase has taken strictly longer than its tail, so such ties do not spend the budget.
+exactly on a learned tail far more often than real ones do. Each server fixes its
+response schedule when it starts serving, and the reading task delivers headers and
+body chunks on its own timers, so a response landing on the tail reaches the
+downloader before a hedge timer firing on the same tick, and such ties do not spend
+the budget.
 
 Compare revisions with the same harness, fixtures, and controls; retain patches for
 dirty trees. Assess completion first, then latency and extra backend work. See the
