@@ -160,12 +160,16 @@ impl LatencyModel {
     }
 
     /// Slow time to finish the phases a request reached: response headers, then any body whose
-    /// length they announced.
+    /// length they announced. A body in a size class the bucket has not served falls back to the
+    /// slow complete request latency across the sizes it has.
     pub fn reached_tail(&self, announced_body_bytes: Option<u64>) -> Option<Duration> {
         let first_byte = self.first_byte_tail()?;
         match announced_body_bytes {
             None => Some(first_byte),
-            Some(bytes) => Some(first_byte.saturating_add(self.body_tail(bytes)?)),
+            Some(bytes) => self
+                .body_tail(bytes)
+                .map(|body| first_byte.saturating_add(body))
+                .or_else(|| self.tail()),
         }
     }
 
@@ -1083,7 +1087,7 @@ mod tests {
         assert_eq!(model.reached_tail(None), Some(Duration::from_millis(20)));
         assert_eq!(
             model.reached_tail(Some(16 * MIN_THROUGHPUT_SAMPLE_BYTES)),
-            None
+            Some(Duration::from_millis(23))
         );
 
         stats.seed(

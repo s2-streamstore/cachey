@@ -221,14 +221,6 @@ impl Scenario {
             .unwrap_or(self.read_body_bytes(seed, read) as u64)
     }
 
-    pub fn min_request_bytes(&self) -> u64 {
-        self.request_bytes.unwrap_or_else(|| {
-            self.short_body
-                .as_ref()
-                .map_or(self.body_bytes, |short| short.bytes) as u64
-        })
-    }
-
     pub fn reads(&self) -> usize {
         self.duration_ms.div_ceil(self.interval_ms) as usize
     }

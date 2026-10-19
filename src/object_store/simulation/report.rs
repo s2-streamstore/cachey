@@ -135,6 +135,7 @@ pub struct Report {
     pub transport_attempts: usize,
     sdk_invocations: usize,
     peak_copy_operations: usize,
+    peak_copy_bytes: u64,
     peak_transport_concurrency: usize,
     peak_server_concurrency: usize,
     peak_server_queue: usize,
@@ -174,6 +175,7 @@ impl Report {
         reads: Vec<Read>,
         copies: Vec<Copy>,
         peak_copies: usize,
+        peak_bytes: u64,
         state: &State,
         last_read_us: u64,
         mut histograms: Vec<(u64, usize)>,
@@ -190,7 +192,7 @@ impl Report {
         }
         let completed = reads.iter().filter(|read| read.error.is_none()).count();
         assert!(peak_copies <= scenario.max_inflight_requests as usize);
-        assert!(peak_copies as u64 * scenario.min_request_bytes() <= scenario.max_inflight_bytes);
+        assert!(peak_bytes <= scenario.max_inflight_bytes);
         let service_after = |transport: &Transport, time: u64| {
             transport.service_start_us.map_or(0, |start| {
                 transport
@@ -297,6 +299,7 @@ impl Report {
                 .filter(|transport| transport.attempt == 1)
                 .count(),
             peak_copy_operations: peak_copies,
+            peak_copy_bytes: peak_bytes,
             peak_transport_concurrency: state.peak_client,
             peak_server_concurrency: state.peak_server,
             peak_server_queue: state.peak_queued,

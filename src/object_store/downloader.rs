@@ -446,14 +446,18 @@ impl Downloader {
         observation: &BucketObservation,
         timeline: &RequestTimeline,
     ) -> Result<ObjectPiece, DownloadError> {
+        #[cfg(test)]
+        let _simulation_copy = crate::object_store::simulation::record_copy(
+            request.object,
+            request.bucket,
+            request.bytes(),
+        );
         let PieceRequest {
             bucket,
             object,
             range: byterange,
             config: req_config,
         } = request;
-        #[cfg(test)]
-        let _simulation_copy = crate::object_store::simulation::record_copy(object, bucket);
         let request = self
             .s3
             .get_object()
