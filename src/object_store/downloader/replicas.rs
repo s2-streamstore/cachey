@@ -30,6 +30,7 @@ type Completion = (usize, Result<ObjectPiece, DownloadError>);
 struct FallbackErrors {
     last_error: Option<DownloadError>,
     largest_object_size: Option<u64>,
+    retry_budget_exhausted: bool,
 }
 
 impl FallbackErrors {
@@ -58,17 +59,25 @@ impl FallbackErrors {
         }
     }
 
-    fn into_error(mut self) -> Option<DownloadError> {
+    fn into_error(mut self) -> DownloadError {
         if let Some(DownloadError::RangeNotSatisfied { object_size, .. }) = &mut self.last_error {
             *object_size = self.largest_object_size;
         }
-        self.last_error
+        match self.last_error {
+            None | Some(DownloadError::NoSuchKey) if self.retry_budget_exhausted => {
+                DownloadError::Overloaded(
+                    "Replica retry budget exhausted during widespread overload".to_owned(),
+                )
+            }
+            Some(error) => error,
+            None => DownloadError::Unknown("No replica could complete the read".to_owned()),
+        }
     }
 }
 
-pub(super) struct AttemptPermits {
-    pub admission: DownloadPermit,
-    pub hedge: Option<HedgePermit>,
+struct AttemptPermits {
+    admission: DownloadPermit,
+    hedge: Option<HedgePermit>,
 }
 
 struct PrimaryAttempt {
@@ -160,6 +169,8 @@ impl ReplicaRequest<'_> {
 }
 
 impl Downloader {
+    /// A single bucket hedges against itself, and an error that another copy from the same bucket
+    /// would repeat ends the read.
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -168,6 +179,7 @@ impl Downloader {
         deadline: Instant,
     ) -> Result<DownloadOutput, DownloadError> {
         let bytes = request.bytes();
+        let single_bucket = buckets.len() == 1;
         let request = ReplicaRequest {
             downloader: self,
             buckets,
@@ -200,7 +212,6 @@ impl Downloader {
         let mut active = FuturesUnordered::new();
         active.push(request.attempt(primary, Some(&primary_timeline), probe, primary_permits));
         let mut fallback_errors = FallbackErrors::default();
-        let mut retry_budget_exhausted = false;
         while !active.is_empty() {
             let next_rescue = rescues
                 .front()
@@ -211,7 +222,11 @@ impl Downloader {
                     match result {
                         Ok(piece) => return Ok(request.output(piece, primary, index, start)),
                         Err(error) => {
-                            if !error.should_attempt_fallback_bucket() { return Err(error); }
+                            if !error.should_attempt_fallback_bucket()
+                                || (single_bucket && !error.should_wait_for_hedged_peer())
+                            {
+                                return Err(error);
+                            }
                             fallback_errors.record(error);
                             hedge.disarm();
                         }
@@ -233,11 +248,14 @@ impl Downloader {
             if remaining.is_zero() || (early && overloaded) {
                 continue;
             }
-            let Some(index) = scheduled.or_else(|| routing.best(&tried, remaining)) else {
+            let Some(index) = scheduled
+                .or_else(|| routing.best(&tried, remaining))
+                .or_else(|| (early && single_bucket).then_some(primary))
+            else {
                 continue;
             };
             if overloaded && !self.attempt_budget.try_retry() {
-                retry_budget_exhausted = true;
+                fallback_errors.retry_budget_exhausted = true;
                 continue;
             }
             let permits = if early {
@@ -255,18 +273,10 @@ impl Downloader {
             tried[index] = true;
             active.push(request.attempt(index, None, None, permits));
         }
-        Err(match fallback_errors.into_error() {
-            None | Some(DownloadError::NoSuchKey) if retry_budget_exhausted => {
-                DownloadError::Overloaded(
-                    "Replica retry budget exhausted during widespread overload".to_owned(),
-                )
-            }
-            Some(error) => error,
-            None => DownloadError::Unknown("No replica could complete the read".to_owned()),
-        })
+        Err(fallback_errors.into_error())
     }
 
-    pub(super) fn hedge_permits(
+    fn hedge_permits(
         &self,
         bucket: &crate::types::BucketName,
         bytes: u64,
@@ -343,7 +353,7 @@ mod tests {
         for error in errors {
             fallback_errors.record(error);
         }
-        let actual = fallback_errors.into_error().unwrap();
+        let actual = fallback_errors.into_error();
         assert_eq!(discriminant(&actual), discriminant(expected), "{actual:?}");
         assert_eq!(actual.to_string(), expected.to_string());
     }

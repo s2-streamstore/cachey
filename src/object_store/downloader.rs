@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc, task::Poll, time::Duration};
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use aws_sdk_s3::{
     error::{ProvideErrorMetadata, SdkError},
@@ -102,22 +102,6 @@ impl DownloadError {
             }
             Self::Timeout { timeout, .. } if *timeout >= expected => Outcome::Failure,
             _ => Outcome::Neutral,
-        }
-    }
-
-    /// The most conclusive error when both copies of a single-bucket hedge fail. An error that
-    /// waiting would not change outweighs a transient one, which outweighs a timeout; between
-    /// equals the primary's is kept.
-    fn of_hedged_pair(primary: Self, secondary: Self) -> Self {
-        let rank = |error: &Self| match error {
-            Self::Timeout { .. } => 0,
-            error if error.should_wait_for_hedged_peer() => 1,
-            _ => 2,
-        };
-        if rank(&secondary) > rank(&primary) {
-            secondary
-        } else {
-            primary
         }
     }
 }
@@ -344,114 +328,11 @@ impl Downloader {
             range: byterange,
             config: req_config,
         };
-        let output = if buckets.len() == 1 {
-            let (piece, hedged) = self.fetch_with_hedge(request, deadline).await?;
-            DownloadOutput {
-                piece,
-                primary_bucket_idx: 0,
-                used_bucket_idx: 0,
-                latency: start.elapsed(),
-                hedged,
-            }
-        } else {
-            self.download_replicas(buckets, request, start, deadline)
-                .await?
-        };
+        let output = self
+            .download_replicas(buckets, request, start, deadline)
+            .await?;
         self.attempt_budget.observe_success();
         Ok(output)
-    }
-
-    /// Each copy of a single-bucket hedge is its own bucket operation, bounded by the primary's
-    /// bucket deadline. A copy that fails while its peer may still succeed waits for the peer.
-    async fn fetch_with_hedge(
-        &self,
-        request: PieceRequest<'_>,
-        deadline: Instant,
-    ) -> Result<(ObjectPiece, bool), DownloadError> {
-        let admission = self.admission.acquire(request.bytes(), deadline).await?;
-        let now = Instant::now();
-        let bucket_deadline = now
-            + self
-                .limits
-                .bucket_timeout
-                .min(deadline.saturating_duration_since(now));
-        let timeline = RequestTimeline::default();
-        let primary = BucketOperation {
-            downloader: self,
-            request,
-            timeline: &timeline,
-            deadline: bucket_deadline,
-            unknown_latency: self.limits.page_timeout,
-            probe: None,
-        }
-        .execute(Some(admission), async || {
-            self.fetch_piece(request, &timeline).await
-        });
-        tokio::pin!(primary);
-        let mut hedge = HedgeTimer::new(
-            self.bucketed_stats.model(request.bucket),
-            &timeline,
-            bucket_deadline,
-            self.limits.hedge_budget_percent > 0,
-        );
-        let permits = loop {
-            select! {
-                biased;
-                result = &mut primary => return result.map(|piece| (piece, false)),
-                () = hedge.due() => {},
-            }
-            if !self.bucketed_stats.overloaded(request.bucket)
-                && let Some(permits) = self.hedge_permits(request.bucket, request.bytes())
-            {
-                break permits;
-            }
-        };
-        let hedge_config = request.config.single_attempt();
-        let hedge_request = PieceRequest {
-            config: &hedge_config,
-            ..request
-        };
-        let hedge_timeline = RequestTimeline::default();
-        let mut secondary = Box::pin(async {
-            let _hedge = permits.hedge;
-            BucketOperation {
-                downloader: self,
-                request: hedge_request,
-                timeline: &hedge_timeline,
-                deadline: bucket_deadline,
-                unknown_latency: self.limits.page_timeout,
-                probe: None,
-            }
-            .execute(Some(permits.admission), async || {
-                self.fetch_piece(hedge_request, &hedge_timeline).await
-            })
-            .await
-        });
-        // The secondary is polled once first so the hedge its permits paid for always starts, then
-        // the primary first so that a primary finishing alongside its hedge is not superseded.
-        let (primary_finished, result) = match futures::poll!(secondary.as_mut()) {
-            Poll::Ready(result) => (false, result),
-            Poll::Pending => select! {
-                biased;
-                result = &mut primary => (true, result),
-                result = &mut secondary => (false, result),
-            },
-        };
-        let result = match result {
-            Err(error) if error.should_wait_for_hedged_peer() => {
-                if primary_finished {
-                    secondary.await.map_err(|secondary_error| {
-                        DownloadError::of_hedged_pair(error, secondary_error)
-                    })
-                } else {
-                    primary.await.map_err(|primary_error| {
-                        DownloadError::of_hedged_pair(primary_error, error)
-                    })
-                }
-            }
-            result => result,
-        };
-        result.map(|piece| (piece, true))
     }
 
     async fn fetch_piece(
@@ -1016,48 +897,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hedged_pair_reports_the_most_conclusive_error_or_the_primarys() {
-        let timeout = |bucket: &str| DownloadError::Timeout {
-            bucket: BucketName::new(bucket).unwrap(),
-            timeout: Duration::from_millis(50),
-        };
-        let streaming = || DownloadError::BodyStreaming("reset".to_owned());
-        for (primary, secondary, expected) in [
-            (streaming(), timeout("secondary"), streaming()),
-            (timeout("primary"), streaming(), streaming()),
-            (timeout("primary"), timeout("secondary"), timeout("primary")),
-            (
-                DownloadError::Overloaded("primary".to_owned()),
-                streaming(),
-                DownloadError::Overloaded("primary".to_owned()),
-            ),
-            (
-                streaming(),
-                DownloadError::NoSuchKey,
-                DownloadError::NoSuchKey,
-            ),
-            (
-                DownloadError::Overloaded("primary".to_owned()),
-                DownloadError::NoSuchKey,
-                DownloadError::NoSuchKey,
-            ),
-            (
-                timeout("primary"),
-                DownloadError::NoSuchKey,
-                DownloadError::NoSuchKey,
-            ),
-            (
-                DownloadError::NoSuchKey,
-                streaming(),
-                DownloadError::NoSuchKey,
-            ),
-        ] {
-            let reported = DownloadError::of_hedged_pair(primary, secondary);
-            assert_eq!(reported.to_string(), expected.to_string());
-        }
-    }
-
     #[tokio::test(start_paused = true)]
     async fn a_conclusive_hedge_error_does_not_hide_its_peers_overload() {
         let (downloader, script) = scripted_downloader([
@@ -1080,7 +919,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_primary_failure_survives_the_bucket_deadline_while_its_hedge_runs() {
+    async fn a_primary_failure_survives_its_hedges_timeout() {
         let (downloader, script) =
             scripted_downloader([("bucket", 1, 92, true), ("bucket", 100, 0, false)]);
         let downloader = downloader
@@ -1099,7 +938,7 @@ mod tests {
             matches!(result, Err(DownloadError::BodyStreaming(_))),
             "{result:?}"
         );
-        assert_eq!(start.elapsed(), Duration::from_millis(95));
+        assert_eq!(start.elapsed(), Duration::from_millis(91 + 95));
         assert!(metrics(&downloader, "bucket").await.deprioritized);
         assert_eq!(script.requests.load(Ordering::SeqCst), 2);
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
@@ -1796,9 +1635,10 @@ mod tests {
         .await;
         assert!(matches!(result, Err(DownloadError::Timeout { .. })));
         assert_eq!(script.requests.load(Ordering::SeqCst), 0);
-        let mut count = 0;
-        downloader.observe_bucket_metrics(|_, _| count += 1);
-        assert_eq!(count, 0);
+        let local = metrics(&downloader, "local").await;
+        assert!(!local.deprioritized);
+        assert_eq!(local.consecutive_failures, 0);
+        assert!(local.error_rate.abs() < f64::EPSILON);
         assert!(downloader.admission.try_acquire(4).is_some());
     }
     #[tokio::test(start_paused = true)]

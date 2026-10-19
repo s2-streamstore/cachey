@@ -62,13 +62,11 @@ hedge supersedes are not measured, so stalls and slow transfers keep being hedge
 they outgrow the budget, instead of pulling the hedge delay up to their own duration. A
 phase whose tail is zero, or a body in a size class the bucket has not yet served, is
 not hedged early. Each phase is one opportunity, so a hedge that cannot start before
-headers may still start during the body. Each copy of a single-bucket hedge is its own
-bucket operation, bounded by the primary's bucket deadline, and records its own health
-outcome, as copies on different buckets do, so throttling or a failure in one copy counts
-even when its peer succeeds. A copy that fails transiently waits for its peer. If both
-copies fail, an error that waiting would not change, such as a missing object, is
-reported over a transient failure, and a transient failure over a timeout; between
-equals, the primary's error is reported. By default, the shared
+headers may still start during the body. A single-bucket read hedges against its own
+bucket under the same rules: each copy records its own health outcome, so throttling or
+a failure in one copy counts even when its peer succeeds, and a copy that fails
+transiently waits for its peer. An error that another copy from the same bucket would
+repeat, such as a missing object, ends the read. By default, the shared
 budget permits one startup hedge and earns another per 20 successful pages. Setting
 the budget to zero disables early hedges; fallback and deadline rescue remain
 available. When every bucket has recently reported overload, early hedges stop and
@@ -122,7 +120,7 @@ an authoritative size or replica agreement.
 In-flight stalls and canceled reads can raise routing latency estimates without
 adding latency samples. Bucket latency samples come from each validated backend
 request, including hedges; copies canceled because another copy succeeded add none.
-Page latency for a single-bucket hedge win is timed from the original primary start.
+Page latency for a hedge win is timed from the original primary start.
 Latency histograms exclude client body transmission.
 
 `DownloadOutput` reports the initial and winning buckets. `hedged` means copies

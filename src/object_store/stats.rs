@@ -776,12 +776,9 @@ impl BucketedStats {
         self.seed(bucket, Sample::from_millis(millis, 4, 0));
     }
 
+    #[cfg(test)]
     pub(super) fn model(&self, bucket: &BucketName) -> LatencyModel {
         self.entry(bucket).lock_stats(Instant::now()).model
-    }
-
-    pub(super) fn overloaded(&self, bucket: &BucketName) -> bool {
-        self.entry(bucket).stats.lock().overloaded(Instant::now())
     }
 
     #[cfg(test)]
