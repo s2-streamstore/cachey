@@ -983,7 +983,7 @@ mod tests {
             assert!(threshold > previous);
             let output = fetch(&downloader, &["bucket"]).await;
             assert!(output.hedged);
-            assert_eq!(output.latency, threshold + Duration::from_millis(50));
+            assert_eq!(output.latency, threshold + Duration::from_millis(51));
             previous = threshold;
         }
     }
@@ -997,9 +997,9 @@ mod tests {
         let output = fetch(&downloader, &["local", "peer"]).await;
         assert_eq!(output.used_bucket_idx, 1);
         assert!(output.hedged);
-        assert_eq!(output.latency, Duration::from_millis(20));
+        assert_eq!(output.latency, Duration::from_millis(21));
         let local = metrics(&downloader, "local").await;
-        assert_eq!(local.first_byte_p99, Duration::from_millis(20));
+        assert_eq!(local.first_byte_p99, Duration::from_millis(21));
         assert_eq!(local.latency_p99, Duration::from_millis(10));
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
@@ -1008,7 +1008,7 @@ mod tests {
     async fn a_failed_copy_releases_its_admission_while_its_peer_continues() {
         for (primary, hedge, elapsed_ms) in [
             (("bucket", 5, 300, false), ("bucket", 1, 1, true), 305),
-            (("bucket", 5, 120, true), ("bucket", 1, 300, false), 396),
+            (("bucket", 5, 120, true), ("bucket", 1, 300, false), 397),
         ] {
             let (downloader, script) =
                 scripted_downloader([("bucket", 10, 90, false), primary, hedge]);
@@ -1157,7 +1157,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn either_peer_can_recover_a_body_failure() {
         for (primary, hedge, elapsed_ms) in [
-            (("bucket", 10, 100, true), ("bucket", 10, 20, false), 130),
+            (("bucket", 10, 100, true), ("bucket", 10, 20, false), 131),
             (("bucket", 10, 190, false), ("bucket", 5, 10, true), 200),
         ] {
             let downloader = downloader([("bucket", 10, 90, false), primary, hedge]);
@@ -1180,7 +1180,7 @@ mod tests {
         let output = fetch(&downloader, &["primary", "fallback"]).await;
         assert_eq!(output.used_bucket_idx, 1);
         assert!(output.hedged, "the failed first bucket started a hedge");
-        assert_eq!(output.latency, Duration::from_millis(130));
+        assert_eq!(output.latency, Duration::from_millis(131));
         let primary = metrics(&downloader, "primary").await;
         assert_eq!(primary.consecutive_failures, 1);
         assert_eq!(primary.small_body_mean, Duration::from_millis(90));
@@ -1330,7 +1330,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn sdk_timeout_does_not_cancel_a_viable_hedged_peer() {
         for (primary, hedge, elapsed_ms) in [
-            (("local", 100, 0, false), ("local", 7, 0, false), 12),
+            (("local", 100, 0, false), ("local", 7, 0, false), 13),
             (("local", 0, 20, false), ("local", 100, 0, false), 20),
         ] {
             let downloader = downloader([primary, hedge]);
@@ -1444,7 +1444,7 @@ mod tests {
         assert!(!fetch(&downloader, &["bucket"]).await.hedged);
         let output = fetch(&downloader, &["bucket"]).await;
         assert!(output.hedged);
-        assert_eq!(output.latency, Duration::from_millis(130));
+        assert_eq!(output.latency, Duration::from_millis(131));
         assert_eq!(script.requests.load(Ordering::SeqCst), 6);
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }

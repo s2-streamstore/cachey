@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::{sync::OnceLock, time::Duration};
 
 use tokio::{
     select,
@@ -66,6 +66,10 @@ impl RequestTimeline {
     }
 }
 
+/// A phase is late only once it has taken strictly longer than its tail, so a response that arrives
+/// exactly at the tail does not start a hedge.
+const LATE_BY: Duration = Duration::from_micros(1);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     FirstByte,
@@ -108,12 +112,17 @@ impl<'a> HedgeTimer<'a> {
                 let body_tail = self.model.body_tail(headers.body_bytes)?;
                 (
                     Phase::Body,
-                    headers.at.checked_add(body_tail.max(first_byte_tail))?,
+                    headers
+                        .at
+                        .checked_add(body_tail.max(first_byte_tail) + LATE_BY)?,
                 )
             }
             (Phase::FirstByte, None) => (
                 Phase::FirstByte,
-                self.primary.started.get()?.checked_add(first_byte_tail)?,
+                self.primary
+                    .started
+                    .get()?
+                    .checked_add(first_byte_tail + LATE_BY)?,
             ),
             (Phase::Body, None) => return None,
         };
@@ -192,7 +201,7 @@ mod tests {
             },
             timer.due(),
         );
-        assert_eq!(start.elapsed(), Duration::from_millis(70));
+        assert_eq!(start.elapsed(), Duration::from_millis(71));
     }
 
     #[tokio::test(start_paused = true)]
@@ -200,16 +209,18 @@ mod tests {
         let timeline = RequestTimeline::default();
         let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline());
         timeline.start();
-        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
+        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(21)));
         sleep(Duration::from_millis(10)).await;
         timeline.receive_headers(4096);
-        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
+        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(21)));
         assert_eq!(due_after(&mut timer).await, None);
     }
 
     #[tokio::test(start_paused = true)]
     async fn bodies_are_hedged_by_their_announced_size_class() {
-        for (large_body_ms, expected) in [(None, None), (Some(250), Some(Duration::from_secs(1)))] {
+        for (large_body_ms, expected) in
+            [(None, None), (Some(250), Some(Duration::from_millis(1001)))]
+        {
             let model = match large_body_ms {
                 None => model(20, 4096, 3),
                 Some(body_ms) => model(20, 4 * MIB, body_ms),

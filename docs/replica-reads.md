@@ -48,8 +48,8 @@ result wins and cancels the others.
 
 Early hedges are timed in two phases and use one SDK attempt, against another bucket
 when available or the same bucket otherwise. Before response headers arrive, a hedge
-starts at the p99 time to first byte after the primary request starts, excluding
-admission wait. Once headers arrive, the hedge is rearmed for the announced body
+starts once the primary request has waited longer than the p99 time to first byte,
+excluding admission wait. Once headers arrive, the hedge is rearmed for the announced body
 length: it starts when the body has taken longer than both its p99 body time and the
 p99 time to first byte. A body in a size class the bucket has not yet served is not
 hedged early. Each phase is one opportunity, so a hedge that cannot start before
