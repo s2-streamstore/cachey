@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/s2-streamstore/cachey/compare/0.11.4...0.12.0) - 2026-10-20
+
+### Other
+
+- harden release workflow with trusted publishing ([#180](https://github.com/s2-streamstore/cachey/pull/180))
+- *(deps)* upgrade dependencies and fix webpki advisories ([#179](https://github.com/s2-streamstore/cachey/pull/179))
+- *(simulation)* organize fixtures by backend and model time before headers ([#177](https://github.com/s2-streamstore/cachey/pull/177))
+- *(simulation)* model mixed response sizes and resolve same-tick ties ([#173](https://github.com/s2-streamstore/cachey/pull/173))
+- *(metrics)* [**breaking**] follow Prometheus naming conventions ([#172](https://github.com/s2-streamstore/cachey/pull/172))
+
 ## [0.11.4](https://github.com/s2-streamstore/cachey/compare/0.11.3...0.11.4) - 2026-10-17
 
 ### Other
