@@ -7,6 +7,12 @@ health, then recent request latency. The first client-supplied bucket has a loca
 preference: its latency is compared with 1.5 times each alternative's. Every supplied
 bucket remains eligible for fallback.
 
+A bucket's request latency for selection averages its measured requests, and copies
+left unmeasured, such as stalls or canceled reads, can raise it. A rise above the
+bucket's measured mean decays with the latency model's 5-second half-life, so a bucket
+that lost preference to one outlier regains it without first receiving reads. A bucket
+never measured keeps its rise.
+
 ## Latency model
 
 Pages are requested whole, so a response's length is unknown until its headers arrive.

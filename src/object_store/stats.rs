@@ -417,6 +417,7 @@ struct BucketStats {
     overload_until: Instant,
     active: BTreeMap<Instant, usize>,
     routing_latency: Duration,
+    routing_updated_at: Instant,
     best_latency: Option<Duration>,
     estimates: LatencyEstimates,
     summarized_at: Instant,
@@ -437,6 +438,7 @@ impl Default for BucketStats {
             overload_until: now,
             active: BTreeMap::new(),
             routing_latency: Duration::ZERO,
+            routing_updated_at: now,
             best_latency: None,
             estimates: LatencyEstimates::new(now),
             summarized_at: now,
@@ -473,24 +475,42 @@ impl BucketStats {
     /// measured, so a recovered bucket is judged by its probe.
     fn record(&mut self, now: Instant, sample: &Sample, replace_history: bool) {
         let latency = sample.latency();
-        if replace_history {
-            self.estimates = LatencyEstimates::new(now);
-        }
         self.routing_latency = if replace_history || self.best_latency.is_none() {
             latency
         } else {
-            self.routing_latency.mul_f64(1.0 - LATENCY_ALPHA) + latency.mul_f64(LATENCY_ALPHA)
+            self.current_routing_latency(now)
+                .mul_f64(1.0 - LATENCY_ALPHA)
+                + latency.mul_f64(LATENCY_ALPHA)
         };
+        self.routing_updated_at = now;
+        if replace_history {
+            self.estimates = LatencyEstimates::new(now);
+        }
         self.best_latency = Some(self.best_latency.map_or(latency, |best| best.min(latency)));
         self.estimates.record(now, sample);
     }
 
     /// A copy left unmeasured, whether unfinished or validated without a sample, can raise the
     /// routing latency toward its duration but never lower it.
-    fn raise_routing_latency(&mut self, elapsed: Duration) {
-        self.routing_latency += elapsed
-            .saturating_sub(self.routing_latency)
-            .mul_f64(LATENCY_ALPHA);
+    fn raise_routing_latency(&mut self, now: Instant, elapsed: Duration) {
+        let current = self.current_routing_latency(now);
+        self.routing_latency = current + elapsed.saturating_sub(current).mul_f64(LATENCY_ALPHA);
+        self.routing_updated_at = now;
+    }
+
+    /// Routing latency above the bucket's measured mean decays toward it with the latency
+    /// half-life, so a rise fades even while the bucket receives no copies to lower it. A bucket
+    /// without measurements keeps its rise.
+    fn current_routing_latency(&self, now: Instant) -> Duration {
+        let Some(mean) = self.estimates.latency.summary.map(Summary::mean_duration) else {
+            return self.routing_latency;
+        };
+        let excess = self.routing_latency.saturating_sub(mean);
+        if excess.is_zero() {
+            return self.routing_latency;
+        }
+        let elapsed = now.saturating_duration_since(self.routing_updated_at);
+        mean + excess.mul_f64((-LATENCY_DECAY * elapsed.as_secs_f64()).exp())
     }
 
     fn routing_latency(&self, now: Instant, tail: Duration) -> Duration {
@@ -503,10 +523,10 @@ impl BucketStats {
             }
             count += active;
             if count >= 3 {
-                return self.routing_latency.max(elapsed);
+                return self.current_routing_latency(now).max(elapsed);
             }
         }
-        self.routing_latency
+        self.current_routing_latency(now)
     }
 }
 
@@ -555,7 +575,7 @@ impl Drop for BucketObservation {
         }
         let elapsed = now.duration_since(self.started);
         let Some(outcome) = self.outcome else {
-            stats.raise_routing_latency(elapsed);
+            stats.raise_routing_latency(now, elapsed);
             return;
         };
         let error_rate = stats.error_rate(now);
@@ -563,7 +583,7 @@ impl Drop for BucketObservation {
             Outcome::Success(sample) => {
                 match &sample {
                     Some(sample) => stats.record(now, sample, self.probe.is_some()),
-                    None => stats.raise_routing_latency(elapsed),
+                    None => stats.raise_routing_latency(now, elapsed),
                 }
                 if self.generation == stats.generation {
                     stats.error_rate = error_rate * (1.0 - ERROR_ALPHA);
@@ -810,10 +830,10 @@ impl BucketedStats {
                 .map(|(index, bucket)| {
                     let state = self.entry(bucket);
                     let mut stats = state.lock();
-                    if index == 0 {
-                        preferred_latency = stats.routing_latency;
-                    }
                     let model = stats.model(now);
+                    if index == 0 {
+                        preferred_latency = stats.current_routing_latency(now);
+                    }
                     let tail = model.tail();
                     let mut latency = stats.routing_latency(now, tail.unwrap_or_default());
                     if index > 0 && tail.is_none() {
@@ -1299,6 +1319,23 @@ mod tests {
             stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
             Some(0)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_outlier_stops_steering_reads_away_once_its_rise_decays() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for (bucket, millis) in buckets.iter().zip([3, 4, 5]) {
+            stats.seed_latency(bucket, millis);
+        }
+        let best = || stats.snapshot(&buckets).best(&[], Duration::from_secs(1));
+        assert_eq!(best(), Some(0));
+        let stall = stats.begin(&buckets[0], None);
+        advance(Duration::from_millis(100)).await;
+        drop(stall);
+        assert_eq!(best(), Some(1));
+        advance(Duration::from_secs(10)).await;
+        assert_eq!(best(), Some(0));
     }
 
     #[tokio::test(start_paused = true)]
