@@ -4,12 +4,16 @@ use serde::{Deserialize, Serialize};
 use crate::{object_store::DownloadLimits, service::PAGE_SIZE};
 
 const SHORT_BODY_DOMAIN: u64 = 2000;
+const SHORT_BODY_LENGTH_DOMAIN: u64 = 2001;
 const PPM: u32 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Replica {
     pub headers_ms: u64,
+    /// Header time added per MiB of response, as for a server that reads the whole response before
+    /// sending headers.
+    pub headers_ms_per_mib: u64,
     pub body_ms: u64,
     /// Body time added per MiB of response, so larger bodies take proportionally longer.
     pub body_ms_per_mib: u64,
@@ -20,8 +24,9 @@ pub struct Replica {
 impl Default for Replica {
     fn default() -> Self {
         Self {
-            headers_ms: 1,
-            body_ms: 2,
+            headers_ms: 3,
+            headers_ms_per_mib: 0,
+            body_ms: 0,
             body_ms_per_mib: 0,
             slots: 1024,
             queue: 1024,
@@ -30,6 +35,10 @@ impl Default for Replica {
 }
 
 impl Replica {
+    pub fn headers_ms(&self, body_bytes: usize) -> u64 {
+        self.headers_ms + self.headers_ms_per_mib * body_bytes as u64 / MIB
+    }
+
     pub fn body_ms(&self, body_bytes: usize) -> u64 {
         self.body_ms + self.body_ms_per_mib * body_bytes as u64 / MIB
     }
@@ -41,6 +50,9 @@ impl Replica {
 #[serde(deny_unknown_fields)]
 pub struct ShortBody {
     pub bytes: usize,
+    /// Spreads short responses uniformly from `bytes` up to, but excluding, this length, as the
+    /// last pages of objects of varied sizes are.
+    pub max_bytes: Option<usize>,
     pub probability_ppm: u32,
 }
 
@@ -126,11 +138,11 @@ impl Default for Scenario {
             replicas: vec![
                 Replica::default(),
                 Replica {
-                    body_ms: 4,
+                    headers_ms: 5,
                     ..Replica::default()
                 },
                 Replica {
-                    body_ms: 5,
+                    headers_ms: 6,
                     ..Replica::default()
                 },
             ],
@@ -159,7 +171,12 @@ impl Scenario {
                 && self.body_bytes as u64 <= PAGE_SIZE
                 && self.chunks > 0
                 && self.short_body.as_ref().is_none_or(|short| {
-                    short.bytes > 0 && short.bytes < self.body_bytes && short.probability_ppm <= PPM
+                    short.bytes > 0
+                        && short.bytes < self.body_bytes
+                        && short
+                            .max_bytes
+                            .is_none_or(|max| max > short.bytes && max <= self.body_bytes)
+                        && short.probability_ppm <= PPM
                 }),
             "invalid body shape"
         );
@@ -208,7 +225,11 @@ impl Scenario {
                     short.probability_ppm,
                 ) =>
             {
-                short.bytes
+                short.max_bytes.map_or(short.bytes, |max| {
+                    let spread = draw(seed, read, 0, 0, 0, SHORT_BODY_LENGTH_DOMAIN)
+                        % (max - short.bytes) as u64;
+                    short.bytes + spread as usize
+                })
             }
             _ => self.body_bytes,
         }

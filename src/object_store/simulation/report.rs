@@ -89,8 +89,9 @@ pub struct Report {
     fault_window_arrivals: usize,
     fault_window_failures: usize,
     success_latency: Latency,
+    /// Successful latency of full and short responses, in fixtures with short bodies.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    success_latency_by_body_bytes: BTreeMap<usize, Latency>,
+    success_latency_by_response: BTreeMap<&'static str, Latency>,
     all_arrival_latency: Latency,
     copy_operations: usize,
     pub transport_attempts: usize,
@@ -110,7 +111,7 @@ pub struct Report {
     produced_bytes: u64,
     delivered_bytes: u64,
     useful_bytes: u64,
-    overlapping_reads: usize,
+    pub overlapping_reads: usize,
     wins_by_replica: Vec<usize>,
     pub recoveries: Vec<Recovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,11 +193,15 @@ impl Report {
                 .any(|fault| (fault.start_ms..fault.end_ms).contains(&(read.arrival_us / 1000)))
         };
         histograms.sort_unstable();
-        let mut latency_by_body_bytes = BTreeMap::<usize, Vec<u64>>::new();
+        let mut latency_by_response = BTreeMap::<&'static str, Vec<u64>>::new();
         if scenario.short_body.is_some() {
             for read in reads.iter().filter(|read| read.error.is_none()) {
-                latency_by_body_bytes
-                    .entry(read.body_bytes)
+                latency_by_response
+                    .entry(if read.body_bytes == scenario.body_bytes {
+                        "full"
+                    } else {
+                        "short"
+                    })
                     .or_default()
                     .push(read.end_us - read.arrival_us);
             }
@@ -232,9 +237,9 @@ impl Report {
                     .map(|read| read.end_us - read.arrival_us)
                     .collect(),
             ),
-            success_latency_by_body_bytes: latency_by_body_bytes
+            success_latency_by_response: latency_by_response
                 .into_iter()
-                .map(|(bytes, latencies)| (bytes, Latency::new(latencies)))
+                .map(|(response, latencies)| (response, Latency::new(latencies)))
                 .collect(),
             all_arrival_latency: Latency::new(
                 reads

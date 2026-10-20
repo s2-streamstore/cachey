@@ -309,19 +309,19 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
 #[tokio::test(start_paused = true)]
 async fn simulation_guarantees() {
     for name in [
-        "healthy_zonal",
-        "cold_regional_failover",
-        "third_after_errors",
-        "third_after_header_stalls",
-        "third_after_body_stalls",
-        "regional_deadline",
-        "missing_objects",
-        "sdk_retry",
-        "guarded_recovery",
-        "delayed_cancellation",
-        "single_bucket_header_stalls",
-        "single_bucket_slow_bodies",
-        "mixed_sizes_header_stalls_page_admission",
+        "s3_express_healthy",
+        "s3_standard_cold_cross_region_failover",
+        "s3_express_two_zones_fail",
+        "s3_express_two_zones_header_stall",
+        "s3_express_two_zones_body_stall",
+        "s3_standard_cross_region_deadline",
+        "s3_standard_replication_lag",
+        "s3_standard_internal_errors",
+        "s3_express_guarded_recovery",
+        "s3_express_delayed_cancellation",
+        "s3_express_single_zone_header_stalls",
+        "s3_express_single_zone_slow_bodies",
+        "s3_express_header_stalls_page_admission",
     ] {
         let mut scenario = model::scenarios()
             .into_iter()
@@ -329,7 +329,9 @@ async fn simulation_guarantees() {
             .unwrap();
         if !matches!(
             name,
-            "sdk_retry" | "guarded_recovery" | "delayed_cancellation"
+            "s3_standard_internal_errors"
+                | "s3_express_guarded_recovery"
+                | "s3_express_delayed_cancellation"
         ) {
             scenario.duration_ms = 250;
             scenario.faults.iter_mut().for_each(|fault| {
@@ -339,10 +341,10 @@ async fn simulation_guarantees() {
         }
         let report = simulate(scenario, 7, false, true).await;
         assert_eq!(report.completed, report.arrivals, "{name}: {report:?}");
-        if name == "sdk_retry" {
+        if name == "s3_standard_internal_errors" {
             assert_eq!(report.transport_attempts, report.arrivals * 2);
         }
-        if name == "guarded_recovery" {
+        if name == "s3_express_guarded_recovery" {
             assert!(
                 report
                     .recoveries
@@ -350,15 +352,29 @@ async fn simulation_guarantees() {
                     .any(|recovery| recovery.replica == 0 && recovery.successes >= 20)
             );
         }
-        if name == "delayed_cancellation" {
+        if name == "s3_express_delayed_cancellation" {
             assert!(report.post_read_service_us >= 40_000);
         }
     }
 }
 
 #[tokio::test(start_paused = true)]
+async fn simulation_reads_finishing_at_their_tail_are_not_hedged() {
+    let scenario = model::scenarios()
+        .into_iter()
+        .find(|scenario| scenario.name == "s3_express_healthy_page_admission")
+        .unwrap();
+    let report = simulate(scenario, 7, false, false).await;
+    assert_eq!(report.completed, report.arrivals, "{report:?}");
+    assert_eq!(report.overlapping_reads, 0, "{report:?}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn simulation_reservations_survive_reordering_and_admission_wait() {
-    for name in ["regional_deadline", "queued_long_read"] {
+    for name in [
+        "s3_standard_cross_region_deadline",
+        "s3_standard_queued_long_read",
+    ] {
         let scenario = model::scenarios()
             .into_iter()
             .find(|scenario| scenario.name == name)
@@ -372,7 +388,7 @@ async fn simulation_reservations_survive_reordering_and_admission_wait() {
 async fn simulation_repeatability_and_cancellation() {
     let mut scenario = model::scenarios()
         .into_iter()
-        .find(|scenario| scenario.name == "independent_errors")
+        .find(|scenario| scenario.name == "s3_express_independent_errors")
         .unwrap();
     scenario.duration_ms = 500;
     scenario.faults[0].start_ms = 0;
@@ -384,7 +400,7 @@ async fn simulation_repeatability_and_cancellation() {
     );
     let recovery = model::scenarios()
         .into_iter()
-        .find(|scenario| scenario.name == "recovery_during_peer_outage")
+        .find(|scenario| scenario.name == "s3_express_recovery_during_peer_outage")
         .unwrap();
     let recovery_report = simulate(recovery, 7, false, true).await;
     assert_eq!(
@@ -397,7 +413,7 @@ async fn simulation_repeatability_and_cancellation() {
     );
     let scenario = model::scenarios()
         .into_iter()
-        .find(|scenario| scenario.name == "caller_cancellation")
+        .find(|scenario| scenario.name == "s3_express_caller_cancellation")
         .unwrap();
     let report = simulate(scenario, 7, false, true).await;
     assert_eq!(
@@ -410,8 +426,8 @@ async fn simulation_repeatability_and_cancellation() {
 #[tokio::test(start_paused = true)]
 async fn simulation_rescue_preserves_availability_and_work_under_overload() {
     for (name, completed, attempts) in [
-        ("finite_capacity", 1806, 3100),
-        ("finite_capacity_sdk_retries", 1807, 3550),
+        ("capacitor_overload", 1807, 3100),
+        ("s3_express_overload_sdk_retries", 1806, 3620),
     ] {
         let scenario = model::scenarios()
             .into_iter()
