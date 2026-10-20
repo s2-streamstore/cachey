@@ -1,4 +1,8 @@
-use std::{ops::Range, time::Duration};
+use std::{
+    ops::Range,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::{
@@ -7,13 +11,14 @@ use tokio::{
 };
 
 use super::{
-    BucketOperation, DownloadError, DownloadOutput, Downloader, ObjectPiece, RequestConfig,
+    BucketOperation, DownloadError, DownloadOutput, Downloader, HedgeTimer, ObjectPiece,
+    PieceRequest, RequestConfig, RequestTimeline,
 };
 use crate::{
     object_store::{
         admission::DownloadPermit,
         budget::HedgePermit,
-        stats::{ProbePermit, RoutingSnapshot},
+        stats::{LatencyModel, ProbePermit, RoutingSnapshot},
     },
     types::{BucketNameSet, ObjectKey},
 };
@@ -26,6 +31,7 @@ type Completion = (usize, Result<ObjectPiece, DownloadError>);
 struct FallbackErrors {
     last_error: Option<DownloadError>,
     largest_object_size: Option<u64>,
+    retry_budget_exhausted: bool,
 }
 
 impl FallbackErrors {
@@ -54,15 +60,23 @@ impl FallbackErrors {
         }
     }
 
-    fn into_error(mut self) -> Option<DownloadError> {
+    fn into_error(mut self) -> DownloadError {
         if let Some(DownloadError::RangeNotSatisfied { object_size, .. }) = &mut self.last_error {
             *object_size = self.largest_object_size;
         }
-        self.last_error
+        match self.last_error {
+            None | Some(DownloadError::NoSuchKey) if self.retry_budget_exhausted => {
+                DownloadError::Overloaded(
+                    "Replica retry budget exhausted during widespread overload".to_owned(),
+                )
+            }
+            Some(error) => error,
+            None => DownloadError::Unknown("No replica could complete the read".to_owned()),
+        }
     }
 }
 
-pub(super) struct AttemptPermits {
+struct AttemptPermits {
     admission: DownloadPermit,
     hedge: Option<HedgePermit>,
 }
@@ -74,17 +88,11 @@ struct PrimaryAttempt {
     backup_admission: Option<DownloadPermit>,
 }
 
-#[derive(Default)]
-struct Progress {
-    active: usize,
-    hedged: bool,
-}
+struct InFlightCopy<'a>(&'a AtomicUsize);
 
-struct ActiveCopy<'a>(&'a parking_lot::Mutex<Progress>);
-
-impl Drop for ActiveCopy<'_> {
+impl Drop for InFlightCopy<'_> {
     fn drop(&mut self) {
-        self.0.lock().active -= 1;
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -94,8 +102,20 @@ struct ReplicaRequest<'a> {
     object: &'a ObjectKey,
     range: &'a Range<u64>,
     config: &'a RequestConfig,
+    copies_in_flight: AtomicUsize,
+    /// Whether a copy started while another was in flight.
+    hedged: AtomicBool,
+}
+
+/// One copy of the page from a bucket.
+struct CopyAttempt<'a> {
+    index: usize,
+    model: LatencyModel,
+    /// The primary's timeline, which the hedge timer follows; other copies keep their own.
+    primary_timeline: Option<&'a RequestTimeline>,
     deadline: Instant,
-    progress: parking_lot::Mutex<Progress>,
+    probe: Option<ProbePermit>,
+    permits: Option<AttemptPermits>,
 }
 
 impl ReplicaRequest<'_> {
@@ -110,57 +130,143 @@ impl ReplicaRequest<'_> {
         used: usize,
         start: Instant,
     ) -> DownloadOutput {
-        let progress = self.progress.lock();
         DownloadOutput {
             piece,
             primary_bucket_idx: primary,
             used_bucket_idx: used,
             latency: start.elapsed(),
-            hedged: progress.hedged,
+            hedged: self.hedged.load(Ordering::Relaxed),
         }
     }
 
-    async fn attempt(
-        &self,
-        index: usize,
-        probe: Option<ProbePermit>,
-        permits: Option<AttemptPermits>,
-    ) -> Completion {
-        let bucket = &self.buckets[index];
+    async fn attempt(&self, copy: CopyAttempt<'_>) -> Completion {
+        let CopyAttempt {
+            index,
+            model,
+            primary_timeline,
+            deadline,
+            probe,
+            permits,
+        } = copy;
+        let own_timeline = RequestTimeline::default();
+        let timeline = primary_timeline.unwrap_or(&own_timeline);
         let (hedge, admission) = match permits {
             Some(permits) => (permits.hedge, Some(permits.admission)),
             None => (None, None),
         };
-        let hedge_config = hedge.as_ref().map(|_| RequestConfig {
-            max_attempts: Some(1),
-            ..self.config.clone()
-        });
+        let hedge_config = hedge.as_ref().map(|_| self.config.single_attempt());
         let _hedge = hedge;
-        let config = hedge_config.as_ref().unwrap_or(self.config);
+        let request = PieceRequest {
+            bucket: &self.buckets[index],
+            object: self.object,
+            range: self.range,
+            config: hedge_config.as_ref().unwrap_or(self.config),
+        };
         let result = BucketOperation {
             downloader: self.downloader,
-            bucket,
-            deadline: self.deadline,
+            request,
+            model,
+            timeline,
+            deadline,
             unknown_latency: self.unknown_latency(),
             probe,
         }
-        .execute(self.range.end - self.range.start, admission, |_| async {
-            let _active = {
-                let mut progress = self.progress.lock();
-                progress.hedged |= progress.active > 0;
-                progress.active += 1;
-                ActiveCopy(&self.progress)
-            };
-            self.downloader
-                .fetch_piece(bucket, self.object, self.range, config)
-                .await
+        .execute(admission, async || {
+            if self.copies_in_flight.fetch_add(1, Ordering::Relaxed) > 0 {
+                self.hedged.store(true, Ordering::Relaxed);
+            }
+            let _in_flight = InFlightCopy(&self.copies_in_flight);
+            self.downloader.fetch_piece(request, timeline).await
         })
         .await;
         (index, result)
     }
 }
 
+/// Chooses the bucket and permits for each copy after the primary.
+struct Followups<'a> {
+    downloader: &'a Downloader,
+    buckets: &'a BucketNameSet,
+    bytes: u64,
+    deadline: Instant,
+    primary: usize,
+    primary_timeline: &'a RequestTimeline,
+    /// Buckets given a copy.
+    tried: Vec<bool>,
+    backup_admission: Option<DownloadPermit>,
+}
+
+impl<'a> Followups<'a> {
+    /// The copy to start for a rescue `scheduled` to a bucket, an `early` hedge, or a fallback
+    /// after an error, if any.
+    fn next(
+        &mut self,
+        early: bool,
+        scheduled: Option<usize>,
+        hedge: &mut HedgeTimer<'_>,
+        fallback_errors: &mut FallbackErrors,
+    ) -> Option<CopyAttempt<'a>> {
+        if scheduled.is_some_and(|index| self.tried[index]) {
+            return None;
+        }
+        let routing = self.downloader.bucketed_stats.snapshot(self.buckets);
+        let overloaded = routing.all_overloaded();
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || (early && overloaded) {
+            return None;
+        }
+        let index = scheduled
+            .or_else(|| routing.best(&self.tried, remaining))
+            .or_else(|| early.then_some(self.primary))?;
+        if overloaded && !self.downloader.attempt_budget.try_retry() {
+            fallback_errors.retry_budget_exhausted = true;
+            return None;
+        }
+        let permits = if early {
+            let admission = self.downloader.admission.try_acquire(self.bytes)?;
+            let Some(budget) = self
+                .downloader
+                .attempt_budget
+                .try_hedge(&self.buckets[index])
+            else {
+                hedge.deny();
+                return None;
+            };
+            hedge.start_hedge();
+            Some(AttemptPermits {
+                hedge: Some(budget),
+                admission,
+            })
+        } else {
+            self.backup_admission
+                .take()
+                .map(|admission| AttemptPermits {
+                    hedge: None,
+                    admission,
+                })
+        };
+        self.tried[index] = true;
+        Some(CopyAttempt {
+            index,
+            model: routing.model(index),
+            primary_timeline: None,
+            deadline: if index == self.primary {
+                self.primary_timeline
+                    .bucket_deadline()
+                    .unwrap_or(self.deadline)
+            } else {
+                self.deadline
+            },
+            probe: None,
+            permits,
+        })
+    }
+}
+
 impl Downloader {
+    /// Copies from the same bucket share its bucket deadline. An early hedge goes to the primary's
+    /// bucket once no other bucket is untried, so a single bucket hedges against itself; there, an
+    /// error that another copy from the same bucket would repeat ends the read.
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -170,51 +276,78 @@ impl Downloader {
         start: Instant,
         deadline: Instant,
     ) -> Result<DownloadOutput, DownloadError> {
+        let bytes = range.end - range.start;
+        let single_bucket = buckets.len() == 1;
         let request = ReplicaRequest {
             downloader: self,
             buckets,
             object,
             range,
             config,
-            deadline,
-            progress: parking_lot::Mutex::default(),
+            copies_in_flight: AtomicUsize::new(0),
+            hedged: AtomicBool::new(false),
         };
+        let primary_timeline = RequestTimeline::default();
         let routing = self.bucketed_stats.snapshot(buckets);
         let PrimaryAttempt {
             index: primary,
             probe,
             permits: primary_permits,
-            mut backup_admission,
+            backup_admission,
         } = self.prepare_primary(
-            range.end - range.start,
+            bytes,
             deadline.saturating_duration_since(Instant::now()),
             &routing,
         );
+        let primary_model = routing.model(primary);
+        let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
         let mut tried = vec![false; buckets.len()];
         tried[primary] = true;
-        let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
-        let threshold = routing.tail(primary).unwrap_or_default();
-        let mut hedge_at =
-            (self.limits.hedge_budget_percent > 0 && !threshold.is_zero() && probe.is_none())
-                .then(|| start + threshold.min(self.limits.page_timeout));
+        let mut followups = Followups {
+            downloader: self,
+            buckets,
+            bytes,
+            deadline,
+            primary,
+            primary_timeline: &primary_timeline,
+            tried,
+            backup_admission,
+        };
+        let mut hedge = HedgeTimer::new(
+            primary_model,
+            &primary_timeline,
+            deadline,
+            self.limits.hedge_budget_percent > 0 && probe.is_none(),
+        );
         let mut active = FuturesUnordered::new();
-        active.push(request.attempt(primary, probe, primary_permits));
+        active.push(request.attempt(CopyAttempt {
+            index: primary,
+            model: primary_model,
+            primary_timeline: Some(&primary_timeline),
+            deadline,
+            probe,
+            permits: primary_permits,
+        }));
         let mut fallback_errors = FallbackErrors::default();
-        let mut retry_budget_exhausted = false;
         while !active.is_empty() {
             let next_rescue = rescues
                 .front()
                 .map_or(deadline, |(after, _)| start + *after);
-            let next_hedge = hedge_at.unwrap_or(deadline);
             let (early, scheduled) = select! {
                 biased;
                 Some((index, result)) = active.next() => {
                     match result {
                         Ok(piece) => return Ok(request.output(piece, primary, index, start)),
                         Err(error) => {
-                            if !error.should_attempt_fallback_bucket() { return Err(error); }
+                            if !error.should_attempt_fallback_bucket()
+                                || (single_bucket && !error.should_wait_for_hedged_peer())
+                            {
+                                return Err(error);
+                            }
                             fallback_errors.record(error);
-                            hedge_at = None;
+                            if index == primary {
+                                hedge.disarm();
+                            }
                         }
                     }
                     (false, None)
@@ -222,65 +355,16 @@ impl Downloader {
                 () = sleep_until(next_rescue), if !rescues.is_empty() => {
                     (false, rescues.pop_front().map(|(_, index)| index))
                 },
-                () = sleep_until(next_hedge), if hedge_at.is_some() => {
-                    hedge_at = None;
-                    (true, None)
-                },
+                () = hedge.due() => (true, None),
             };
-            if active.len() >= MAX_CONCURRENT_COPIES || scheduled.is_some_and(|index| tried[index])
+            if active.len() < MAX_CONCURRENT_COPIES
+                && let Some(copy) =
+                    followups.next(early, scheduled, &mut hedge, &mut fallback_errors)
             {
-                continue;
+                active.push(request.attempt(copy));
             }
-            let routing = self.bucketed_stats.snapshot(buckets);
-            let overloaded = routing.all_overloaded();
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() || (early && overloaded) {
-                continue;
-            }
-            let Some(index) = scheduled.or_else(|| routing.best(&tried, remaining)) else {
-                continue;
-            };
-            if overloaded && !self.attempt_budget.try_retry() {
-                retry_budget_exhausted = true;
-                continue;
-            }
-            let permits = if early {
-                let Some(permits) = self.hedge_permits(&buckets[index], range.end - range.start)
-                else {
-                    continue;
-                };
-                Some(permits)
-            } else {
-                backup_admission.take().map(|admission| AttemptPermits {
-                    hedge: None,
-                    admission,
-                })
-            };
-            tried[index] = true;
-            active.push(request.attempt(index, None, permits));
         }
-        Err(match fallback_errors.into_error() {
-            None | Some(DownloadError::NoSuchKey) if retry_budget_exhausted => {
-                DownloadError::Overloaded(
-                    "Replica retry budget exhausted during widespread overload".to_owned(),
-                )
-            }
-            Some(error) => error,
-            None => DownloadError::Unknown("No replica could complete the read".to_owned()),
-        })
-    }
-
-    pub(super) fn hedge_permits(
-        &self,
-        bucket: &crate::types::BucketName,
-        bytes: u64,
-    ) -> Option<AttemptPermits> {
-        let admission = self.admission.try_acquire(bytes)?;
-        let hedge = self.attempt_budget.try_hedge(bucket)?;
-        Some(AttemptPermits {
-            hedge: Some(hedge),
-            admission,
-        })
+        Err(fallback_errors.into_error())
     }
 
     fn prepare_primary(
@@ -347,7 +431,7 @@ mod tests {
         for error in errors {
             fallback_errors.record(error);
         }
-        let actual = fallback_errors.into_error().unwrap();
+        let actual = fallback_errors.into_error();
         assert_eq!(discriminant(&actual), discriminant(expected), "{actual:?}");
         assert_eq!(actual.to_string(), expected.to_string());
     }

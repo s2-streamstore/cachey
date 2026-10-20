@@ -1,0 +1,335 @@
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
+
+use tokio::{
+    select,
+    sync::Notify,
+    time::{Instant, sleep_until},
+};
+
+use crate::object_store::stats::{LatencyModel, Sample};
+
+#[derive(Debug, Clone, Copy)]
+struct Headers {
+    at: Instant,
+    body_bytes: u64,
+}
+
+/// When a backend request started and must finish, when response headers with a validated range
+/// arrived with the announced body length, and when the hedge budget first denied a hedge against
+/// it and whether one started.
+#[derive(Debug, Default)]
+pub(super) struct RequestTimeline {
+    started: OnceLock<Instant>,
+    bucket_deadline: OnceLock<Instant>,
+    headers: OnceLock<Headers>,
+    hedge_denied: OnceLock<Instant>,
+    hedge_started: AtomicBool,
+    changed: Notify,
+}
+
+impl RequestTimeline {
+    /// Set once the request is admitted, before it starts.
+    pub fn set_bucket_deadline(&self, deadline: Instant) {
+        _ = self.bucket_deadline.set(deadline);
+    }
+
+    pub fn bucket_deadline(&self) -> Option<Instant> {
+        self.bucket_deadline.get().copied()
+    }
+
+    pub fn start(&self) -> Instant {
+        let now = Instant::now();
+        if self.started.set(now).is_ok() {
+            self.changed.notify_waiters();
+        }
+        now
+    }
+
+    pub fn receive_headers(&self, body_bytes: u64) {
+        let headers = Headers {
+            at: Instant::now(),
+            body_bytes,
+        };
+        if self.headers.set(headers).is_ok() {
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub fn announced_body_bytes(&self) -> Option<u64> {
+        self.headers.get().map(|headers| headers.body_bytes)
+    }
+
+    /// Measurements of a request whose body has just been read in full. A request whose hedge the
+    /// budget denied, and that never had one, is left unmeasured like one a hedge superseded if it
+    /// outlasted the time such a hedge would have taken at the bucket's tails. So stalls the budget
+    /// leaves unhedged cannot raise the tails and stop later hedges. The budget denies hedges only
+    /// while others run or recently ran, and their races keep teaching the tails if the bucket
+    /// itself slows. A hedge withheld for overload or admission says nothing about whether the
+    /// request was an outlier, so the request is measured.
+    pub fn sample(&self, model: &LatencyModel) -> Option<Sample> {
+        let started = *self.started.get()?;
+        let headers = self.headers.get()?;
+        let now = Instant::now();
+        if let Some(denied) = self.hedge_denied.get()
+            && !self.hedge_started.load(Ordering::Relaxed)
+            && model
+                .first_byte_tail()
+                .zip(model.body_tail(headers.body_bytes))
+                .and_then(|(first_byte, body)| denied.checked_add(first_byte.saturating_add(body)))
+                .is_some_and(|hedge_finish| now > hedge_finish)
+        {
+            return None;
+        }
+        Some(Sample {
+            first_byte: headers.at.saturating_duration_since(started),
+            body_bytes: headers.body_bytes,
+            body: now.saturating_duration_since(headers.at),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    FirstByte,
+    Body,
+}
+
+/// Times a page's early hedge against its primary request in two phases: the p99 time to first
+/// byte after the request starts, then, once headers announce the body length, when the body has
+/// taken longer than both its p99 time and the p99 time to first byte. Each phase is due at most
+/// once, so a hedge that cannot start before headers may still start during the body. A phase whose
+/// tail is zero, or a body in a size class the bucket has not served, is not hedged early. No hedge
+/// is due once the primary's bucket deadline or the page deadline has passed.
+pub(super) struct HedgeTimer<'a> {
+    model: LatencyModel,
+    primary: &'a RequestTimeline,
+    deadline: Instant,
+    next: Option<Phase>,
+}
+
+impl<'a> HedgeTimer<'a> {
+    pub fn new(
+        model: LatencyModel,
+        primary: &'a RequestTimeline,
+        deadline: Instant,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            model,
+            primary,
+            deadline,
+            next: (enabled && model.first_byte_tail().is_some()).then_some(Phase::FirstByte),
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.next = None;
+    }
+
+    /// Records that a hedge started against the primary, which ends hedging.
+    pub fn start_hedge(&mut self) {
+        self.primary.hedge_started.store(true, Ordering::Relaxed);
+        self.disarm();
+    }
+
+    /// Records that the hedge budget denied a hedge that came due.
+    pub fn deny(&self) {
+        _ = self.primary.hedge_denied.set(Instant::now());
+    }
+
+    fn deadline(&self) -> Instant {
+        self.primary
+            .bucket_deadline()
+            .map_or(self.deadline, |bucket_deadline| {
+                bucket_deadline.min(self.deadline)
+            })
+    }
+
+    fn due_at(&self) -> Option<(Phase, Instant)> {
+        let next = self.next?;
+        let first_byte_tail = self.model.first_byte_tail()?;
+        let (phase, since, tail) = match (next, self.primary.headers.get()) {
+            (_, Some(headers)) => (
+                Phase::Body,
+                headers.at,
+                self.model
+                    .body_tail(headers.body_bytes)?
+                    .max(first_byte_tail),
+            ),
+            (Phase::FirstByte, None) => (
+                Phase::FirstByte,
+                *self.primary.started.get()?,
+                first_byte_tail,
+            ),
+            (Phase::Body, None) => return None,
+        };
+        if tail.is_zero() {
+            return None;
+        }
+        let at = since.checked_add(tail)?;
+        (at < self.deadline()).then_some((phase, at))
+    }
+
+    /// Completes when a hedge is due, or never if none can be. The primary's timeline stops
+    /// changing once its headers arrive, so from then on only the timer is polled. Timers fire on
+    /// the next tick, so one that fires at or past the deadline ends hedging.
+    pub async fn due(&mut self) {
+        if self.next.is_none() {
+            return std::future::pending().await;
+        }
+        let primary = self.primary;
+        loop {
+            let changed = primary.changed.notified();
+            let settled = primary.headers.get().is_some();
+            let Some((phase, at)) = self.due_at() else {
+                if settled {
+                    return std::future::pending().await;
+                }
+                changed.await;
+                continue;
+            };
+            select! {
+                biased;
+                () = changed, if !settled => {}
+                () = sleep_until(at) => {
+                    if Instant::now() >= self.deadline() {
+                        self.next = None;
+                        return std::future::pending().await;
+                    }
+                    self.next = (phase == Phase::FirstByte).then_some(Phase::Body);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytesize::MIB;
+    use tokio::time::{Instant, advance, sleep, timeout};
+
+    use super::{HedgeTimer, RequestTimeline};
+    use crate::{
+        object_store::stats::{BucketedStats, LatencyModel, Sample},
+        types::BucketName,
+    };
+
+    fn model(first_byte_ms: u64, body_bytes: u64, body_ms: u64) -> LatencyModel {
+        let stats = BucketedStats::default();
+        let bucket = BucketName::new("bucket").unwrap();
+        stats.seed(
+            &bucket,
+            Sample::from_millis(first_byte_ms, body_bytes, body_ms),
+        );
+        stats.model(&bucket)
+    }
+
+    async fn due_after(timer: &mut HedgeTimer<'_>) -> Option<Duration> {
+        let start = Instant::now();
+        timeout(Duration::from_secs(60), timer.due())
+            .await
+            .ok()
+            .map(|()| start.elapsed())
+    }
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_byte_phase_is_timed_from_the_request_start() {
+        let timeline = RequestTimeline::default();
+        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline(), true);
+        let start = Instant::now();
+        tokio::join!(
+            async {
+                sleep(Duration::from_millis(50)).await;
+                timeline.start();
+            },
+            timer.due(),
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(70));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hedge_not_taken_before_headers_can_be_taken_during_the_body() {
+        let timeline = RequestTimeline::default();
+        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline(), true);
+        timeline.start();
+        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
+        sleep(Duration::from_millis(10)).await;
+        timeline.receive_headers(4096);
+        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
+        assert_eq!(due_after(&mut timer).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_first_byte_tail_still_times_the_body() {
+        let timeline = RequestTimeline::default();
+        let mut timer = HedgeTimer::new(model(0, 4096, 30), &timeline, deadline(), true);
+        timeline.start();
+        let (due, ()) = tokio::join!(due_after(&mut timer), async {
+            sleep(Duration::from_millis(5)).await;
+            timeline.receive_headers(4096);
+        });
+        assert_eq!(due, Some(Duration::from_millis(35)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timer_rounded_past_the_deadline_does_not_hedge() {
+        advance(Duration::from_micros(500)).await;
+        let timeline = RequestTimeline::default();
+        let deadline = Instant::now() + Duration::from_micros(20_002);
+        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline, true);
+        timeline.start();
+        assert_eq!(due_after(&mut timer).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hedges_are_due_only_before_the_primarys_bucket_deadline() {
+        for (bucket_timeout_ms, expected) in [(20, None), (21, Some(Duration::from_millis(20)))] {
+            let timeline = RequestTimeline::default();
+            let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline(), true);
+            timeline.set_bucket_deadline(Instant::now() + Duration::from_millis(bucket_timeout_ms));
+            timeline.start();
+            assert_eq!(due_after(&mut timer).await, expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bodies_are_hedged_by_their_announced_size_class() {
+        for (large_body_ms, expected) in
+            [(None, None), (Some(250), Some(Duration::from_millis(1000)))]
+        {
+            let model = match large_body_ms {
+                None => model(20, 4096, 3),
+                Some(body_ms) => model(20, 4 * MIB, body_ms),
+            };
+            let timeline = RequestTimeline::default();
+            let mut timer = HedgeTimer::new(model, &timeline, deadline(), true);
+            timeline.start();
+            timeline.receive_headers(16 * MIB);
+            assert_eq!(due_after(&mut timer).await, expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_too_long_to_time_is_not_hedged() {
+        let timeline = RequestTimeline::default();
+        let mut timer = HedgeTimer::new(
+            model(20, 4 * MIB, 5_000_000_000),
+            &timeline,
+            deadline(),
+            true,
+        );
+        timeline.start();
+        timeline.receive_headers(u64::MAX);
+        assert_eq!(due_after(&mut timer).await, None);
+    }
+}

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::Serialize;
 
@@ -6,7 +6,7 @@ use super::{
     backend::{State, Transport},
     model::Scenario,
 };
-use crate::object_store::DownloadError;
+use crate::object_store::{BucketMetrics, DownloadError};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Copy {
@@ -16,11 +16,59 @@ pub struct Copy {
     pub end_us: u64,
 }
 
+/// A bucket's exported latency model, with each estimate absent until measured.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Estimates {
+    latency_p99_us: Option<u64>,
+    first_byte_p99_us: Option<u64>,
+    body_overhead_us: Option<u64>,
+    body_throughput_bytes_per_second: Option<u64>,
+    small_body_p99_ratio: Option<f64>,
+    large_body_p99_ratio: Option<f64>,
+}
+
+impl From<&BucketMetrics> for Estimates {
+    fn from(metrics: &BucketMetrics) -> Self {
+        let micros =
+            |duration: Option<Duration>| duration.map(|duration| duration.as_micros() as u64);
+        Self {
+            latency_p99_us: micros(metrics.latency_p99),
+            first_byte_p99_us: micros(metrics.first_byte_p99),
+            body_overhead_us: micros(metrics.body_overhead),
+            body_throughput_bytes_per_second: metrics
+                .body_throughput
+                .map(|throughput| throughput as u64),
+            small_body_p99_ratio: metrics.small_body_p99_ratio,
+            large_body_p99_ratio: metrics.large_body_p99_ratio,
+        }
+    }
+}
+
+impl Estimates {
+    fn slowest(self, other: Self) -> Self {
+        let larger =
+            |left: Option<f64>, right: Option<f64>| left.into_iter().chain(right).reduce(f64::max);
+        Self {
+            latency_p99_us: self.latency_p99_us.max(other.latency_p99_us),
+            first_byte_p99_us: self.first_byte_p99_us.max(other.first_byte_p99_us),
+            body_overhead_us: self.body_overhead_us.max(other.body_overhead_us),
+            body_throughput_bytes_per_second: self
+                .body_throughput_bytes_per_second
+                .into_iter()
+                .chain(other.body_throughput_bytes_per_second)
+                .min(),
+            small_body_p99_ratio: larger(self.small_body_p99_ratio, other.small_body_p99_ratio),
+            large_body_p99_ratio: larger(self.large_body_p99_ratio, other.large_body_p99_ratio),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Health {
     pub replica: usize,
     pub deprioritized: bool,
     pub recovery_successes: u32,
+    pub estimates: Estimates,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,7 +90,7 @@ pub struct Read {
 pub struct Latency {
     mean_us: u64,
     p50_us: u64,
-    p99_us: u64,
+    pub p99_us: u64,
     max_us: u64,
 }
 
@@ -91,7 +139,7 @@ pub struct Report {
     success_latency: Latency,
     /// Successful latency of full and short responses, in fixtures with short bodies.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    success_latency_by_response: BTreeMap<&'static str, Latency>,
+    pub success_latency_by_response: BTreeMap<&'static str, Latency>,
     all_arrival_latency: Latency,
     copy_operations: usize,
     pub transport_attempts: usize,
@@ -113,9 +161,14 @@ pub struct Report {
     useful_bytes: u64,
     pub overlapping_reads: usize,
     wins_by_replica: Vec<usize>,
+    /// Each bucket's estimates after the last read completed.
+    final_estimates: Vec<Estimates>,
+    /// Each bucket's slowest estimates observed after any read: highest durations and ratios,
+    /// lowest throughput.
+    slowest_estimates: Vec<Estimates>,
     pub recoveries: Vec<Recovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reads: Option<Vec<Read>>,
+    pub reads: Option<Vec<Read>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     copies: Option<Vec<Copy>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,8 +225,13 @@ impl Report {
         chronological.sort_by_key(|read| read.completion_order);
         let mut impaired = vec![None; scenario.replicas.len()];
         let mut recoveries = vec![];
+        let mut final_estimates = vec![Estimates::default(); scenario.replicas.len()];
+        let mut slowest_estimates = final_estimates.clone();
         for read in chronological {
             for health in &read.health {
+                final_estimates[health.replica] = health.estimates;
+                slowest_estimates[health.replica] =
+                    slowest_estimates[health.replica].slowest(health.estimates);
                 if health.deprioritized {
                     impaired[health.replica].get_or_insert(read.end_us);
                 } else if let Some(since) = impaired[health.replica].take() {
@@ -309,6 +367,8 @@ impl Report {
                 .sum(),
             overlapping_reads: reads.iter().filter(|read| read.hedged).count(),
             wins_by_replica: wins,
+            final_estimates,
+            slowest_estimates,
             recoveries,
             scenario,
             reads: trace.then_some(reads),

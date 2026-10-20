@@ -255,6 +255,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                             replica: bucket.strip_prefix("replica-").unwrap().parse().unwrap(),
                             deprioritized: metrics.deprioritized,
                             recovery_successes: metrics.recovery_successes,
+                            estimates: metrics.into(),
                         });
                     });
                     health.sort_by_key(|health| health.replica);
@@ -367,6 +368,37 @@ async fn simulation_reads_finishing_at_their_tail_are_not_hedged() {
     let report = simulate(scenario, 7, false, false).await;
     assert_eq!(report.completed, report.arrivals, "{report:?}");
     assert_eq!(report.overlapping_reads, 0, "{report:?}");
+}
+
+/// Full pages take about 100ms after headers, and short last pages of every length share the
+/// bucket, so a hedge rescuing a slow full page should start near the full page's own tail. Slow
+/// bodies outnumber 1% of reads, so on seed 42, where the budget once leaves some unhedged, those
+/// stalls must not set the tail and stop later hedges. A hedged full page slower than 150ms had a
+/// slow primary, and one past 900ms was not rescued.
+#[tokio::test(start_paused = true)]
+async fn simulation_slow_full_pages_are_hedged_at_their_own_tail() {
+    for seed in [7, 42] {
+        let scenario = model::scenarios()
+            .into_iter()
+            .find(|scenario| scenario.name == "synthetic_fixed_body_time_slow_bodies")
+            .unwrap();
+        let full_page = scenario.body_bytes;
+        let report = simulate(scenario, seed, false, true).await;
+        assert_eq!(report.completed, report.arrivals, "seed {seed}");
+        let rescued = report
+            .reads
+            .iter()
+            .flatten()
+            .filter(|read| read.error.is_none() && read.hedged && read.body_bytes == full_page)
+            .map(|read| read.end_us - read.arrival_us)
+            .filter(|latency_us| (150_000..900_000).contains(latency_us))
+            .collect::<Vec<_>>();
+        assert!(rescued.len() >= 5, "seed {seed}: {rescued:?}");
+        assert!(
+            rescued.iter().all(|latency_us| *latency_us <= 250_000),
+            "seed {seed}: {rescued:?}"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]

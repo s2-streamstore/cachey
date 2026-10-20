@@ -81,6 +81,14 @@ impl RequestConfig {
         self == &Self::default()
     }
 
+    #[must_use]
+    pub(super) fn single_attempt(&self) -> Self {
+        Self {
+            max_attempts: Some(1),
+            ..self.clone()
+        }
+    }
+
     fn has_retry_overrides(&self) -> bool {
         self.max_attempts.is_some() || self.initial_backoff.is_some() || self.max_backoff.is_some()
     }

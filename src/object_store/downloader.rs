@@ -18,13 +18,16 @@ use crate::{
         admission::{DownloadAdmission, DownloadPermit},
         budget::AttemptBudget,
         config::{DownloadLimits, RequestConfig},
-        stats::{BucketedStats, Outcome, ProbePermit},
+        stats::{BucketedStats, LatencyModel, Outcome, ProbePermit},
     },
     service::SlidingThroughput,
     types::{BucketName, BucketNameSet, ObjectKey},
 };
 
 mod replicas;
+mod timeline;
+
+use timeline::{HedgeTimer, RequestTimeline};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DownloadError {
@@ -174,27 +177,46 @@ pub struct DownloadOutput {
     pub hedged: bool,
 }
 
+#[derive(Clone, Copy)]
+struct PieceRequest<'a> {
+    bucket: &'a BucketName,
+    object: &'a ObjectKey,
+    range: &'a Range<u64>,
+    config: &'a RequestConfig,
+}
+
+impl PieceRequest<'_> {
+    fn bytes(&self) -> u64 {
+        self.range.end - self.range.start
+    }
+}
+
 struct BucketOperation<'a> {
     downloader: &'a Downloader,
-    bucket: &'a BucketName,
+    request: PieceRequest<'a>,
+    /// The bucket's latency model when the copy was routed.
+    model: LatencyModel,
+    timeline: &'a RequestTimeline,
     deadline: Instant,
     unknown_latency: Duration,
     probe: Option<ProbePermit>,
 }
 
 impl BucketOperation<'_> {
-    async fn execute<T, F: Future<Output = Result<T, DownloadError>>>(
+    /// Records the request's measurements only once its body is validated. A timeout counts
+    /// against the bucket only if the request had the model's timeout allowance, with half its
+    /// share of the deadline for each phase the bucket has not measured.
+    async fn execute<T>(
         self,
-        bytes: u64,
         admission: Option<DownloadPermit>,
-        fetch: impl FnOnce(Instant) -> F,
+        fetch: impl AsyncFnOnce() -> Result<T, DownloadError>,
     ) -> Result<T, DownloadError> {
         let _admission = match admission {
             Some(permit) => permit,
             None => {
                 self.downloader
                     .admission
-                    .acquire(bytes, self.deadline)
+                    .acquire(self.request.bytes(), self.deadline)
                     .await?
             }
         };
@@ -206,35 +228,34 @@ impl BucketOperation<'_> {
             .min(self.deadline.saturating_duration_since(now));
         if budget.is_zero() {
             return Err(DownloadError::Timeout {
-                bucket: self.bucket.clone(),
+                bucket: self.request.bucket.clone(),
                 timeout: budget,
             });
         }
-        let expected = self
-            .downloader
-            .bucketed_stats
-            .tail_latency(self.bucket)
-            .unwrap_or(
-                self.unknown_latency
-                    .min(self.downloader.limits.bucket_timeout)
-                    / 2,
-            );
+        self.timeline.set_bucket_deadline(now + budget);
         let observation = self
             .downloader
             .bucketed_stats
-            .begin(self.bucket, self.probe);
+            .begin(self.request.bucket, self.probe);
         let result = select! {
             biased;
-            result = fetch(now + budget) => result,
+            result = fetch() => result,
             () = sleep_until(now + budget) => Err(DownloadError::Timeout {
-                bucket: self.bucket.clone(), timeout: budget,
+                bucket: self.request.bucket.clone(), timeout: budget,
             }),
         };
-        observation.complete(
-            result
-                .as_ref()
-                .map_or_else(|error| error.health_outcome(expected), |_| Outcome::Success),
-        );
+        let outcome = match &result {
+            Ok(_) => Outcome::Success(self.timeline.sample(&self.model)),
+            Err(error) => error.health_outcome(
+                self.model.timeout_allowance(
+                    self.timeline.announced_body_bytes(),
+                    self.unknown_latency
+                        .min(self.downloader.limits.bucket_timeout)
+                        / 2,
+                ),
+            ),
+        };
+        observation.complete(outcome);
         result
     }
 }
@@ -299,143 +320,68 @@ impl Downloader {
         let deadline = start.checked_add(self.limits.page_timeout).ok_or_else(|| {
             DownloadError::Unknown("Page timeout exceeds the clock's supported range".to_owned())
         })?;
-        let output = if buckets.len() == 1 {
-            let bucket = &buckets[0];
-            let (piece, hedged) = BucketOperation {
-                downloader: self,
-                bucket,
-                deadline,
-                unknown_latency: self.limits.page_timeout,
-                probe: None,
-            }
-            .execute(byterange.end - byterange.start, None, |deadline| {
-                self.fetch_with_hedge(bucket, &object, byterange, req_config, deadline)
-            })
+        let output = self
+            .download_replicas(buckets, &object, byterange, req_config, start, deadline)
             .await?;
-            DownloadOutput {
-                piece,
-                primary_bucket_idx: 0,
-                used_bucket_idx: 0,
-                latency: start.elapsed(),
-                hedged,
-            }
-        } else {
-            self.download_replicas(buckets, &object, byterange, req_config, start, deadline)
-                .await?
-        };
         self.attempt_budget.observe_success();
         Ok(output)
     }
 
-    async fn fetch_with_hedge(
-        &self,
-        bucket: &BucketName,
-        object: &ObjectKey,
-        byterange: &Range<u64>,
-        config: &RequestConfig,
-        deadline: Instant,
-    ) -> Result<(ObjectPiece, bool), DownloadError> {
-        let primary = self.fetch_piece(bucket, object, byterange, config);
-        tokio::pin!(primary);
-        let Some(hedge_delay) = self
-            .bucketed_stats
-            .tail_latency(bucket)
-            .filter(|delay| !delay.is_zero() && self.limits.hedge_budget_percent > 0)
-        else {
-            return primary.await.map(|piece| (piece, false));
-        };
-        let now = Instant::now();
-        let hedge_at = now + hedge_delay.min(deadline.saturating_duration_since(now));
-        select! {
-            biased;
-            result = &mut primary => return result.map(|piece| (piece, false)),
-            () = sleep_until(hedge_at) => {},
-        }
-        let mut hedged = false;
-        let mut hedge = Box::pin(async {
-            if Instant::now() >= deadline || self.bucketed_stats.overloaded(bucket) {
-                return None;
-            }
-            let _permits = self.hedge_permits(bucket, byterange.end - byterange.start)?;
-            hedged = true;
-            let hedge_config = RequestConfig {
-                max_attempts: Some(1),
-                ..config.clone()
-            };
-            Some(
-                self.fetch_piece(bucket, object, byterange, &hedge_config)
-                    .await,
-            )
-        });
-        let result = select! {
-            result = &mut primary => match result {
-                Err(error) if error.should_wait_for_hedged_peer() => hedge.as_mut().await.unwrap_or(Err(error)),
-                result => result,
-            },
-            result = &mut hedge => match result {
-                Some(Ok(piece)) => Ok(piece),
-                Some(Err(error)) if !error.should_wait_for_hedged_peer() => Err(error),
-                Some(Err(_)) | None => primary.as_mut().await,
-            },
-        };
-        drop(hedge);
-        result.map(|piece| (piece, hedged))
-    }
-
     async fn fetch_piece(
         &self,
-        bucket: &BucketName,
-        object: &ObjectKey,
-        byterange: &Range<u64>,
-        req_config: &RequestConfig,
+        request: PieceRequest<'_>,
+        timeline: &RequestTimeline,
     ) -> Result<ObjectPiece, DownloadError> {
-        #[cfg(test)]
-        let _simulation_copy = crate::object_store::simulation::record_copy(
-            object,
+        let PieceRequest {
             bucket,
-            byterange.end - byterange.start,
-        );
-        let request = self
+            object,
+            range,
+            config,
+        } = request;
+        #[cfg(test)]
+        let _simulation_copy =
+            crate::object_store::simulation::record_copy(object, bucket, request.bytes());
+        let get_object = self
             .s3
             .get_object()
             .bucket(&**bucket)
             .key(&**object)
-            .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
+            .range(format!("bytes={}-{}", range.start, range.end - 1))
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
 
-        let started = Instant::now();
-        let output = if req_config.is_noop() {
-            request.send().await
+        let started = timeline.start();
+        let output = if config.is_noop() {
+            get_object.send().await
         } else {
             let client_config = self.s3.config();
             let mut config_override = client_config.to_builder();
             if let Some(timeout_config) =
-                req_config.merged_timeout_config(client_config.timeout_config())
+                config.merged_timeout_config(client_config.timeout_config())
             {
                 config_override = config_override.timeout_config(timeout_config);
             }
-            if let Some(retry_config) = req_config.merged_retry_config(client_config.retry_config())
-            {
+            if let Some(retry_config) = config.merged_retry_config(client_config.retry_config()) {
                 config_override = config_override.retry_config(retry_config);
             }
-            if let Some(force_path_style) = req_config.force_path_style {
+            if let Some(force_path_style) = config.force_path_style {
                 config_override = config_override.force_path_style(force_path_style);
             }
 
-            request
+            get_object
                 .customize()
                 .config_override(config_override)
                 .send()
                 .await
         }
-        .map_err(|error| map_get_object_error(bucket, byterange, started.elapsed(), error))?;
-        self.read_response(byterange, output).await
+        .map_err(|error| map_get_object_error(bucket, range, started.elapsed(), error))?;
+        self.read_response(range, output, timeline).await
     }
 
     async fn read_response(
         &self,
         req_range: &Range<u64>,
         output: GetObjectOutput,
+        timeline: &RequestTimeline,
     ) -> Result<ObjectPiece, DownloadError> {
         let invalid_range = || {
             DownloadError::InvalidResponse(format!(
@@ -455,6 +401,7 @@ impl Downloader {
             return Err(invalid_range());
         }
         let expected_data_len = expected_end - req_range.start;
+        timeline.receive_headers(expected_data_len);
         let object_size = content_range.complete_length;
         let mtime = output
             .last_modified()
@@ -517,6 +464,7 @@ mod tests {
         result::ConnectorError,
     };
     use bytes::Bytes;
+    use bytesize::MIB;
     use futures::{StreamExt, stream};
     use http_body::Frame;
     use http_body_util::StreamBody;
@@ -525,9 +473,10 @@ mod tests {
 
     use super::{
         BucketMetrics, DownloadError, DownloadLimits, DownloadOutput, Downloader, RequestConfig,
-        map_get_object_error,
+        RequestTimeline, map_get_object_error,
     };
     use crate::{
+        object_store::stats::{Outcome, Sample},
         service::SlidingThroughput,
         types::{BucketName, BucketNameSet, ObjectKey},
     };
@@ -666,12 +615,18 @@ mod tests {
             .await
     }
 
-    async fn seed_latency(downloader: &Downloader, bucket: &str, millis: u64) {
-        let observation = downloader
+    fn seed_latency(downloader: &Downloader, bucket: &str, millis: u64) {
+        downloader
             .bucketed_stats
-            .begin(&BucketName::new(bucket).unwrap(), None);
-        advance(Duration::from_millis(millis)).await;
-        observation.complete(crate::object_store::stats::Outcome::Success);
+            .seed_latency(&BucketName::new(bucket).unwrap(), millis);
+    }
+
+    /// The body tail for the 4-byte objects tests read.
+    fn object_body_tail(downloader: &Downloader, bucket: &str) -> Option<Duration> {
+        downloader
+            .bucketed_stats
+            .model(&BucketName::new(bucket).unwrap())
+            .body_tail(4)
     }
 
     async fn metrics(downloader: &Downloader, bucket: &str) -> BucketMetrics {
@@ -698,7 +653,9 @@ mod tests {
             let output = GetObjectOutput::builder()
                 .set_content_range(header.map(str::to_owned))
                 .build();
-            let result = downloader.read_response(&(0..10), output).await;
+            let result = downloader
+                .read_response(&(0..10), output, &RequestTimeline::default())
+                .await;
             assert!(
                 matches!(result, Err(DownloadError::InvalidResponse(_))),
                 "{header:?}: {result:?}"
@@ -723,7 +680,7 @@ mod tests {
                 .build();
             let result = timeout(
                 Duration::from_millis(1),
-                downloader.read_response(&(0..10), output),
+                downloader.read_response(&(0..10), output, &RequestTimeline::default()),
             )
             .await
             .expect("excess data must be rejected without waiting for the rest of the body");
@@ -860,9 +817,11 @@ mod tests {
         let downloader = downloader([("bucket", 10, 190, false), ("bucket", 10, 190, false)]);
         let first = fetch(&downloader, &["bucket"]).await;
         assert_eq!(first.latency, Duration::from_millis(200));
+        let metrics = metrics(&downloader, "bucket").await;
+        assert_eq!(metrics.first_byte_p99, Some(Duration::from_millis(10)));
         assert_eq!(
-            metrics(&downloader, "bucket").await.latency_hedge,
-            first.latency
+            object_body_tail(&downloader, "bucket"),
+            Some(Duration::from_millis(190))
         );
 
         let second = fetch(&downloader, &["bucket"]).await;
@@ -874,7 +833,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn repeated_hedge_wins_preserve_wait_and_body_time() {
+    async fn header_stalls_superseded_by_hedges_keep_being_hedged() {
         let mut responses = vec![("bucket", 10, 90, false)];
         for _ in 0..8 {
             responses.extend([("bucket", 1_000, 0, false), ("bucket", 10, 40, false)]);
@@ -887,37 +846,267 @@ mod tests {
             .unwrap();
         fetch(&downloader, &["bucket"]).await;
         for _ in 0..8 {
-            let threshold = metrics(&downloader, "bucket").await.latency_hedge;
-            assert!(threshold >= Duration::from_millis(100));
             let output = fetch(&downloader, &["bucket"]).await;
             assert!(output.hedged);
-            assert_eq!(output.latency, threshold + Duration::from_millis(50));
+            assert_eq!(output.latency, Duration::from_millis(60));
+            assert_eq!(
+                metrics(&downloader, "bucket").await.first_byte_p99,
+                Some(Duration::from_millis(10))
+            );
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn primary_win_preserves_hedged_flag_and_cancels_pending_hedge() {
-        let downloader = downloader([
-            ("bucket", 10, 90, false),
-            ("bucket", 10, 140, false),
-            ("bucket", 10, 190, false),
-        ]);
-        fetch(&downloader, &["bucket"]).await;
-
-        let output = fetch(&downloader, &["bucket"]).await;
+    async fn replica_stalls_superseded_by_a_hedge_leave_their_tails() {
+        let (downloader, script) =
+            scripted_downloader([("local", 1_000, 0, false), ("peer", 5, 5, false)]);
+        seed_latency(&downloader, "local", 10);
+        seed_latency(&downloader, "peer", 20);
+        let output = fetch(&downloader, &["local", "peer"]).await;
+        assert_eq!(output.used_bucket_idx, 1);
         assert!(output.hedged);
-        assert_eq!(output.latency, Duration::from_millis(150));
-        assert_eq!(output.piece.data, Bytes::from_static(b"data"));
-
-        let metrics = metrics(&downloader, "bucket").await;
-        assert_eq!(metrics.latency_mean, Duration::from_millis(125));
-        assert_eq!(metrics.latency_hedge, Duration::from_millis(150));
-        assert!(metrics.error_rate.abs() < f64::EPSILON);
-        assert_eq!(metrics.consecutive_failures, 0);
+        assert_eq!(output.latency, Duration::from_millis(20));
+        let local = metrics(&downloader, "local").await;
+        assert_eq!(local.first_byte_p99, Some(Duration::from_millis(10)));
+        assert_eq!(local.latency_p99, Some(Duration::from_millis(10)));
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn either_peer_can_recover_a_body_failure() {
+    async fn a_failed_copy_releases_its_admission_while_its_peer_continues() {
+        for (primary, hedge, elapsed_ms) in [
+            (("bucket", 5, 300, false), ("bucket", 1, 1, true), 305),
+            (("bucket", 5, 120, true), ("bucket", 1, 300, false), 396),
+        ] {
+            let (downloader, script) =
+                scripted_downloader([("bucket", 10, 90, false), primary, hedge]);
+            let downloader = downloader
+                .with_test_limits(DownloadLimits {
+                    max_inflight_requests: 2,
+                    max_inflight_bytes: 8,
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            fetch(&downloader, &["bucket"]).await;
+            let (output, admitted_during_peer) =
+                tokio::join!(fetch(&downloader, &["bucket"]), async {
+                    sleep(Duration::from_millis(150)).await;
+                    downloader.admission.try_acquire(4).is_some()
+                });
+            assert!(output.hedged);
+            assert_eq!(output.latency, Duration::from_millis(elapsed_ms));
+            assert!(admitted_during_peer);
+            assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_conclusive_hedge_error_does_not_hide_its_peers_overload() {
+        let (downloader, script) = scripted_downloader([
+            ("bucket", 10, 90, false),
+            ("bucket", 50, 0, false),
+            ("bucket", 60, 0, false),
+        ]);
+        script.service_errors.lock().extend([(1, 503), (2, 404)]);
+        fetch(&downloader, &["bucket"]).await;
+        let result = fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+        assert!(
+            matches!(result, Err(DownloadError::NoSuchKey)),
+            "{result:?}"
+        );
+        let metrics = metrics(&downloader, "bucket").await;
+        assert!(metrics.deprioritized);
+        assert_eq!(metrics.consecutive_failures, 1);
+        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_primary_failure_survives_its_hedges_timeout() {
+        let (downloader, script) =
+            scripted_downloader([("bucket", 1, 92, true), ("bucket", 100, 0, false)]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                bucket_timeout: Duration::from_millis(95),
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        downloader.bucketed_stats.seed(
+            &BucketName::new("bucket").unwrap(),
+            Sample::from_millis(10, 4, 90),
+        );
+        let start = tokio::time::Instant::now();
+        let result = fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+        assert!(
+            matches!(result, Err(DownloadError::BodyStreaming(_))),
+            "{result:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(95));
+        assert!(metrics(&downloader, "bucket").await.deprioritized);
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeouts_allow_an_unmeasured_body_beyond_the_first_byte_tail() {
+        for (headers, budget_ms, counts) in
+            [(false, 28, false), (true, 28, false), (true, 50, true)]
+        {
+            let downloader = downloader([]);
+            seed_latency(&downloader, "bucket", 30);
+            let bucket = BucketName::new("bucket").unwrap();
+            let object = ObjectKey::new("object").unwrap();
+            let timeline = RequestTimeline::default();
+            let result = super::BucketOperation {
+                downloader: &downloader,
+                request: super::PieceRequest {
+                    bucket: &bucket,
+                    object: &object,
+                    range: &(0..4),
+                    config: &RequestConfig::default(),
+                },
+                model: downloader.bucketed_stats.model(&bucket),
+                timeline: &timeline,
+                deadline: tokio::time::Instant::now() + Duration::from_millis(budget_ms),
+                unknown_latency: Duration::from_millis(40),
+                probe: None,
+            }
+            .execute(None, async || {
+                timeline.start();
+                sleep(Duration::from_millis(10)).await;
+                if headers {
+                    timeline.receive_headers(16 * MIB);
+                }
+                std::future::pending::<Result<(), DownloadError>>().await
+            })
+            .await;
+            assert!(
+                matches!(result, Err(DownloadError::Timeout { .. })),
+                "{result:?}"
+            );
+            assert_eq!(
+                metrics(&downloader, "bucket").await.deprioritized,
+                counts,
+                "headers: {headers}, budget: {budget_ms}ms"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hedge_timeout_does_not_mask_the_primarys_failure() {
+        let (downloader, script) = scripted_downloader([
+            ("bucket", 10, 200, false),
+            ("bucket", 20, 30, true),
+            ("bucket", 1_000, 0, false),
+        ]);
+        fetch(&downloader, &["bucket"]).await;
+        let config = RequestConfig {
+            operation_timeout: Some(Duration::from_millis(50)),
+            ..RequestConfig::default()
+        };
+        let result = fetch_with_config(&downloader, &["bucket"], &config).await;
+        assert!(
+            matches!(result, Err(DownloadError::BodyStreaming(_))),
+            "{result:?}"
+        );
+        assert_eq!(metrics(&downloader, "bucket").await.consecutive_failures, 1);
+        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_primary_finishing_with_or_before_its_hedge_wins_and_is_measured() {
+        for hedge_body_ms in [190, 40] {
+            let downloader = downloader([
+                ("bucket", 10, 90, false),
+                ("bucket", 10, 140, false),
+                ("bucket", 10, hedge_body_ms, false),
+            ]);
+            fetch(&downloader, &["bucket"]).await;
+
+            let output = fetch(&downloader, &["bucket"]).await;
+            assert!(output.hedged);
+            assert_eq!(output.latency, Duration::from_millis(150));
+            assert_eq!(output.piece.data, Bytes::from_static(b"data"));
+
+            let metrics = metrics(&downloader, "bucket").await;
+            assert_eq!(metrics.first_byte_mean, Some(Duration::from_millis(10)));
+            assert_eq!(
+                object_body_tail(&downloader, "bucket"),
+                Some(Duration::from_millis(140))
+            );
+            assert!(metrics.error_rate.abs() < f64::EPSILON);
+            assert_eq!(metrics.consecutive_failures, 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_validated_requests_record_latency() {
+        let (downloader, script) = scripted_downloader([
+            ("bucket", 70, 0, false),
+            ("bucket", 5, 1, true),
+            ("bucket", 10, 90, false),
+            ("bucket", 30, 140, false),
+        ]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        script.service_errors.lock().insert(0, 404);
+        assert!(matches!(
+            fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
+            Err(DownloadError::NoSuchKey)
+        ));
+        assert!(matches!(
+            fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
+            Err(DownloadError::BodyStreaming(_))
+        ));
+        fetch(&downloader, &["bucket"]).await;
+        fetch(&downloader, &["bucket"]).await;
+
+        let metrics = metrics(&downloader, "bucket").await;
+        assert_eq!(metrics.latency_mean, Some(Duration::from_millis(135)));
+        assert_eq!(metrics.first_byte_mean, Some(Duration::from_millis(20)));
+        assert_eq!(metrics.first_byte_p99, Some(Duration::from_millis(30)));
+        assert_eq!(
+            object_body_tail(&downloader, "bucket"),
+            Some(Duration::from_millis(140))
+        );
+        assert!(metrics.body_throughput.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_stalls_count_once_they_outlast_the_complete_request_tail() {
+        for (bucket_timeout_ms, counts) in [(300, false), (500, true)] {
+            let (downloader, script) = scripted_downloader([("bucket", 1_000, 0, false)]);
+            let downloader = downloader
+                .with_test_limits(DownloadLimits {
+                    bucket_timeout: Duration::from_millis(bucket_timeout_ms),
+                    hedge_budget_percent: 0,
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            downloader.bucketed_stats.seed(
+                &BucketName::new("bucket").unwrap(),
+                Sample::from_millis(5, 4 * MIB, 400),
+            );
+            assert!(matches!(
+                fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
+                Err(DownloadError::Timeout { .. })
+            ));
+            assert_eq!(
+                metrics(&downloader, "bucket").await.deprioritized,
+                counts,
+                "{bucket_timeout_ms}ms"
+            );
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn either_peer_recovers_a_body_failure_that_still_counts_against_the_bucket() {
         for (primary, hedge, elapsed_ms) in [
             (("bucket", 10, 100, true), ("bucket", 10, 20, false), 130),
             (("bucket", 10, 190, false), ("bucket", 5, 10, true), 200),
@@ -927,7 +1116,7 @@ mod tests {
             let output = fetch(&downloader, &["bucket"]).await;
             assert!(output.hedged);
             assert_eq!(output.latency, Duration::from_millis(elapsed_ms));
-            assert!(metrics(&downloader, "bucket").await.error_rate.abs() < f64::EPSILON);
+            assert_eq!(metrics(&downloader, "bucket").await.consecutive_failures, 1);
         }
     }
 
@@ -945,10 +1134,10 @@ mod tests {
         assert_eq!(output.latency, Duration::from_millis(130));
         let primary = metrics(&downloader, "primary").await;
         assert_eq!(primary.consecutive_failures, 1);
-        assert_eq!(primary.latency_mean, Duration::from_millis(100));
+        assert_eq!(primary.body_overhead, Some(Duration::from_millis(90)));
         assert_eq!(
-            metrics(&downloader, "fallback").await.latency_mean,
-            Duration::from_millis(30)
+            metrics(&downloader, "fallback").await.body_overhead,
+            Some(Duration::from_millis(20))
         );
     }
 
@@ -975,7 +1164,8 @@ mod tests {
             for bucket in buckets {
                 let metrics = metrics(&downloader, bucket).await;
                 assert_eq!(metrics.consecutive_failures, 1);
-                assert_eq!(metrics.latency_mean, Duration::ZERO);
+                assert_eq!(metrics.latency_mean, None);
+                assert_eq!(metrics.first_byte_mean, None);
             }
         }
     }
@@ -1032,24 +1222,41 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn bucket_deadline_does_not_launch_a_hedge_at_expiry() {
-        for body_ms in [90, 200] {
-            let (downloader, script) =
-                scripted_downloader([("bucket", 10, 90, false), ("bucket", 10, body_ms, false)]);
-            fetch(&downloader, &["bucket"]).await;
+        // A sub-millisecond body tail makes the hedge due before a 100ms deadline, but its timer
+        // fires on the deadline's tick.
+        for (body_tail_us, body_ms, bucket_timeout_ms, requests) in [
+            (90_000, 90, 100, 1),
+            (90_000, 200, 100, 1),
+            (89_500, 90, 100, 1),
+            (89_500, 200, 100, 1),
+            (89_500, 200, 101, 2),
+        ] {
+            let responses = [("bucket", 10, body_ms, false), ("bucket", 0, 0, false)];
+            let (downloader, script) = scripted_downloader(responses.into_iter().take(requests));
             let downloader = downloader
                 .with_test_limits(DownloadLimits {
-                    bucket_timeout: Duration::from_millis(100),
+                    bucket_timeout: Duration::from_millis(bucket_timeout_ms),
                     ..DownloadLimits::default()
                 })
                 .unwrap();
+            downloader.bucketed_stats.seed(
+                &BucketName::new("bucket").unwrap(),
+                Sample {
+                    first_byte: Duration::from_millis(10),
+                    body_bytes: 4,
+                    body: Duration::from_micros(body_tail_us),
+                },
+            );
             let result =
                 fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
             if body_ms == 90 {
                 assert_eq!(result.unwrap().latency, Duration::from_millis(100));
-            } else {
+            } else if requests == 1 {
                 assert!(matches!(result, Err(DownloadError::Timeout { .. })));
+            } else {
+                assert!(result.unwrap().hedged);
             }
-            assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(script.requests.load(Ordering::SeqCst), requests);
             assert_eq!(script.active.load(Ordering::SeqCst), 0);
         }
     }
@@ -1066,7 +1273,7 @@ mod tests {
                         ..DownloadLimits::default()
                     })
                     .unwrap();
-                seed_latency(&downloader, "local", 50).await;
+                seed_latency(&downloader, "local", 50);
                 let duration = Some(Duration::from_millis(timeout_ms));
                 let config = RequestConfig {
                     operation_timeout: if attempt_timeout { None } else { duration },
@@ -1095,7 +1302,7 @@ mod tests {
             (("local", 0, 20, false), ("local", 100, 0, false), 20),
         ] {
             let downloader = downloader([primary, hedge]);
-            seed_latency(&downloader, "local", 5).await;
+            seed_latency(&downloader, "local", 5);
             let output = fetch_with_config(
                 &downloader,
                 &["local"],
@@ -1108,7 +1315,7 @@ mod tests {
             .unwrap();
             assert_eq!(output.latency, Duration::from_millis(elapsed_ms));
             assert!(output.hedged);
-            assert!(!metrics(&downloader, "local").await.deprioritized);
+            assert_eq!(metrics(&downloader, "local").await.consecutive_failures, 1);
         }
     }
 
@@ -1201,13 +1408,68 @@ mod tests {
         let bucket_metrics = metrics(&downloader, "bucket").await;
         assert_eq!(bucket_metrics.consecutive_failures, 0);
         assert!(bucket_metrics.error_rate.abs() < f64::EPSILON);
-        assert_eq!(bucket_metrics.latency_mean, Duration::from_millis(100));
+        assert_eq!(
+            bucket_metrics.body_overhead,
+            Some(Duration::from_millis(90))
+        );
         assert!(!fetch(&downloader, &["bucket"]).await.hedged);
         let output = fetch(&downloader, &["bucket"]).await;
         assert!(output.hedged);
         assert_eq!(output.latency, Duration::from_millis(130));
         assert_eq!(script.requests.load(Ordering::SeqCst), 6);
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalls_the_budget_leaves_unhedged_leave_the_body_tail() {
+        for (body_ms, tail_ms) in [(1_000, 90), (150, 150)] {
+            let downloader = downloader([("bucket", 10, body_ms, false)]);
+            let bucket = BucketName::new("bucket").unwrap();
+            downloader
+                .bucketed_stats
+                .seed(&bucket, Sample::from_millis(10, 4, 90));
+            let _exhausted = downloader.attempt_budget.try_hedge(&bucket).unwrap();
+            let output = fetch(&downloader, &["bucket"]).await;
+            assert!(!output.hedged);
+            assert_eq!(output.latency, Duration::from_millis(10 + body_ms));
+            metrics(&downloader, "bucket").await;
+            assert_eq!(
+                object_body_tail(&downloader, "bucket"),
+                Some(Duration::from_millis(tail_ms)),
+                "{body_ms}ms body"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalls_withheld_from_hedging_by_overload_or_admission_are_measured() {
+        for overloaded in [false, true] {
+            let downloader = downloader([("bucket", 10, 1_000, false)])
+                .with_test_limits(DownloadLimits {
+                    max_inflight_requests: if overloaded { 2 } else { 1 },
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            let bucket = BucketName::new("bucket").unwrap();
+            downloader
+                .bucketed_stats
+                .seed(&bucket, Sample::from_millis(10, 4, 90));
+            if overloaded {
+                downloader
+                    .bucketed_stats
+                    .begin(&bucket, None)
+                    .complete(Outcome::Overload);
+            }
+            let output = fetch(&downloader, &["bucket"]).await;
+            assert!(!output.hedged);
+            assert_eq!(output.latency, Duration::from_millis(1_010));
+            metrics(&downloader, "bucket").await;
+            assert_eq!(
+                object_body_tail(&downloader, "bucket"),
+                Some(Duration::from_secs(1)),
+                "overloaded: {overloaded}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1218,7 +1480,7 @@ mod tests {
             ("bucket", 10, 0, false),
         ]);
         script.service_errors.lock().extend([(0, 503), (2, 503)]);
-        seed_latency(&downloader, "bucket", 100).await;
+        seed_latency(&downloader, "bucket", 100);
         let config = RequestConfig {
             max_attempts: Some(3),
             initial_backoff: Some(Duration::from_millis(1)),
@@ -1234,7 +1496,7 @@ mod tests {
         );
         assert_eq!(script.requests.load(Ordering::SeqCst), 3);
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
-        assert_eq!(metrics(&downloader, "bucket").await.consecutive_failures, 0);
+        assert_eq!(metrics(&downloader, "bucket").await.consecutive_failures, 1);
     }
     #[tokio::test(start_paused = true)]
     async fn two_failed_copies_leave_the_third_available_without_hedge_credits() {
@@ -1273,7 +1535,7 @@ mod tests {
             })
             .unwrap();
         for (bucket, millis) in [("local", 10), ("peer", 60), ("third", 150)] {
-            seed_latency(&downloader, bucket, millis).await;
+            seed_latency(&downloader, bucket, millis);
         }
         let output = fetch(&downloader, &["local", "peer", "third"]).await;
         assert_eq!(output.used_bucket_idx, 2);
@@ -1300,7 +1562,7 @@ mod tests {
                 })
                 .unwrap();
             for (bucket, latency) in [("local", 250), ("peer", 300), ("third", 300)] {
-                seed_latency(&downloader, bucket, latency).await;
+                seed_latency(&downloader, bucket, latency);
             }
             let output = fetch(&downloader, &["local", "peer", "third"]).await;
             if primary_body_ms == 250 {
@@ -1326,12 +1588,12 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        seed_latency(&downloader, "local", 3).await;
-        seed_latency(&downloader, "peer", 5).await;
+        seed_latency(&downloader, "local", 3);
+        seed_latency(&downloader, "peer", 5);
         downloader
             .bucketed_stats
             .begin(&BucketName::new("local").unwrap(), None)
-            .complete(crate::object_store::stats::Outcome::Failure);
+            .complete(Outcome::Failure);
         advance(Duration::from_secs(37)).await;
         let output = fetch(&downloader, &["local", "peer"]).await;
         assert_eq!(output.primary_bucket_idx, 0);
@@ -1352,13 +1614,13 @@ mod tests {
             })
             .unwrap();
         for (bucket, millis) in [("local", 10), ("peer", 60), ("third", 150)] {
-            seed_latency(&downloader, bucket, millis).await;
+            seed_latency(&downloader, bucket, millis);
         }
         for bucket in ["local", "peer"] {
             downloader
                 .bucketed_stats
                 .begin(&BucketName::new(bucket).unwrap(), None)
-                .complete(crate::object_store::stats::Outcome::Failure);
+                .complete(Outcome::Failure);
         }
         let output = fetch(&downloader, &["local", "peer", "third"]).await;
         assert_eq!(output.used_bucket_idx, 0);
@@ -1373,13 +1635,42 @@ mod tests {
             ("third", 0, 50, false),
         ]);
         for (bucket, millis) in [("local", 10), ("peer", 20), ("third", 30)] {
-            seed_latency(&downloader, bucket, millis).await;
+            seed_latency(&downloader, bucket, millis);
         }
         let output = fetch(&downloader, &["local", "peer", "third"]).await;
         assert_eq!(output.used_bucket_idx, 0);
         assert_eq!(output.latency, Duration::from_millis(40));
         assert_eq!(script.requests.load(Ordering::SeqCst), 3);
-        assert!(metrics(&downloader, "peer").await.deprioritized);
+        let peer = metrics(&downloader, "peer").await;
+        assert!(peer.deprioritized);
+        assert_eq!(peer.first_byte_mean, Some(Duration::from_millis(20)));
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_rescue_does_not_cancel_the_primarys_body_hedge() {
+        let (downloader, script) = scripted_downloader([
+            ("local", 5, 1_000, false),
+            ("peer", 1, 0, false),
+            ("local", 0, 5, false),
+        ]);
+        script.service_errors.lock().insert(1, 404);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                page_timeout: Duration::from_millis(100),
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        downloader.bucketed_stats.seed(
+            &BucketName::new("local").unwrap(),
+            Sample::from_millis(10, 4, 70),
+        );
+        seed_latency(&downloader, "peer", 60);
+        let output = fetch(&downloader, &["local", "peer"]).await;
+        assert_eq!(output.used_bucket_idx, 0);
+        assert!(output.hedged);
+        assert_eq!(output.latency, Duration::from_millis(80));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
@@ -1394,8 +1685,8 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        seed_latency(&downloader, "local", 99).await;
-        seed_latency(&downloader, "peer", 100).await;
+        seed_latency(&downloader, "local", 99);
+        seed_latency(&downloader, "peer", 100);
         assert!(
             fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default())
                 .await
@@ -1421,18 +1712,28 @@ mod tests {
         assert!(matches!(result, Err(DownloadError::AdmissionTimeout)));
         let result = super::BucketOperation {
             downloader: &downloader,
-            bucket: &BucketName::new("local").unwrap(),
+            request: super::PieceRequest {
+                bucket: &BucketName::new("local").unwrap(),
+                object: &ObjectKey::new("object").unwrap(),
+                range: &(0..4),
+                config: &RequestConfig::default(),
+            },
+            model: downloader
+                .bucketed_stats
+                .model(&BucketName::new("local").unwrap()),
+            timeline: &RequestTimeline::default(),
             deadline: tokio::time::Instant::now(),
             unknown_latency: Duration::from_millis(10),
             probe: None,
         }
-        .execute(4, Some(permit), |_| async { Ok(()) })
+        .execute(Some(permit), async || Ok(()))
         .await;
         assert!(matches!(result, Err(DownloadError::Timeout { .. })));
         assert_eq!(script.requests.load(Ordering::SeqCst), 0);
-        let mut count = 0;
-        downloader.observe_bucket_metrics(|_, _| count += 1);
-        assert_eq!(count, 0);
+        let local = metrics(&downloader, "local").await;
+        assert!(!local.deprioritized);
+        assert_eq!(local.consecutive_failures, 0);
+        assert!(local.error_rate.abs() < f64::EPSILON);
         assert!(downloader.admission.try_acquire(4).is_some());
     }
     #[tokio::test(start_paused = true)]
@@ -1450,7 +1751,7 @@ mod tests {
             downloader
                 .bucketed_stats
                 .begin(&BucketName::new(bucket).unwrap(), None)
-                .complete(crate::object_store::stats::Outcome::Overload);
+                .complete(Outcome::Overload);
         }
         for _ in 0..2 {
             assert!(matches!(
@@ -1471,8 +1772,8 @@ mod tests {
     async fn cross_copy_hedge_has_one_sdk_attempt_while_the_primary_can_finish() {
         let (downloader, script) =
             scripted_downloader([("local", 0, 40, false), ("peer", 1, 0, false)]);
-        seed_latency(&downloader, "local", 10).await;
-        seed_latency(&downloader, "peer", 20).await;
+        seed_latency(&downloader, "local", 10);
+        seed_latency(&downloader, "peer", 20);
         script.service_errors.lock().insert(1, 503);
         let config = RequestConfig {
             max_attempts: Some(3),
@@ -1498,12 +1799,12 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        seed_latency(&downloader, "local", 3).await;
-        seed_latency(&downloader, "peer", 5).await;
+        seed_latency(&downloader, "local", 3);
+        seed_latency(&downloader, "peer", 5);
         downloader
             .bucketed_stats
             .begin(&BucketName::new("local").unwrap(), None)
-            .complete(crate::object_store::stats::Outcome::Failure);
+            .complete(Outcome::Failure);
         advance(Duration::from_secs(37)).await;
         let output = fetch(&downloader, &["local", "peer"]).await;
         assert_eq!(output.primary_bucket_idx, 1);
@@ -1524,12 +1825,12 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        seed_latency(&downloader, "local", 3).await;
-        seed_latency(&downloader, "peer", 5).await;
+        seed_latency(&downloader, "local", 3);
+        seed_latency(&downloader, "peer", 5);
         downloader
             .bucketed_stats
             .begin(&BucketName::new("local").unwrap(), None)
-            .complete(crate::object_store::stats::Outcome::Failure);
+            .complete(Outcome::Failure);
         advance(Duration::from_secs(37)).await;
 
         let occupied = downloader.admission.try_acquire(4).unwrap();
@@ -1558,8 +1859,8 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        seed_latency(&downloader, "local", 10).await;
-        seed_latency(&downloader, "peer", 20).await;
+        seed_latency(&downloader, "local", 10);
+        seed_latency(&downloader, "peer", 20);
         let output = fetch(&downloader, &["local", "peer"]).await;
         assert_eq!(output.used_bucket_idx, 0);
         assert!(!output.hedged);
@@ -1578,12 +1879,12 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        seed_latency(&downloader, "local", 400).await;
-        seed_latency(&downloader, "peer", 150).await;
+        seed_latency(&downloader, "local", 400);
+        seed_latency(&downloader, "peer", 150);
         downloader
             .bucketed_stats
             .begin(&BucketName::new("peer").unwrap(), None)
-            .complete(crate::object_store::stats::Outcome::Failure);
+            .complete(Outcome::Failure);
         let output = fetch(&downloader, &["local", "peer"]).await;
         assert_eq!(output.used_bucket_idx, 1);
         assert!(output.latency < Duration::from_millis(500));
@@ -1640,7 +1941,7 @@ mod tests {
             downloader
                 .bucketed_stats
                 .begin(&BucketName::new(bucket).unwrap(), None)
-                .complete(crate::object_store::stats::Outcome::Overload);
+                .complete(Outcome::Overload);
         }
         assert!(downloader.attempt_budget.try_retry());
         let result =
@@ -1675,7 +1976,7 @@ mod tests {
             downloader
                 .bucketed_stats
                 .begin(&BucketName::new(bucket).unwrap(), None)
-                .complete(crate::object_store::stats::Outcome::Overload);
+                .complete(Outcome::Overload);
         }
         assert!(downloader.attempt_budget.try_retry());
         let start = tokio::time::Instant::now();
@@ -1707,7 +2008,7 @@ mod tests {
             })
             .unwrap();
         for (bucket, latency) in [("local", 3), ("peer", 5), ("third", 6)] {
-            seed_latency(&downloader, bucket, latency).await;
+            seed_latency(&downloader, bucket, latency);
         }
         let result = fetch_with_config(
             &downloader,
@@ -1734,8 +2035,8 @@ mod tests {
                     ..DownloadLimits::default()
                 })
                 .unwrap();
-            seed_latency(&downloader, "local", 2).await;
-            seed_latency(&downloader, "peer", peer_latency).await;
+            seed_latency(&downloader, "local", 2);
+            seed_latency(&downloader, "peer", peer_latency);
             let start = tokio::time::Instant::now();
             let result =
                 fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
@@ -1760,8 +2061,8 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        seed_latency(&downloader, "local", 2).await;
-        seed_latency(&downloader, "peer", 150).await;
+        seed_latency(&downloader, "local", 2);
+        seed_latency(&downloader, "peer", 150);
         let output = fetch(&downloader, &["local", "peer"]).await;
         assert_eq!(output.used_bucket_idx, 1);
         assert_eq!(output.latency, Duration::from_millis(7));
@@ -1787,8 +2088,8 @@ mod tests {
                     ..DownloadLimits::default()
                 })
                 .unwrap();
-            seed_latency(&downloader, "local", 2).await;
-            seed_latency(&downloader, "peer", 5).await;
+            seed_latency(&downloader, "local", 2);
+            seed_latency(&downloader, "peer", 5);
             let start = tokio::time::Instant::now();
             let read = async {
                 let result =
