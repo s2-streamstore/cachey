@@ -221,7 +221,8 @@ struct Followups<'a> {
 impl<'a> Followups<'a> {
     /// The copy to start for `trigger`, if any. A fallback goes to an untried bucket, or else
     /// retries a failed body against its bucket once per read; the retry, like any copy while
-    /// every bucket reports overload, draws on the retry budget.
+    /// every bucket reports overload, draws on the retry budget. An early hedge skips a bucket
+    /// reporting overload.
     fn next(&mut self, trigger: Trigger, hedge: &mut HedgeTimer<'_>) -> Option<CopyAttempt<'a>> {
         if let Trigger::Rescue(index) = trigger
             && self.tried[index]
@@ -231,9 +232,8 @@ impl<'a> Followups<'a> {
         let early = matches!(trigger, Trigger::Hedge);
         let downloader = self.request.downloader;
         let routing = downloader.bucketed_stats.snapshot(self.request.buckets);
-        let overloaded = routing.all_overloaded();
         let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || (early && overloaded) {
+        if remaining.is_zero() {
             return None;
         }
         let index = match trigger {
@@ -243,6 +243,10 @@ impl<'a> Followups<'a> {
                 .best(&self.tried, remaining)
                 .or(retry.filter(|_| !self.retried))?,
         };
+        if early && routing.overloaded(index) {
+            return None;
+        }
+        let overloaded = routing.all_overloaded();
         let retrying = !early && self.tried[index];
         if (overloaded || retrying) && !downloader.attempt_budget.try_retry() {
             self.retry_budget_exhausted |= overloaded;

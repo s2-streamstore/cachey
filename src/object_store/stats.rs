@@ -791,6 +791,10 @@ impl RoutingSnapshot {
         self.0[index].model
     }
 
+    pub fn overloaded(&self, index: usize) -> bool {
+        self.0[index].overloaded
+    }
+
     pub fn all_overloaded(&self) -> bool {
         self.0.iter().all(|bucket| bucket.overloaded)
     }

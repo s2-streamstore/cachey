@@ -74,14 +74,15 @@ has a copy and one retry of a failed body, with up to three copies active per pa
 first validated result wins and cancels the others.
 
 Early hedges use one SDK attempt, against another bucket when available or the
-primary's bucket otherwise. They start only before the primary's bucket deadline, and
-one against the same bucket shares that deadline, so a single-bucket read ends by its
-bucket deadline. A hedge is timed in two phases. Before headers arrive, it starts at the
-p99 time to first byte after the primary request starts, excluding admission wait. Once
-headers announce the body length, it starts when the body has taken longer than both its
-body tail and the p99 time to first byte. A phase whose tail is zero, or a body in a
-size class the bucket has not served, is not hedged early. Each phase is one opportunity,
-so a hedge that cannot start before headers may still start during the body.
+primary's bucket otherwise, and never against a bucket that recently reported overload.
+They start only before the primary's bucket deadline, and one against the same bucket
+shares that deadline, so a single-bucket read ends by its bucket deadline. A hedge is
+timed in two phases. Before headers arrive, it starts at the p99 time to first byte
+after the primary request starts, excluding admission wait. Once headers announce the
+body length, it starts when the body has taken longer than both its body tail and the
+p99 time to first byte. A phase whose tail is zero, or a body in a size class the
+bucket has not served, is not hedged early. Each phase is one opportunity, so a hedge
+that cannot start before headers may still start during the body.
 
 A single-bucket read hedges against its own bucket under the same rules. Each copy
 records its own health outcome, so throttling or a failure in one copy counts even when
@@ -96,10 +97,9 @@ another request would likely repeat, so it is not retried against its bucket.
 
 By default, the shared budget permits one startup hedge and earns another per 20
 successful pages. Setting the budget to zero disables early hedges; fallback and
-deadline rescue remain available. When every bucket has recently reported overload,
-early hedges stop. Body retries, and extra attempts during such overload, draw on a
-separate retry budget that permits one at startup and earns another per 10 successful
-pages.
+deadline rescue remain available. Body retries, and extra attempts while every bucket
+has recently reported overload, draw on a separate retry budget that permits one at
+startup and earns another per 10 successful pages.
 
 ## Limits
 

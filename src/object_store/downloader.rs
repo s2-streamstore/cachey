@@ -1067,6 +1067,52 @@ mod tests {
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
+    /// The local primary's body hedge is due at 59ms, after a rescue gave the peer a copy at 40ms.
+    fn hedge_after_rescue(
+        responses: [ResponseStep; 3],
+    ) -> (Downloader, Arc<ScriptState>, BucketName) {
+        let (downloader, script) = scripted_downloader(responses);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                page_timeout: Duration::from_millis(100),
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        let local = BucketName::new("local").unwrap();
+        downloader
+            .bucketed_stats
+            .seed(&local, Sample::from_millis(30, 4, 2));
+        seed_latency(&downloader, "peer", 30);
+        (downloader, script, local)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hedge_does_not_return_to_a_primary_reporting_overload() {
+        let (downloader, script, local) = hedge_after_rescue([
+            ("local", 29, 1_000, false),
+            ("peer", 1_000, 0, false),
+            ("local", 0, 0, false),
+        ]);
+        downloader
+            .bucketed_stats
+            .begin(&local, None)
+            .complete(Outcome::Overload);
+        for _ in 0..2 {
+            downloader
+                .bucketed_stats
+                .begin(&BucketName::new("peer").unwrap(), None)
+                .complete(Outcome::Failure);
+        }
+        let result =
+            fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
+        assert!(
+            matches!(result, Err(DownloadError::Timeout { .. })),
+            "{result:?}"
+        );
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_primary_finishing_with_or_before_its_hedge_wins_and_is_measured() {
         for hedge_body_ms in [190, 40] {
