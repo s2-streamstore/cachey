@@ -8,3 +8,13 @@
 crate = "rustls"
 version = "0.23.46"
 advisory = "RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, RUSTSEC-2026-0349"
+
+[[exception]]
+crate = "rustls-webpki"
+version = "0.103.16"
+advisory = "RUSTSEC-2026-0382"
+
+[[exception]]
+crate = "webpki-root-certs"
+version = "1.0.10"
+advisory = "RUSTSEC-2026-0383"
