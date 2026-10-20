@@ -24,13 +24,14 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     object_store::{DownloadError, RequestConfig},
-    service::{CacheyService, Chunk, ServiceError, metrics},
+    service::{CacheyService, Chunk, PAGE_SIZE, ServiceError, metrics},
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
 };
 
 const CONTENT_TYPE: &str = "application/octet-stream";
 static C0_BUCKET_HEADER: HeaderName = HeaderName::from_static("c0-bucket");
 static C0_CONFIG_HEADER: HeaderName = HeaderName::from_static("c0-config");
+static C0_EXACT_HEADER: HeaderName = HeaderName::from_static("c0-exact");
 
 fn on_chunk_error(
     kind: &ObjectKind,
@@ -204,6 +205,28 @@ where
     }
 }
 
+#[derive(Debug)]
+pub struct ExactHeader(pub bool);
+
+impl<S> FromRequestParts<S> for ExactHeader
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let Some(header_value) = parts.headers.get(&C0_EXACT_HEADER) else {
+            return Ok(Self(false));
+        };
+        header_value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Self)
+            .ok_or((StatusCode::BAD_REQUEST, "Invalid C0-Exact header"))
+    }
+}
+
 #[instrument(skip(service))]
 #[allow(clippy::too_many_lines)]
 pub async fn fetch(
@@ -211,10 +234,19 @@ pub async fn fetch(
     Path((kind, object)): Path<(ObjectKind, ObjectKey)>,
     method: axum::http::Method,
     RangeHeader(byterange): RangeHeader,
+    ExactHeader(exact): ExactHeader,
     BucketHeaders(buckets): BucketHeaders,
     req_config: RequestConfig,
 ) -> Response {
     let start = Instant::now();
+
+    if exact && byterange.end - byterange.start > PAGE_SIZE {
+        return (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "Exact range exceeds the page size",
+        )
+            .into_response();
+    }
 
     let buckets = if buckets.is_empty() {
         BucketName::from(kind.clone()).into()
@@ -239,6 +271,7 @@ pub async fn fetch(
                 object,
                 buckets,
                 byterange.clone(),
+                exact,
                 concurrency,
                 req_config,
             )
