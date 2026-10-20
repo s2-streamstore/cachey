@@ -183,6 +183,18 @@ impl ReplicaRequest<'_> {
     }
 }
 
+/// What may start a copy after the primary.
+#[derive(Debug, Clone, Copy)]
+enum Trigger {
+    /// A copy failed. With no other copy in flight, `retry` names the bucket whose body last
+    /// failed after headers.
+    Fallback { retry: Option<usize> },
+    /// The rescue timer reserved for a bucket fired.
+    Rescue(usize),
+    /// The primary's hedge timer fired.
+    Hedge,
+}
+
 /// Chooses the bucket and permits for each copy after the primary.
 struct Followups<'a> {
     downloader: &'a Downloader,
@@ -193,35 +205,46 @@ struct Followups<'a> {
     primary_timeline: &'a RequestTimeline,
     /// Buckets given a copy.
     tried: Vec<bool>,
+    /// Whether a failed body was retried against its bucket.
+    retried: bool,
     backup_admission: Option<DownloadPermit>,
 }
 
 impl<'a> Followups<'a> {
-    /// The copy to start for a rescue `scheduled` to a bucket, an `early` hedge, or a fallback
-    /// after an error, if any.
+    /// The copy to start for `trigger`, if any. A fallback goes to an untried bucket, or else
+    /// retries a failed body against its bucket once per read; the retry, like any copy while
+    /// every bucket reports overload, draws on the retry budget.
     fn next(
         &mut self,
-        early: bool,
-        scheduled: Option<usize>,
+        trigger: Trigger,
         hedge: &mut HedgeTimer<'_>,
         fallback_errors: &mut FallbackErrors,
     ) -> Option<CopyAttempt<'a>> {
-        if scheduled.is_some_and(|index| self.tried[index]) {
+        if let Trigger::Rescue(index) = trigger
+            && self.tried[index]
+        {
             return None;
         }
+        let early = matches!(trigger, Trigger::Hedge);
         let routing = self.downloader.bucketed_stats.snapshot(self.buckets);
         let overloaded = routing.all_overloaded();
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || (early && overloaded) {
             return None;
         }
-        let index = scheduled
-            .or_else(|| routing.best(&self.tried, remaining))
-            .or_else(|| early.then_some(self.primary))?;
-        if overloaded && !self.downloader.attempt_budget.try_retry() {
-            fallback_errors.retry_budget_exhausted = true;
+        let index = match trigger {
+            Trigger::Rescue(index) => index,
+            Trigger::Hedge => routing.best(&self.tried, remaining).unwrap_or(self.primary),
+            Trigger::Fallback { retry } => routing
+                .best(&self.tried, remaining)
+                .or(retry.filter(|_| !self.retried))?,
+        };
+        let retrying = !early && self.tried[index];
+        if (overloaded || retrying) && !self.downloader.attempt_budget.try_retry() {
+            fallback_errors.retry_budget_exhausted |= overloaded;
             return None;
         }
+        self.retried |= retrying;
         let permits = if early {
             let admission = self.downloader.admission.try_acquire(self.bytes)?;
             let Some(budget) = self
@@ -266,7 +289,9 @@ impl<'a> Followups<'a> {
 impl Downloader {
     /// Copies from the same bucket share its bucket deadline. An early hedge goes to the primary's
     /// bucket once no other bucket is untried, so a single bucket hedges against itself; there, an
-    /// error that another copy from the same bucket would repeat ends the read.
+    /// error that another copy from the same bucket would repeat ends the read. A body that fails
+    /// after its headers is retried against its bucket once no untried bucket or other copy
+    /// remains.
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -311,6 +336,7 @@ impl Downloader {
             primary,
             primary_timeline: &primary_timeline,
             tried,
+            retried: false,
             backup_admission,
         };
         let mut hedge = HedgeTimer::new(
@@ -329,37 +355,42 @@ impl Downloader {
             permits: primary_permits,
         }));
         let mut fallback_errors = FallbackErrors::default();
+        let mut body_failed = None;
         while !active.is_empty() {
             let next_rescue = rescues
                 .front()
                 .map_or(deadline, |(after, _)| start + *after);
-            let (early, scheduled) = select! {
+            let trigger = select! {
                 biased;
                 Some((index, result)) = active.next() => {
-                    match result {
+                    let error = match result {
                         Ok(piece) => return Ok(request.output(piece, primary, index, start)),
-                        Err(error) => {
-                            if !error.should_attempt_fallback_bucket()
-                                || (single_bucket && !error.should_wait_for_hedged_peer())
-                            {
-                                return Err(error);
-                            }
-                            fallback_errors.record(error);
-                            if index == primary {
-                                hedge.disarm();
-                            }
-                        }
+                        Err(error) => error,
+                    };
+                    if !error.should_attempt_fallback_bucket()
+                        || (single_bucket && !error.should_wait_for_hedged_peer())
+                    {
+                        return Err(error);
                     }
-                    (false, None)
+                    if error.should_retry_same_bucket() {
+                        body_failed = Some(index);
+                    }
+                    fallback_errors.record(error);
+                    if index == primary {
+                        hedge.disarm();
+                    }
+                    Trigger::Fallback { retry: body_failed.filter(|_| active.is_empty()) }
                 },
                 () = sleep_until(next_rescue), if !rescues.is_empty() => {
-                    (false, rescues.pop_front().map(|(_, index)| index))
+                    let Some((_, index)) = rescues.pop_front() else {
+                        continue;
+                    };
+                    Trigger::Rescue(index)
                 },
-                () = hedge.due() => (true, None),
+                () = hedge.due() => Trigger::Hedge,
             };
             if active.len() < MAX_CONCURRENT_COPIES
-                && let Some(copy) =
-                    followups.next(early, scheduled, &mut hedge, &mut fallback_errors)
+                && let Some(copy) = followups.next(trigger, &mut hedge, &mut fallback_errors)
             {
                 active.push(request.attempt(copy));
             }

@@ -401,6 +401,18 @@ async fn simulation_slow_full_pages_are_hedged_at_their_own_tail() {
     }
 }
 
+/// A connection reset after headers, which the SDK cannot retry, is retried against the same
+/// bucket, so a single-bucket read survives it.
+#[tokio::test(start_paused = true)]
+async fn simulation_body_resets_on_one_bucket_are_retried() {
+    let scenario = model::scenarios()
+        .into_iter()
+        .find(|scenario| scenario.name == "s3_standard_body_resets")
+        .unwrap();
+    let report = simulate(scenario, 7, false, false).await;
+    assert_eq!(report.completed, report.arrivals, "{report:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn simulation_reservations_survive_reordering_and_admission_wait() {
     for name in [

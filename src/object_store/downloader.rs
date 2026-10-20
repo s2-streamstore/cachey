@@ -94,6 +94,12 @@ impl DownloadError {
         }
     }
 
+    /// A body that fails after its headers, which the SDK cannot retry, is likely to succeed on
+    /// another request to the same bucket.
+    fn should_retry_same_bucket(&self) -> bool {
+        matches!(self, Self::BodyStreaming(_))
+    }
+
     fn health_outcome(&self, expected: Duration) -> Outcome {
         match self {
             Self::Overloaded(_) => Outcome::Overload,
@@ -597,6 +603,12 @@ mod tests {
         (downloader, state)
     }
 
+    /// Spends the retry budget, so a read ends on its copies' errors rather than retrying a failed
+    /// body.
+    fn spend_retry_budget(downloader: &Downloader) {
+        while downloader.attempt_budget.try_retry() {}
+    }
+
     async fn fetch(downloader: &Downloader, buckets: &[&str]) -> DownloadOutput {
         fetch_with_config(downloader, buckets, &RequestConfig::default())
             .await
@@ -922,6 +934,43 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_body_failing_after_headers_is_retried_against_its_bucket() {
+        let (downloader, script) =
+            scripted_downloader([("bucket", 5, 5, true), ("bucket", 5, 5, false)]);
+        let output = fetch(&downloader, &["bucket"]).await;
+        assert_eq!(output.latency, Duration::from_millis(20));
+        assert!(!output.hedged);
+        assert!(metrics(&downloader, "bucket").await.deprioritized);
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_retries_a_failed_body_once_and_only_within_the_retry_budget() {
+        for funded in [true, false] {
+            let (downloader, script) =
+                scripted_downloader([("bucket", 5, 5, true), ("bucket", 5, 5, true)]);
+            if funded {
+                for _ in 0..20 {
+                    downloader.attempt_budget.observe_success();
+                }
+            } else {
+                spend_retry_budget(&downloader);
+            }
+            let result =
+                fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+            assert!(
+                matches!(result, Err(DownloadError::BodyStreaming(_))),
+                "{result:?}"
+            );
+            assert_eq!(
+                script.requests.load(Ordering::SeqCst),
+                if funded { 2 } else { 1 }
+            );
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_primary_failure_survives_its_hedges_timeout() {
         let (downloader, script) =
             scripted_downloader([("bucket", 1, 92, true), ("bucket", 100, 0, false)]);
@@ -1000,6 +1049,7 @@ mod tests {
             ("bucket", 1_000, 0, false),
         ]);
         fetch(&downloader, &["bucket"]).await;
+        spend_retry_budget(&downloader);
         let config = RequestConfig {
             operation_timeout: Some(Duration::from_millis(50)),
             ..RequestConfig::default()
@@ -1059,12 +1109,9 @@ mod tests {
             fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
             Err(DownloadError::NoSuchKey)
         ));
-        assert!(matches!(
-            fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
-            Err(DownloadError::BodyStreaming(_))
-        ));
         fetch(&downloader, &["bucket"]).await;
         fetch(&downloader, &["bucket"]).await;
+        assert_eq!(script.requests.load(Ordering::SeqCst), 4);
 
         let metrics = metrics(&downloader, "bucket").await;
         assert_eq!(metrics.latency_mean, Some(Duration::from_millis(135)));
@@ -1907,6 +1954,7 @@ mod tests {
         for missing in [&[0][..], &[1][..], &[0, 1][..]] {
             let (downloader, script) =
                 scripted_downloader([("local", 1, 1, true), ("peer", 1, 1, true)]);
+            spend_retry_budget(&downloader);
             script
                 .service_errors
                 .lock()

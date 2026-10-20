@@ -68,10 +68,10 @@ recovery completes.
 The page deadline includes admission, SDK retries, and body validation. Each copy
 also has a bucket deadline starting at admission. Recoverable errors and rescue
 timers start untried replicas; timers reserve execution time for alternatives,
-including unmeasured buckets. Multi-bucket reads try each bucket at most once at
-the downloader layer, apart from an early hedge against the primary's bucket once
-every other bucket has a copy, with up to three copies active per page. The first
-validated result wins and cancels the others.
+including unmeasured buckets. Reads try each bucket at most once at the downloader
+layer, apart from an early hedge against the primary's bucket once every other bucket
+has a copy and one retry of a failed body, with up to three copies active per page. The
+first validated result wins and cancels the others.
 
 Early hedges use one SDK attempt, against another bucket when available or the
 primary's bucket otherwise. They start only before the primary's bucket deadline, and
@@ -88,10 +88,16 @@ records its own health outcome, so throttling or a failure in one copy counts ev
 its peer succeeds, and a copy that fails transiently waits for its peer. An error that
 another copy from the same bucket would repeat, such as a missing object, ends the read.
 
+A body that fails after its headers, which the SDK cannot retry, is retried once per
+read against its bucket when no untried bucket remains and no other copy is in flight.
+Like a hedge, a retry against the primary's bucket shares its bucket deadline.
+
 By default, the shared budget permits one startup hedge and earns another per 20
 successful pages. Setting the budget to zero disables early hedges; fallback and
 deadline rescue remain available. When every bucket has recently reported overload,
-early hedges stop and extra attempts use a separate success-funded retry budget.
+early hedges stop. Body retries, and extra attempts during such overload, draw on a
+separate retry budget that permits one at startup and earns another per 10 successful
+pages.
 
 ## Limits
 
