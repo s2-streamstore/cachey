@@ -88,9 +88,11 @@ records its own health outcome, so throttling or a failure in one copy counts ev
 its peer succeeds, and a copy that fails transiently waits for its peer. An error that
 another copy from the same bucket would repeat, such as a missing object, ends the read.
 
-A body that fails after its headers, which the SDK cannot retry, is retried once per
-read against its bucket when no untried bucket remains and no other copy is in flight.
-Like a hedge, a retry against the primary's bucket shares its bucket deadline.
+A body whose transfer fails after its headers, which the SDK cannot retry, is retried
+once per read against its bucket when no untried bucket remains and no other copy is in
+flight. Like a hedge, a retry against the primary's bucket shares its bucket deadline. A
+body whose length disagrees with its `Content-Range` is an invalid response, which
+another request would likely repeat, so it is not retried against its bucket.
 
 By default, the shared budget permits one startup hedge and earns another per 20
 successful pages. Setting the budget to zero disables early hedges; fallback and

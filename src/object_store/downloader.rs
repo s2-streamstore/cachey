@@ -94,8 +94,9 @@ impl DownloadError {
         }
     }
 
-    /// A body that fails after its headers, which the SDK cannot retry, is likely to succeed on
-    /// another request to the same bucket.
+    /// A body whose transfer fails after its headers, which the SDK cannot retry, is likely to
+    /// succeed on another request to the same bucket. A body whose length disagrees with its
+    /// headers is an invalid response instead.
     fn should_retry_same_bucket(&self) -> bool {
         matches!(self, Self::BodyStreaming(_))
     }
@@ -426,14 +427,14 @@ impl Downloader {
             .map_err(|error| DownloadError::BodyStreaming(error.to_string()))?
         {
             if chunk.len() as u64 > expected_data_len.saturating_sub(data.len() as u64) {
-                return Err(DownloadError::BodyStreaming(format!(
+                return Err(DownloadError::InvalidResponse(format!(
                     "Body exceeds expected {expected_data_len} bytes"
                 )));
             }
             data.extend_from_slice(&chunk);
         }
         if data.len() as u64 != expected_data_len {
-            return Err(DownloadError::BodyStreaming(format!(
+            return Err(DownloadError::InvalidResponse(format!(
                 "Expected {expected_data_len} bytes, got {}",
                 data.len()
             )));
@@ -698,7 +699,7 @@ mod tests {
             )
             .await
             .expect("excess data must be rejected without waiting for the rest of the body");
-            assert!(matches!(result, Err(DownloadError::BodyStreaming(_))));
+            assert!(matches!(result, Err(DownloadError::InvalidResponse(_))));
         }
     }
 
