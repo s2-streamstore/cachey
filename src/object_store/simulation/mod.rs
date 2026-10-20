@@ -401,6 +401,84 @@ async fn simulation_slow_full_pages_are_hedged_at_their_own_tail() {
     }
 }
 
+/// Checks that at least `min_rescued` reads were hedged, that each finished within `bound_ms` of
+/// the fixture and its length, and that at most 1% of reads took longer unhedged.
+async fn assert_stalls_are_rescued(
+    name: &str,
+    min_rescued: usize,
+    bound_ms: impl Fn(&model::Scenario, usize) -> u64,
+) -> Vec<Report> {
+    let mut reports = Vec::new();
+    for seed in [7, 42, 2026] {
+        let scenario = model::scenarios()
+            .into_iter()
+            .find(|scenario| scenario.name == name)
+            .unwrap();
+        let shape = scenario.clone();
+        let late =
+            |read: &Read| read.end_us - read.arrival_us > bound_ms(&shape, read.body_bytes) * 1000;
+        let report = simulate(scenario, seed, false, true).await;
+        assert_eq!(report.completed, report.arrivals, "seed {seed}");
+        let (rescued, unhedged): (Vec<_>, Vec<_>) =
+            report.reads.iter().flatten().partition(|read| read.hedged);
+        assert!(
+            rescued.len() >= min_rescued,
+            "seed {seed}: {}",
+            rescued.len()
+        );
+        let late_rescues = rescued
+            .iter()
+            .filter(|read| late(read))
+            .map(|read| (read.body_bytes, read.end_us - read.arrival_us))
+            .collect::<Vec<_>>();
+        assert!(late_rescues.is_empty(), "seed {seed}: {late_rescues:?}");
+        let late_unhedged = unhedged.iter().filter(|read| late(read)).count();
+        assert!(
+            late_unhedged * 100 <= report.arrivals,
+            "seed {seed}: {late_unhedged}"
+        );
+        reports.push(report);
+    }
+    reports
+}
+
+/// As on S3, fixed latency comes before the first byte and bodies stream at a steady rate. A hedge
+/// started at the first-byte tail, or at the body tail for the announced length, finishes within
+/// about two and a half nominal reads of that length. Stalls outnumber 1% of reads, so they must
+/// not set the tails; only reads the budget leaves unhedged may take longer.
+#[tokio::test(start_paused = true)]
+async fn simulation_s3_shaped_stalls_are_hedged_at_size_aware_tails() {
+    assert_stalls_are_rescued("s3_standard_stalls", 10, |scenario, bytes| {
+        let replica = &scenario.replicas[0];
+        (replica.headers_ms(bytes) + replica.body_ms(bytes)) * 5 / 2 + 30
+    })
+    .await;
+}
+
+/// As on Capacitor, the server reads and verifies the whole chunk before sending headers, so time
+/// to first byte grows with chunk length, and the body follows from memory. A stalled read of any
+/// length waits for the first-byte tail of full chunks, then a hedge to another zone, and finishes
+/// within three nominal full-chunk reads from the local zone. A stall the startup budget leaves
+/// unhedged raises the local zone's routing latency, and the rise must decay rather than keep
+/// reads in other zones, so the local zone serves at least half of them.
+#[tokio::test(start_paused = true)]
+async fn simulation_capacitor_shaped_stalls_are_hedged_to_another_zone() {
+    let reports = assert_stalls_are_rescued("capacitor_stalls", 5, |scenario, _| {
+        let local = &scenario.replicas[0];
+        (local.headers_ms(scenario.body_bytes) + local.body_ms(scenario.body_bytes)) * 3
+    })
+    .await;
+    for report in reports {
+        let local_wins = report
+            .reads
+            .iter()
+            .flatten()
+            .filter(|read| read.winner == Some(0))
+            .count();
+        assert!(local_wins * 2 >= report.arrivals, "{local_wins}");
+    }
+}
+
 /// A connection reset after headers, which the SDK cannot retry, is retried against the same
 /// bucket, so a single-bucket read survives it.
 #[tokio::test(start_paused = true)]
