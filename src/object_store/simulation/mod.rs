@@ -255,6 +255,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                             replica: bucket.strip_prefix("replica-").unwrap().parse().unwrap(),
                             deprioritized: metrics.deprioritized,
                             recovery_successes: metrics.recovery_successes,
+                            estimates: metrics.into(),
                         });
                     });
                     health.sort_by_key(|health| health.replica);
@@ -306,6 +307,13 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
         .await
 }
 
+fn scenario_named(name: &str) -> Scenario {
+    model::scenarios()
+        .into_iter()
+        .find(|scenario| scenario.name == name)
+        .unwrap()
+}
+
 #[tokio::test(start_paused = true)]
 async fn simulation_guarantees() {
     for name in [
@@ -323,10 +331,7 @@ async fn simulation_guarantees() {
         "s3_express_single_zone_slow_bodies",
         "s3_express_header_stalls_page_admission",
     ] {
-        let mut scenario = model::scenarios()
-            .into_iter()
-            .find(|scenario| scenario.name == name)
-            .unwrap();
+        let mut scenario = scenario_named(name);
         if !matches!(
             name,
             "s3_standard_internal_errors"
@@ -360,13 +365,91 @@ async fn simulation_guarantees() {
 
 #[tokio::test(start_paused = true)]
 async fn simulation_reads_finishing_at_their_tail_are_not_hedged() {
-    let scenario = model::scenarios()
-        .into_iter()
-        .find(|scenario| scenario.name == "s3_express_healthy_page_admission")
-        .unwrap();
+    let scenario = scenario_named("s3_express_healthy_page_admission");
     let report = simulate(scenario, 7, false, false).await;
     assert_eq!(report.completed, report.arrivals, "{report:?}");
     assert_eq!(report.overlapping_reads, 0, "{report:?}");
+}
+
+/// Checks that at least `min_rescued` reads were hedged, that each finished within `bound_ms` of
+/// the fixture and its length, and that at most 1% of reads took longer unhedged.
+async fn assert_stalls_are_rescued(
+    name: &str,
+    min_rescued: usize,
+    bound_ms: impl Fn(&model::Scenario, usize) -> u64,
+) -> Vec<Report> {
+    let mut reports = Vec::new();
+    for seed in [7, 42, 2026] {
+        let scenario = scenario_named(name);
+        let shape = scenario.clone();
+        let late = |read: &Read| read.latency_us() > bound_ms(&shape, read.body_bytes) * 1000;
+        let report = simulate(scenario, seed, false, true).await;
+        assert_eq!(report.completed, report.arrivals, "seed {seed}");
+        let (rescued, unhedged): (Vec<_>, Vec<_>) =
+            report.reads.iter().flatten().partition(|read| read.hedged);
+        assert!(
+            rescued.len() >= min_rescued,
+            "seed {seed}: {}",
+            rescued.len()
+        );
+        let late_rescues = rescued
+            .iter()
+            .filter(|read| late(read))
+            .map(|read| (read.body_bytes, read.latency_us()))
+            .collect::<Vec<_>>();
+        assert!(late_rescues.is_empty(), "seed {seed}: {late_rescues:?}");
+        let late_unhedged = unhedged.iter().filter(|read| late(read)).count();
+        assert!(
+            late_unhedged * 100 <= report.arrivals,
+            "seed {seed}: {late_unhedged}"
+        );
+        reports.push(report);
+    }
+    reports
+}
+
+/// As on S3, fixed latency comes before the first byte and bodies stream at a steady rate. A hedge
+/// started at the first-byte tail, or at the body tail for the announced length, finishes within
+/// about two and a half nominal reads of that length. Stalls outnumber 1% of reads, so they must
+/// not set the tails; only reads the budget leaves unhedged may take longer.
+#[tokio::test(start_paused = true)]
+async fn simulation_s3_shaped_stalls_are_hedged_at_size_aware_tails() {
+    assert_stalls_are_rescued("s3_standard_stalls", 10, |scenario, bytes| {
+        scenario.replicas[0].read_ms(bytes) * 5 / 2 + 30
+    })
+    .await;
+}
+
+/// As on Capacitor, the server reads and verifies the whole chunk before sending headers, so time
+/// to first byte grows with chunk length, and the body follows from memory. A stalled read of any
+/// length waits for the first-byte tail of full chunks, then a hedge to another zone, and finishes
+/// within three nominal full-chunk reads from the local zone. A stall the startup budget leaves
+/// unhedged raises the local zone's routing latency, and the rise must decay rather than keep
+/// reads in other zones, so the local zone serves at least half of them.
+#[tokio::test(start_paused = true)]
+async fn simulation_capacitor_shaped_stalls_are_hedged_to_another_zone() {
+    let reports = assert_stalls_are_rescued("capacitor_stalls", 5, |scenario, _| {
+        scenario.replicas[0].read_ms(scenario.body_bytes) * 3
+    })
+    .await;
+    for report in reports {
+        let local_wins = report
+            .reads
+            .iter()
+            .flatten()
+            .filter(|read| read.winner == Some(0))
+            .count();
+        assert!(local_wins * 2 >= report.arrivals, "{local_wins}");
+    }
+}
+
+/// A connection reset after headers, which the SDK cannot retry, is retried against the same
+/// bucket, so a single-bucket read survives it.
+#[tokio::test(start_paused = true)]
+async fn simulation_body_resets_on_one_bucket_are_retried() {
+    let scenario = scenario_named("s3_standard_body_resets");
+    let report = simulate(scenario, 7, false, false).await;
+    assert_eq!(report.completed, report.arrivals, "{report:?}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -375,10 +458,7 @@ async fn simulation_reservations_survive_reordering_and_admission_wait() {
         "s3_standard_cross_region_deadline",
         "s3_standard_queued_long_read",
     ] {
-        let scenario = model::scenarios()
-            .into_iter()
-            .find(|scenario| scenario.name == name)
-            .unwrap();
+        let scenario = scenario_named(name);
         let report = simulate(scenario, 7, false, true).await;
         assert_eq!(report.completed, report.arrivals, "{name}: {report:?}");
     }
@@ -386,10 +466,7 @@ async fn simulation_reservations_survive_reordering_and_admission_wait() {
 
 #[tokio::test(start_paused = true)]
 async fn simulation_repeatability_and_cancellation() {
-    let mut scenario = model::scenarios()
-        .into_iter()
-        .find(|scenario| scenario.name == "s3_express_independent_errors")
-        .unwrap();
+    let mut scenario = scenario_named("s3_express_independent_errors");
     scenario.duration_ms = 500;
     scenario.faults[0].start_ms = 0;
     let first = simulate(scenario.clone(), 42, false, true).await;
@@ -398,10 +475,7 @@ async fn simulation_repeatability_and_cancellation() {
         serde_json::to_value(first).unwrap(),
         serde_json::to_value(second).unwrap()
     );
-    let recovery = model::scenarios()
-        .into_iter()
-        .find(|scenario| scenario.name == "s3_express_recovery_during_peer_outage")
-        .unwrap();
+    let recovery = scenario_named("s3_express_recovery_during_peer_outage");
     let recovery_report = simulate(recovery, 7, false, true).await;
     assert_eq!(
         recovery_report
@@ -411,10 +485,7 @@ async fn simulation_repeatability_and_cancellation() {
             .count(),
         1
     );
-    let scenario = model::scenarios()
-        .into_iter()
-        .find(|scenario| scenario.name == "s3_express_caller_cancellation")
-        .unwrap();
+    let scenario = scenario_named("s3_express_caller_cancellation");
     let report = simulate(scenario, 7, false, true).await;
     assert_eq!(
         report.errors.get("caller_cancelled"),
@@ -429,10 +500,7 @@ async fn simulation_rescue_preserves_availability_and_work_under_overload() {
         ("capacitor_overload", 1807, 3100),
         ("s3_express_overload_sdk_retries", 1806, 3620),
     ] {
-        let scenario = model::scenarios()
-            .into_iter()
-            .find(|scenario| scenario.name == name)
-            .unwrap();
+        let scenario = scenario_named(name);
         let report = simulate(scenario, 7, false, false).await;
         assert!(report.completed >= completed, "{name}: {report:?}");
         assert!(report.transport_attempts <= attempts, "{name}: {report:?}");

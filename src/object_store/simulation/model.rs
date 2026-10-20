@@ -42,6 +42,10 @@ impl Replica {
     pub fn body_ms(&self, body_bytes: usize) -> u64 {
         self.body_ms + self.body_ms_per_mib * body_bytes as u64 / MIB
     }
+
+    pub fn read_ms(&self, body_bytes: usize) -> u64 {
+        self.headers_ms(body_bytes) + self.body_ms(body_bytes)
+    }
 }
 
 /// A share of reads whose response is shorter than `body_bytes`: the last page of an object, or

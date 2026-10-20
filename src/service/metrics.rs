@@ -2,9 +2,8 @@ use std::{sync::LazyLock, time::Duration};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use prometheus::{
-    Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
-    register_gauge_vec, register_histogram_vec, register_int_counter_vec, register_int_gauge,
-    register_int_gauge_vec,
+    Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, TextEncoder, register_gauge_vec,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge,
 };
 
 use crate::{
@@ -12,67 +11,90 @@ use crate::{
     types::{BucketName, ObjectKind},
 };
 
+fn seconds(duration: Option<Duration>) -> Option<f64> {
+    duration.map(|duration| duration.as_secs_f64())
+}
+
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
-    static ERROR_RATE: LazyLock<GaugeVec> = LazyLock::new(|| {
-        register_gauge_vec!(
-            "cachey_bucket_error_ratio",
-            "Exponentially decayed fraction of completed bucket fetches that failed",
-            &["bucket"]
-        )
-        .unwrap()
+    type BucketGauge = (GaugeVec, fn(&BucketMetrics) -> Option<f64>);
+
+    static GAUGES: LazyLock<[BucketGauge; 9]> = LazyLock::new(|| {
+        let gauge = |name: &str, help: &str| register_gauge_vec!(name, help, &["bucket"]).unwrap();
+        [
+            (
+                gauge(
+                    "cachey_bucket_error_ratio",
+                    "Exponentially decayed fraction of completed bucket fetches that failed",
+                ),
+                |metrics| Some(metrics.error_rate),
+            ),
+            (
+                gauge(
+                    "cachey_bucket_latency_mean_seconds",
+                    "Mean time from starting a request to its validated body, including SDK retries",
+                ),
+                |metrics| seconds(metrics.latency_mean),
+            ),
+            (
+                gauge(
+                    "cachey_bucket_latency_p99_seconds",
+                    "p99 time from starting a request to its validated body, including SDK retries",
+                ),
+                |metrics| seconds(metrics.latency_p99),
+            ),
+            (
+                gauge(
+                    "cachey_bucket_first_byte_mean_seconds",
+                    "Mean time from starting a request to successful response headers, including SDK retries",
+                ),
+                |metrics| seconds(metrics.first_byte_mean),
+            ),
+            (
+                gauge(
+                    "cachey_bucket_first_byte_p99_seconds",
+                    "p99 time from starting a request to successful response headers, including SDK retries",
+                ),
+                |metrics| seconds(metrics.first_byte_p99),
+            ),
+            (
+                gauge(
+                    "cachey_bucket_small_body_p99_seconds",
+                    "p99 time to read a response body under 1 MiB after its headers",
+                ),
+                |metrics| seconds(metrics.small_body_p99),
+            ),
+            (
+                gauge(
+                    "cachey_bucket_large_body_throughput_p1_bytes_per_second",
+                    "Throughput after headers that 99% of response bodies of at least 1 MiB exceed",
+                ),
+                |metrics| metrics.large_body_throughput_p1,
+            ),
+            (
+                gauge(
+                    "cachey_bucket_deprioritized",
+                    "Whether the bucket is deprioritized while remaining eligible for fallback",
+                ),
+                |metrics| Some(f64::from(u8::from(metrics.deprioritized))),
+            ),
+            (
+                gauge(
+                    "cachey_bucket_consecutive_failures",
+                    "Number of consecutive failures per bucket",
+                ),
+                |metrics| Some(f64::from(metrics.consecutive_failures)),
+            ),
+        ]
     });
 
-    static LATENCY_MEAN: LazyLock<GaugeVec> = LazyLock::new(|| {
-        register_gauge_vec!(
-            "cachey_bucket_latency_mean_seconds",
-            "Mean successful bucket fetch latency, including retries, hedging, and body validation",
-            &["bucket"]
-        )
-        .unwrap()
-    });
-
-    static LATENCY_HEDGE: LazyLock<GaugeVec> = LazyLock::new(|| {
-        register_gauge_vec!(
-            "cachey_bucket_latency_hedge_seconds",
-            "Hedge delay from the successful bucket fetch latency quantile, in seconds",
-            &["bucket"]
-        )
-        .unwrap()
-    });
-
-    static DEPRIORITIZED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-        register_int_gauge_vec!(
-            "cachey_bucket_deprioritized",
-            "Whether the bucket is deprioritized while remaining eligible for fallback",
-            &["bucket"]
-        )
-        .unwrap()
-    });
-
-    static CONSECUTIVE_FAILURES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-        register_int_gauge_vec!(
-            "cachey_bucket_consecutive_failures",
-            "Number of consecutive failures per bucket",
-            &["bucket"]
-        )
-        .unwrap()
-    });
-
-    ERROR_RATE
-        .with_label_values(&[bucket])
-        .set(metrics.error_rate);
-    LATENCY_MEAN
-        .with_label_values(&[bucket])
-        .set(metrics.latency_mean.as_secs_f64());
-    LATENCY_HEDGE
-        .with_label_values(&[bucket])
-        .set(metrics.latency_hedge.as_secs_f64());
-    DEPRIORITIZED
-        .with_label_values(&[bucket])
-        .set(i64::from(metrics.deprioritized));
-    CONSECUTIVE_FAILURES
-        .with_label_values(&[bucket])
-        .set(i64::from(metrics.consecutive_failures));
+    for (gauge, value) in &*GAUGES {
+        match value(metrics) {
+            Some(value) => gauge.with_label_values(&[bucket]).set(value),
+            None => {
+                let _ = gauge.remove_label_values(&[bucket]);
+            }
+        }
+    }
 }
 
 pub fn fetch_request_count(kind: &ObjectKind, method: &axum::http::Method, typ: &str) {

@@ -48,7 +48,7 @@ reservations independently of `body_bytes`; page-admission fixtures reserve 16 M
 object, or an exact-range read when `request_bytes` is unset. With `max_bytes`, short
 responses spread uniformly from `bytes` up to that length, as the last pages of objects
 of varied sizes do. A replica's `body_ms_per_mib` adds body time in proportion to the
-response length.
+response length, so mixed lengths exercise the size-aware body tails.
 
 Seeds control faults, latency jitter, and recovery probes. SDK retries use the real
 classifier and quota with deterministic backoff. The default histogram reservoir
@@ -89,9 +89,6 @@ time per MiB is an assumption. Capacitor's figures follow its p99 goals of 5 ms 
 | Admission | `s3_standard_admission_saturation`, `s3_standard_queued_long_read` | `s3_express_stalled_admission` | |
 | Cancellation | | `s3_express_caller_cancellation`, `s3_express_delayed_cancellation` | `capacitor_cancel_storm`, `capacitor_cancel_immediate` |
 
-`synthetic_fixed_body_time_slow_bodies` alone puts fixed time after headers, which no
-backend above does.
-
 ## Interpreting results
 
 Completion includes **every scheduled arrival**, including admission failures and
@@ -99,15 +96,18 @@ caller cancellations. Reports separate successful latency from all-arrival laten
 and admitted copies from SDK invocations and wire attempts. Service work measures
 occupied slot time; post-read work is the portion after the originating read finishes.
 Recovery timestamps are sampled when reads complete. Fixtures with short bodies also
-report successful latency for full and short responses.
+report successful latency for full and short responses. Each bucket's exported latency
+estimates are sampled after every read; reports give the final values and the slowest
+seen (highest p99 durations, lowest throughput), which show how far stalls moved them.
 
 The model omits connection setup, network contention, and interactions among cachey
 instances. Millisecond timing and prescribed service distributions limit conclusions
-about real S3 or Capacitor latency. Whole-millisecond timing makes responses land
-exactly on a learned tail far more often than real ones do. Each server fixes its
-response schedule when it starts serving, and the reading task delivers headers and
-body chunks on its own timers, so a response landing on the tail reaches the
-downloader before a hedge timer firing on the same tick, and such ties do not spend
+about real S3 or Capacitor latency. Capacitor's bodies take a few milliseconds, so
+whole-millisecond timing inflates their measured spread. Whole-millisecond timing also
+makes responses land exactly on a learned tail far more often than real ones do. Each
+server fixes its response schedule when it starts serving, and the reading task delivers
+headers and body chunks on its own timers, so a response landing on the tail reaches
+the downloader before a hedge timer firing on the same tick, and such ties do not spend
 the budget.
 
 Compare revisions with the same harness, fixtures, and controls; retain patches for
