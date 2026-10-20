@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     ops::Range,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
@@ -31,7 +32,6 @@ type Completion = (usize, Result<ObjectPiece, DownloadError>);
 struct FallbackErrors {
     last_error: Option<DownloadError>,
     largest_object_size: Option<u64>,
-    retry_budget_exhausted: bool,
 }
 
 impl FallbackErrors {
@@ -60,12 +60,12 @@ impl FallbackErrors {
         }
     }
 
-    fn into_error(mut self) -> DownloadError {
+    fn into_error(mut self, retry_budget_exhausted: bool) -> DownloadError {
         if let Some(DownloadError::RangeNotSatisfied { object_size, .. }) = &mut self.last_error {
             *object_size = self.largest_object_size;
         }
         match self.last_error {
-            None | Some(DownloadError::NoSuchKey) if self.retry_budget_exhausted => {
+            None | Some(DownloadError::NoSuchKey) if retry_budget_exhausted => {
                 DownloadError::Overloaded(
                     "Replica retry budget exhausted during widespread overload".to_owned(),
                 )
@@ -107,7 +107,6 @@ struct ReplicaRequest<'a> {
     hedged: AtomicBool,
 }
 
-/// One copy of the page from a bucket.
 struct CopyAttempt<'a> {
     index: usize,
     model: LatencyModel,
@@ -183,6 +182,16 @@ impl ReplicaRequest<'_> {
     }
 }
 
+/// Completes with the bucket whose rescue timer fires next, or never once none remain.
+async fn next_rescue(rescues: &mut VecDeque<(Duration, usize)>, start: Instant) -> usize {
+    let Some(&(after, index)) = rescues.front() else {
+        return std::future::pending().await;
+    };
+    sleep_until(start + after).await;
+    rescues.pop_front();
+    index
+}
+
 /// What may start a copy after the primary.
 #[derive(Debug, Clone, Copy)]
 enum Trigger {
@@ -197,16 +206,15 @@ enum Trigger {
 
 /// Chooses the bucket and permits for each copy after the primary.
 struct Followups<'a> {
-    downloader: &'a Downloader,
-    buckets: &'a BucketNameSet,
+    request: &'a ReplicaRequest<'a>,
     bytes: u64,
     deadline: Instant,
     primary: usize,
-    primary_timeline: &'a RequestTimeline,
     /// Buckets given a copy.
     tried: Vec<bool>,
     /// Whether a failed body was retried against its bucket.
     retried: bool,
+    retry_budget_exhausted: bool,
     backup_admission: Option<DownloadPermit>,
 }
 
@@ -214,19 +222,15 @@ impl<'a> Followups<'a> {
     /// The copy to start for `trigger`, if any. A fallback goes to an untried bucket, or else
     /// retries a failed body against its bucket once per read; the retry, like any copy while
     /// every bucket reports overload, draws on the retry budget.
-    fn next(
-        &mut self,
-        trigger: Trigger,
-        hedge: &mut HedgeTimer<'_>,
-        fallback_errors: &mut FallbackErrors,
-    ) -> Option<CopyAttempt<'a>> {
+    fn next(&mut self, trigger: Trigger, hedge: &mut HedgeTimer<'_>) -> Option<CopyAttempt<'a>> {
         if let Trigger::Rescue(index) = trigger
             && self.tried[index]
         {
             return None;
         }
         let early = matches!(trigger, Trigger::Hedge);
-        let routing = self.downloader.bucketed_stats.snapshot(self.buckets);
+        let downloader = self.request.downloader;
+        let routing = downloader.bucketed_stats.snapshot(self.request.buckets);
         let overloaded = routing.all_overloaded();
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || (early && overloaded) {
@@ -240,17 +244,16 @@ impl<'a> Followups<'a> {
                 .or(retry.filter(|_| !self.retried))?,
         };
         let retrying = !early && self.tried[index];
-        if (overloaded || retrying) && !self.downloader.attempt_budget.try_retry() {
-            fallback_errors.retry_budget_exhausted |= overloaded;
+        if (overloaded || retrying) && !downloader.attempt_budget.try_retry() {
+            self.retry_budget_exhausted |= overloaded;
             return None;
         }
         self.retried |= retrying;
         let permits = if early {
-            let admission = self.downloader.admission.try_acquire(self.bytes)?;
-            let Some(budget) = self
-                .downloader
+            let admission = downloader.admission.try_acquire(self.bytes)?;
+            let Some(budget) = downloader
                 .attempt_budget
-                .try_hedge(&self.buckets[index])
+                .try_hedge(&self.request.buckets[index])
             else {
                 hedge.deny();
                 return None;
@@ -274,9 +277,7 @@ impl<'a> Followups<'a> {
             model: routing.model(index),
             primary_timeline: None,
             deadline: if index == self.primary {
-                self.primary_timeline
-                    .bucket_deadline()
-                    .unwrap_or(self.deadline)
+                hedge.deadline()
             } else {
                 self.deadline
             },
@@ -287,11 +288,11 @@ impl<'a> Followups<'a> {
 }
 
 impl Downloader {
-    /// Copies from the same bucket share its bucket deadline. An early hedge goes to the primary's
-    /// bucket once no other bucket is untried, so a single bucket hedges against itself; there, an
-    /// error that another copy from the same bucket would repeat ends the read. A body that fails
-    /// after its headers is retried against its bucket once no untried bucket or other copy
-    /// remains.
+    /// Copies sent back to the primary's bucket share its bucket deadline. An early hedge goes to
+    /// the primary's bucket once no other bucket is untried, so a single bucket hedges against
+    /// itself; there, an error that another copy from the same bucket would repeat ends the read.
+    /// A body that fails after its headers is retried against its bucket once no untried bucket or
+    /// other copy remains.
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -329,14 +330,13 @@ impl Downloader {
         let mut tried = vec![false; buckets.len()];
         tried[primary] = true;
         let mut followups = Followups {
-            downloader: self,
-            buckets,
+            request: &request,
             bytes,
             deadline,
             primary,
-            primary_timeline: &primary_timeline,
             tried,
             retried: false,
+            retry_budget_exhausted: false,
             backup_admission,
         };
         let mut hedge = HedgeTimer::new(
@@ -357,9 +357,6 @@ impl Downloader {
         let mut fallback_errors = FallbackErrors::default();
         let mut body_failed = None;
         while !active.is_empty() {
-            let next_rescue = rescues
-                .front()
-                .map_or(deadline, |(after, _)| start + *after);
             let trigger = select! {
                 biased;
                 Some((index, result)) = active.next() => {
@@ -381,21 +378,16 @@ impl Downloader {
                     }
                     Trigger::Fallback { retry: body_failed.filter(|_| active.is_empty()) }
                 },
-                () = sleep_until(next_rescue), if !rescues.is_empty() => {
-                    let Some((_, index)) = rescues.pop_front() else {
-                        continue;
-                    };
-                    Trigger::Rescue(index)
-                },
+                index = next_rescue(&mut rescues, start) => Trigger::Rescue(index),
                 () = hedge.due() => Trigger::Hedge,
             };
             if active.len() < MAX_CONCURRENT_COPIES
-                && let Some(copy) = followups.next(trigger, &mut hedge, &mut fallback_errors)
+                && let Some(copy) = followups.next(trigger, &mut hedge)
             {
                 active.push(request.attempt(copy));
             }
         }
-        Err(fallback_errors.into_error())
+        Err(fallback_errors.into_error(followups.retry_budget_exhausted))
     }
 
     fn prepare_primary(
@@ -462,7 +454,7 @@ mod tests {
         for error in errors {
             fallback_errors.record(error);
         }
-        let actual = fallback_errors.into_error();
+        let actual = fallback_errors.into_error(false);
         assert_eq!(discriminant(&actual), discriminant(expected), "{actual:?}");
         assert_eq!(actual.to_string(), expected.to_string());
     }

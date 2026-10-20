@@ -209,11 +209,20 @@ struct BucketOperation<'a> {
 }
 
 impl BucketOperation<'_> {
-    /// Records the request's measurements only once its body is validated. A timeout counts
-    /// against the bucket only if the request had the model's timeout allowance, with half its
-    /// share of the deadline for each phase the bucket has not measured.
+    /// The model's timeout allowance, with half the copy's share of the deadline for each phase
+    /// the bucket has not measured.
+    fn timeout_allowance(&self) -> Duration {
+        let unmeasured = self
+            .unknown_latency
+            .min(self.downloader.limits.bucket_timeout)
+            / 2;
+        self.model
+            .timeout_allowance(self.timeline.announced_body_bytes(), unmeasured)
+    }
+
+    /// Records the request's measurements only once its body is validated.
     async fn execute<T>(
-        self,
+        mut self,
         admission: Option<DownloadPermit>,
         fetch: impl AsyncFnOnce() -> Result<T, DownloadError>,
     ) -> Result<T, DownloadError> {
@@ -242,7 +251,7 @@ impl BucketOperation<'_> {
         let observation = self
             .downloader
             .bucketed_stats
-            .begin(self.request.bucket, self.probe);
+            .begin(self.request.bucket, self.probe.take());
         let result = select! {
             biased;
             result = fetch() => result,
@@ -252,14 +261,7 @@ impl BucketOperation<'_> {
         };
         let outcome = match &result {
             Ok(_) => Outcome::Success(self.timeline.sample(&self.model)),
-            Err(error) => error.health_outcome(
-                self.model.timeout_allowance(
-                    self.timeline.announced_body_bytes(),
-                    self.unknown_latency
-                        .min(self.downloader.limits.bucket_timeout)
-                        / 2,
-                ),
-            ),
+            Err(error) => error.health_outcome(self.timeout_allowance()),
         };
         observation.complete(outcome);
         result
@@ -1479,7 +1481,7 @@ mod tests {
             let output = fetch(&downloader, &["bucket"]).await;
             assert!(!output.hedged);
             assert_eq!(output.latency, Duration::from_millis(10 + body_ms));
-            metrics(&downloader, "bucket").await;
+            advance(Duration::from_secs(1)).await;
             assert_eq!(
                 object_body_tail(&downloader, "bucket"),
                 Some(Duration::from_millis(tail_ms)),
@@ -1510,7 +1512,7 @@ mod tests {
             let output = fetch(&downloader, &["bucket"]).await;
             assert!(!output.hedged);
             assert_eq!(output.latency, Duration::from_millis(1_010));
-            metrics(&downloader, "bucket").await;
+            advance(Duration::from_secs(1)).await;
             assert_eq!(
                 object_body_tail(&downloader, "bucket"),
                 Some(Duration::from_secs(1)),

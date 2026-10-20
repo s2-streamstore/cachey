@@ -2,9 +2,8 @@ use std::{sync::LazyLock, time::Duration};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use prometheus::{
-    Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
-    register_gauge_vec, register_histogram_vec, register_int_counter_vec, register_int_gauge,
-    register_int_gauge_vec,
+    Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, TextEncoder, register_gauge_vec,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge,
 };
 
 use crate::{
@@ -19,7 +18,7 @@ fn seconds(duration: Option<Duration>) -> Option<f64> {
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     type BucketGauge = (GaugeVec, fn(&BucketMetrics) -> Option<f64>);
 
-    static GAUGES: LazyLock<[BucketGauge; 9]> = LazyLock::new(|| {
+    static GAUGES: LazyLock<[BucketGauge; 11]> = LazyLock::new(|| {
         let gauge = |name: &str, help: &str| register_gauge_vec!(name, help, &["bucket"]).unwrap();
         [
             (
@@ -85,25 +84,21 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
                 ),
                 |metrics| metrics.large_body_p99_ratio,
             ),
+            (
+                gauge(
+                    "cachey_bucket_deprioritized",
+                    "Whether the bucket is deprioritized while remaining eligible for fallback",
+                ),
+                |metrics| Some(f64::from(u8::from(metrics.deprioritized))),
+            ),
+            (
+                gauge(
+                    "cachey_bucket_consecutive_failures",
+                    "Number of consecutive failures per bucket",
+                ),
+                |metrics| Some(f64::from(metrics.consecutive_failures)),
+            ),
         ]
-    });
-
-    static DEPRIORITIZED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-        register_int_gauge_vec!(
-            "cachey_bucket_deprioritized",
-            "Whether the bucket is deprioritized while remaining eligible for fallback",
-            &["bucket"]
-        )
-        .unwrap()
-    });
-
-    static CONSECUTIVE_FAILURES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-        register_int_gauge_vec!(
-            "cachey_bucket_consecutive_failures",
-            "Number of consecutive failures per bucket",
-            &["bucket"]
-        )
-        .unwrap()
     });
 
     for (gauge, value) in &*GAUGES {
@@ -114,12 +109,6 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
             }
         }
     }
-    DEPRIORITIZED
-        .with_label_values(&[bucket])
-        .set(i64::from(metrics.deprioritized));
-    CONSECUTIVE_FAILURES
-        .with_label_values(&[bucket])
-        .set(i64::from(metrics.consecutive_failures));
 }
 
 pub fn fetch_request_count(kind: &ObjectKind, method: &axum::http::Method, typ: &str) {

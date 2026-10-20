@@ -36,10 +36,6 @@ impl RequestTimeline {
         _ = self.bucket_deadline.set(deadline);
     }
 
-    pub fn bucket_deadline(&self) -> Option<Instant> {
-        self.bucket_deadline.get().copied()
-    }
-
     pub fn start(&self) -> Instant {
         let now = Instant::now();
         if self.started.set(now).is_ok() {
@@ -64,11 +60,9 @@ impl RequestTimeline {
 
     /// Measurements of a request whose body has just been read in full. A request whose hedge the
     /// budget denied, and that never had one, is left unmeasured like one a hedge superseded if it
-    /// outlasted the time such a hedge would have taken at the bucket's tails. So stalls the budget
-    /// leaves unhedged cannot raise the tails and stop later hedges. The budget denies hedges only
-    /// while others run or recently ran, and their races keep teaching the tails if the bucket
-    /// itself slows. A hedge withheld for overload or admission says nothing about whether the
-    /// request was an outlier, so the request is measured.
+    /// outlasted the time such a hedge would have taken at the bucket's tails, so stalls the budget
+    /// leaves unhedged cannot raise the tails and stop later hedges. Hedges withheld for any other
+    /// reason leave the request measured; `docs/replica-reads.md` explains why.
     pub fn sample(&self, model: &LatencyModel) -> Option<Sample> {
         let started = *self.started.get()?;
         let headers = self.headers.get()?;
@@ -91,7 +85,7 @@ impl RequestTimeline {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum Phase {
     FirstByte,
     Body,
@@ -140,37 +134,34 @@ impl<'a> HedgeTimer<'a> {
         _ = self.primary.hedge_denied.set(Instant::now());
     }
 
-    fn deadline(&self) -> Instant {
+    /// The primary's bucket deadline once admitted, or else the page deadline.
+    pub fn deadline(&self) -> Instant {
         self.primary
-            .bucket_deadline()
-            .map_or(self.deadline, |bucket_deadline| {
+            .bucket_deadline
+            .get()
+            .map_or(self.deadline, |&bucket_deadline| {
                 bucket_deadline.min(self.deadline)
             })
     }
 
-    fn due_at(&self) -> Option<(Phase, Instant)> {
+    fn due_at(&self, headers: Option<&Headers>) -> Option<Instant> {
         let next = self.next?;
         let first_byte_tail = self.model.first_byte_tail()?;
-        let (phase, since, tail) = match (next, self.primary.headers.get()) {
+        let (since, tail) = match (next, headers) {
             (_, Some(headers)) => (
-                Phase::Body,
                 headers.at,
                 self.model
                     .body_tail(headers.body_bytes)?
                     .max(first_byte_tail),
             ),
-            (Phase::FirstByte, None) => (
-                Phase::FirstByte,
-                *self.primary.started.get()?,
-                first_byte_tail,
-            ),
+            (Phase::FirstByte, None) => (*self.primary.started.get()?, first_byte_tail),
             (Phase::Body, None) => return None,
         };
         if tail.is_zero() {
             return None;
         }
         let at = since.checked_add(tail)?;
-        (at < self.deadline()).then_some((phase, at))
+        (at < self.deadline()).then_some(at)
     }
 
     /// Completes when a hedge is due, or never if none can be. The primary's timeline stops
@@ -183,8 +174,9 @@ impl<'a> HedgeTimer<'a> {
         let primary = self.primary;
         loop {
             let changed = primary.changed.notified();
-            let settled = primary.headers.get().is_some();
-            let Some((phase, at)) = self.due_at() else {
+            let headers = primary.headers.get();
+            let settled = headers.is_some();
+            let Some(at) = self.due_at(headers) else {
                 if settled {
                     return std::future::pending().await;
                 }
@@ -199,7 +191,7 @@ impl<'a> HedgeTimer<'a> {
                         self.next = None;
                         return std::future::pending().await;
                     }
-                    self.next = (phase == Phase::FirstByte).then_some(Phase::Body);
+                    self.next = (!settled).then_some(Phase::Body);
                     return;
                 }
             }

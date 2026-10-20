@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use bytesize::MIB;
+use bytesize::{ByteSize, MIB};
 use dashmap::DashMap;
 use exponential_decay_histogram::{ExponentialDecayHistogram, Snapshot};
 use parking_lot::Mutex;
@@ -66,7 +66,7 @@ pub struct BucketMetrics {
 #[derive(Debug, Clone, Copy)]
 struct Summary {
     mean: f64,
-    slow: i64,
+    p99: i64,
 }
 
 impl Summary {
@@ -74,21 +74,25 @@ impl Summary {
         Duration::from_micros(self.mean.round() as u64)
     }
 
-    fn slow_duration(self) -> Duration {
-        Duration::from_micros(self.slow as u64)
+    fn p99_duration(self) -> Duration {
+        Duration::from_micros(self.p99 as u64)
     }
 
-    fn slow_ratio(self) -> f64 {
-        self.slow as f64 / RATIO_UNITS
+    fn p99_ratio(self) -> f64 {
+        self.p99 as f64 / RATIO_UNITS
     }
 }
 
-fn is_small_body(bytes: u64) -> bool {
-    bytes < LARGE_BODY_BYTES
+fn size_class<T>(bytes: u64, small: T, large: T) -> T {
+    if bytes < LARGE_BODY_BYTES {
+        small
+    } else {
+        large
+    }
 }
 
-fn mebibytes(bytes: u64) -> f64 {
-    bytes as f64 / MIB as f64
+fn decay(rate: f64, elapsed: Duration) -> f64 {
+    (-rate * elapsed.as_secs_f64()).exp()
 }
 
 fn duration_from_secs(seconds: f64) -> Duration {
@@ -96,7 +100,7 @@ fn duration_from_secs(seconds: f64) -> Duration {
 }
 
 /// Measurements from one backend request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct Sample {
     pub first_byte: Duration,
     pub body_bytes: u64,
@@ -130,7 +134,7 @@ impl BodyLine {
     /// The fitted time for a body of `bytes`, at least `MIN_BODY_SCALE`.
     fn scale(&self, bytes: u64) -> f64 {
         self.per_mib
-            .mul_add(mebibytes(bytes), self.fixed)
+            .mul_add(ByteSize::b(bytes).as_mib(), self.fixed)
             .max(MIN_BODY_SCALE.as_secs_f64())
     }
 }
@@ -139,9 +143,9 @@ impl BodyLine {
 /// weighted by the inverse square of the larger of its time and the fit's prediction, so errors
 /// count relative to body time whatever the length, and a stall weighs no more than a body that
 /// took as long as predicted.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct BodyFit {
-    updated_at: Option<Instant>,
+    updated_at: Instant,
     weight: f64,
     mebibytes: f64,
     mebibytes_squared: f64,
@@ -150,25 +154,36 @@ struct BodyFit {
 }
 
 impl BodyFit {
+    fn new(now: Instant) -> Self {
+        Self {
+            updated_at: now,
+            weight: 0.0,
+            mebibytes: 0.0,
+            mebibytes_squared: 0.0,
+            seconds: 0.0,
+            mebibyte_seconds: 0.0,
+        }
+    }
+
     /// Adds a body to the fit and returns its time relative to the updated fit.
     fn record(&mut self, now: Instant, bytes: u64, time: Duration) -> f64 {
-        if let Some(updated_at) = self.updated_at {
-            let decay =
-                (-LATENCY_DECAY * now.saturating_duration_since(updated_at).as_secs_f64()).exp();
-            self.weight *= decay;
-            self.mebibytes *= decay;
-            self.mebibytes_squared *= decay;
-            self.seconds *= decay;
-            self.mebibyte_seconds *= decay;
-        }
-        self.updated_at = Some(now);
+        let decay = decay(
+            LATENCY_DECAY,
+            now.saturating_duration_since(self.updated_at),
+        );
+        self.weight *= decay;
+        self.mebibytes *= decay;
+        self.mebibytes_squared *= decay;
+        self.seconds *= decay;
+        self.mebibyte_seconds *= decay;
+        self.updated_at = now;
         let seconds = time.as_secs_f64();
         let predicted = self.line().map_or(0.0, |line| line.scale(bytes));
         let weight = seconds
             .max(predicted)
             .max(MIN_BODY_SCALE.as_secs_f64())
             .powi(-2);
-        let length = mebibytes(bytes);
+        let length = ByteSize::b(bytes).as_mib();
         self.weight += weight;
         self.mebibytes += weight * length;
         self.mebibytes_squared += weight * length * length;
@@ -197,7 +212,7 @@ impl BodyFit {
         };
         let variance = mean_length.mul_add(-mean_length, mean_square_length);
         if variance <= MIN_BODY_LENGTH_SPREAD * mean_square_length {
-            return Some(if mean_length < mebibytes(LARGE_BODY_BYTES) {
+            return Some(if mean_length < ByteSize::b(LARGE_BODY_BYTES).as_mib() {
                 fixed_only
             } else {
                 proportional()
@@ -230,33 +245,29 @@ pub(super) struct LatencyModel {
 }
 
 impl LatencyModel {
-    /// Slow complete request latency, or `None` before any measurement.
+    /// p99 complete request latency, or `None` before any measurement.
     fn tail(&self) -> Option<Duration> {
-        self.latency.map(Summary::slow_duration)
+        self.latency.map(Summary::p99_duration)
     }
 
     pub fn first_byte_tail(&self) -> Option<Duration> {
-        self.first_byte.map(Summary::slow_duration)
+        self.first_byte.map(Summary::p99_duration)
     }
 
-    /// Slow body time after headers announce `bytes`: the fitted time for that length, scaled by
-    /// the slow ratio of body time to the fit in its size class. `None` before the bucket has
-    /// served a body in the same size class.
+    /// Body time after headers announce `bytes`: the fitted time for that length, scaled by the
+    /// p99 ratio of body time to the fit in its size class. `None` before the bucket has served a
+    /// body in the same size class.
     pub fn body_tail(&self, bytes: u64) -> Option<Duration> {
-        let ratios = if is_small_body(bytes) {
-            self.small_body
-        } else {
-            self.large_body
-        }?;
+        let ratios = size_class(bytes, self.small_body, self.large_body)?;
         let line = self.body_time?;
-        Some(duration_from_secs(ratios.slow_ratio() * line.scale(bytes)))
+        Some(duration_from_secs(ratios.p99_ratio() * line.scale(bytes)))
     }
 
-    /// Time a request must have had before its timeout counts against the bucket: the slow
-    /// complete request time, or the slow time to finish the phases it reached if longer. Those
-    /// phases are response headers, then any body whose length they announced. The complete
-    /// request time keeps a caller timeout shorter than a typical request, which the tail of an
-    /// early phase alone would allow, from counting against the bucket. A phase the bucket has not
+    /// Time a request must have had before its timeout counts against the bucket: the complete
+    /// request tail, or the summed tails of the phases it reached if longer. Those phases are
+    /// response headers, then any body whose length they announced. The complete request tail
+    /// keeps a caller timeout shorter than a typical request, which the tail of an early phase
+    /// alone would allow, from counting against the bucket. A phase the bucket has not
     /// measured, including a body in a size class it has not served, is allowed `unmeasured`,
     /// so reaching a later phase never shortens the allowance.
     pub fn timeout_allowance(
@@ -309,7 +320,7 @@ fn summarize(histogram: &ExponentialDecayHistogram) -> Option<Summary> {
     let snapshot = histogram.snapshot();
     (snapshot.count() > 0).then(|| Summary {
         mean: snapshot.mean(),
-        slow: quantile(&snapshot, 0.99),
+        p99: quantile(&snapshot, 0.99),
     })
 }
 
@@ -359,7 +370,7 @@ impl LatencyEstimates {
         Self {
             latency: PhaseHistogram::new(now),
             first_byte: PhaseHistogram::new(now),
-            body_time: BodyFit::default(),
+            body_time: BodyFit::new(now),
             small_body: PhaseHistogram::new(now),
             large_body: PhaseHistogram::new(now),
         }
@@ -371,12 +382,12 @@ impl LatencyEstimates {
         self.latency.update(now, histogram_micros(sample.latency()));
         self.first_byte
             .update(now, histogram_micros(sample.first_byte));
-        let ratios = if is_small_body(sample.body_bytes) {
-            &mut self.small_body
-        } else {
-            &mut self.large_body
-        };
-        ratios.update(now, (ratio * RATIO_UNITS).round() as i64);
+        size_class(
+            sample.body_bytes,
+            &mut self.small_body,
+            &mut self.large_body,
+        )
+        .update(now, (ratio * RATIO_UNITS).round() as i64);
     }
 
     fn model(&mut self, due: bool) -> LatencyModel {
@@ -449,11 +460,10 @@ impl Default for BucketStats {
 impl BucketStats {
     fn error_rate(&self, now: Instant) -> f64 {
         self.error_rate
-            * (-ERROR_ALPHA
-                * now
-                    .saturating_duration_since(self.last_outcome)
-                    .as_secs_f64())
-            .exp()
+            * decay(
+                ERROR_ALPHA,
+                now.saturating_duration_since(self.last_outcome),
+            )
     }
 
     /// Changed histograms are summarized again at most once per interval, except that a phase is
@@ -465,10 +475,6 @@ impl BucketStats {
             self.summarized_at = now;
         }
         self.estimates.model(due)
-    }
-
-    fn overloaded(&self, now: Instant) -> bool {
-        now < self.overload_until
     }
 
     /// Replacing history starts the latency model over from the sample, as for a bucket never
@@ -509,11 +515,13 @@ impl BucketStats {
         if excess.is_zero() {
             return self.routing_latency;
         }
-        let elapsed = now.saturating_duration_since(self.routing_updated_at);
-        mean + excess.mul_f64((-LATENCY_DECAY * elapsed.as_secs_f64()).exp())
+        mean + excess.mul_f64(decay(
+            LATENCY_DECAY,
+            now.saturating_duration_since(self.routing_updated_at),
+        ))
     }
 
-    fn routing_latency(&self, now: Instant, tail: Duration) -> Duration {
+    fn routing_latency(&self, now: Instant, tail: Duration, current: Duration) -> Duration {
         let overdue = tail.saturating_mul(4).max(Duration::from_millis(1));
         let mut count = 0;
         for (started, active) in &self.active {
@@ -523,14 +531,14 @@ impl BucketStats {
             }
             count += active;
             if count >= 3 {
-                return self.current_routing_latency(now).max(elapsed);
+                return current.max(elapsed);
             }
         }
-        self.current_routing_latency(now)
+        current
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(super) enum Outcome {
     /// With the validated request's measurements, unless it was left unmeasured.
     Success(Option<Sample>),
@@ -831,11 +839,12 @@ impl BucketedStats {
                     let state = self.entry(bucket);
                     let mut stats = state.lock();
                     let model = stats.model(now);
+                    let current = stats.current_routing_latency(now);
                     if index == 0 {
-                        preferred_latency = stats.current_routing_latency(now);
+                        preferred_latency = current;
                     }
                     let tail = model.tail();
-                    let mut latency = stats.routing_latency(now, tail.unwrap_or_default());
+                    let mut latency = stats.routing_latency(now, tail.unwrap_or_default(), current);
                     if index > 0 && tail.is_none() {
                         latency = latency.max(preferred_latency);
                     }
@@ -845,7 +854,7 @@ impl BucketedStats {
                         latency: locality_adjusted(latency, index),
                         deprioritized: stats.deprioritized,
                         error_rate: stats.error_rate(now),
-                        overloaded: stats.overloaded(now),
+                        overloaded: now < stats.overload_until,
                     }
                 })
                 .collect(),
@@ -891,15 +900,15 @@ impl BucketedStats {
                     consecutive_failures: stats.consecutive_failures,
                     recovery_successes: stats.recovery_successes,
                     latency_mean: model.latency.map(Summary::mean_duration),
-                    latency_p99: model.latency.map(Summary::slow_duration),
+                    latency_p99: model.tail(),
                     first_byte_mean: model.first_byte.map(Summary::mean_duration),
-                    first_byte_p99: model.first_byte.map(Summary::slow_duration),
+                    first_byte_p99: model.first_byte_tail(),
                     body_overhead: model.body_time.map(|line| duration_from_secs(line.fixed)),
                     body_throughput: model
                         .body_time
                         .and_then(|line| (line.per_mib > 0.0).then(|| MIB as f64 / line.per_mib)),
-                    small_body_p99_ratio: model.small_body.map(Summary::slow_ratio),
-                    large_body_p99_ratio: model.large_body.map(Summary::slow_ratio),
+                    small_body_p99_ratio: model.small_body.map(Summary::p99_ratio),
+                    large_body_p99_ratio: model.large_body.map(Summary::p99_ratio),
                 };
                 (entry.key().clone(), metrics)
             })

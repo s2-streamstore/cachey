@@ -85,6 +85,12 @@ pub struct Read {
     pub health: Vec<Health>,
 }
 
+impl Read {
+    pub fn latency_us(&self) -> u64 {
+        self.end_us - self.arrival_us
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[allow(clippy::struct_field_names)]
 pub struct Latency {
@@ -261,7 +267,7 @@ impl Report {
                         "short"
                     })
                     .or_default()
-                    .push(read.end_us - read.arrival_us);
+                    .push(read.latency_us());
             }
         }
         Self {
@@ -277,8 +283,7 @@ impl Report {
             completed_before_deadline: reads
                 .iter()
                 .filter(|read| {
-                    read.error.is_none()
-                        && read.end_us - read.arrival_us < scenario.page_timeout_ms * 1000
+                    read.error.is_none() && read.latency_us() < scenario.page_timeout_ms * 1000
                 })
                 .count(),
             errors,
@@ -292,19 +297,14 @@ impl Report {
                 reads
                     .iter()
                     .filter(|read| read.error.is_none())
-                    .map(|read| read.end_us - read.arrival_us)
+                    .map(Read::latency_us)
                     .collect(),
             ),
             success_latency_by_response: latency_by_response
                 .into_iter()
                 .map(|(response, latencies)| (response, Latency::new(latencies)))
                 .collect(),
-            all_arrival_latency: Latency::new(
-                reads
-                    .iter()
-                    .map(|read| read.end_us - read.arrival_us)
-                    .collect(),
-            ),
+            all_arrival_latency: Latency::new(reads.iter().map(Read::latency_us).collect()),
             copy_operations: copies.len(),
             transport_attempts: state.transports.len(),
             sdk_invocations: state
