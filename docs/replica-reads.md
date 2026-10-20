@@ -65,24 +65,26 @@ recovery completes.
 
 ## Deadlines and hedging
 
-The page deadline includes admission, SDK retries, and body validation. Each copy
-also has a bucket deadline starting at admission. Recoverable errors and rescue
-timers start untried replicas; timers reserve execution time for alternatives,
-including unmeasured buckets. Reads try each bucket at most once at the downloader
-layer, apart from an early hedge against the primary's bucket once every other bucket
-has a copy and one retry of a failed body, with up to three copies active per page. The
-first validated result wins and cancels the others.
+The page deadline includes admission, SDK retries, and body validation. Each bucket
+also has a deadline, starting when the page's first copy to it is admitted, that its
+later copies share, so a single-bucket read ends by its bucket deadline. Recoverable
+errors and rescue timers start untried replicas; timers reserve execution time for
+alternatives, including unmeasured buckets. Reads try each bucket at most once at the
+downloader layer, apart from an early hedge against the primary's bucket once every
+other bucket has a copy and one retry of a failed body, with up to three copies active
+per page. Such a later copy to a bucket starts only while more than the bucket's p99
+time to first byte remains before its deadline. The first validated result wins and
+cancels the others.
 
 Early hedges use one SDK attempt, against another bucket when available or the
 primary's bucket otherwise, and never against a bucket that recently reported overload.
-They start only before the primary's bucket deadline, and one against the same bucket
-shares that deadline, so a single-bucket read ends by its bucket deadline. A hedge is
-timed in two phases. Before headers arrive, it starts at the p99 time to first byte
-after the primary request starts, excluding admission wait. Once headers announce the
-body length, it starts when the body has taken longer than both its body tail and the
-p99 time to first byte. A phase whose tail is zero, or a body in a size class the
-bucket has not served, is not hedged early. Each phase is one opportunity, so a hedge
-that cannot start before headers may still start during the body.
+They start only before the primary's bucket deadline. A hedge is timed in two phases.
+Before headers arrive, it starts at the p99 time to first byte after the primary
+request starts, excluding admission wait. Once headers announce the body length, it
+starts when the body has taken longer than both its body tail and the p99 time to first
+byte. A phase whose tail is zero, or a body in a size class the bucket has not served,
+is not hedged early. Each phase is one opportunity, so a hedge that cannot start before
+headers may still start during the body.
 
 A single-bucket read hedges against its own bucket under the same rules. Each copy
 records its own health outcome, so throttling or a failure in one copy counts even when
@@ -91,9 +93,8 @@ another copy from the same bucket would repeat, such as a missing object, ends t
 
 A body whose transfer fails after its headers, which the SDK cannot retry, is retried
 once per read against its bucket when no untried bucket remains and no other copy is in
-flight. Like a hedge, a retry against the primary's bucket shares its bucket deadline. A
-body whose length disagrees with its `Content-Range` is an invalid response, which
-another request would likely repeat, so it is not retried against its bucket.
+flight. A body whose length disagrees with its `Content-Range` is an invalid response,
+which another request would likely repeat, so it is not retried against its bucket.
 
 By default, the shared budget permits one startup hedge and earns another per 20
 successful pages. Setting the budget to zero disables early hedges; fallback and
@@ -105,7 +106,7 @@ startup and earns another per 10 successful pages.
 
 | Server option | Default |
 |---------------|---------|
-| `--bucket-timeout-ms` | 5,000 ms per copy |
+| `--bucket-timeout-ms` | 5,000 ms per bucket, per page |
 | `--page-timeout-ms` | 10,000 ms per page |
 | `--max-download-memory` | 1 GiB of reserved body bytes |
 | `--hedge-budget-percent` | 5 credits per successful page; a hedge costs 100 |

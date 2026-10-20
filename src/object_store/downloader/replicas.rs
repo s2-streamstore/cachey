@@ -1,7 +1,10 @@
 use std::{
     collections::VecDeque,
     ops::Range,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -102,6 +105,9 @@ struct ReplicaRequest<'a> {
     object: &'a ObjectKey,
     range: &'a Range<u64>,
     config: &'a RequestConfig,
+    deadline: Instant,
+    /// Each bucket's deadline, shared by its copies once the first is admitted.
+    bucket_deadlines: Vec<OnceLock<Instant>>,
     copies_in_flight: AtomicUsize,
     /// Whether a copy started while another was in flight.
     hedged: AtomicBool,
@@ -112,7 +118,6 @@ struct CopyAttempt<'a> {
     model: LatencyModel,
     /// The primary's timeline, which the hedge timer follows; other copies keep their own.
     primary_timeline: Option<&'a RequestTimeline>,
-    deadline: Instant,
     probe: Option<ProbePermit>,
     permits: Option<AttemptPermits>,
 }
@@ -143,7 +148,6 @@ impl ReplicaRequest<'_> {
             index,
             model,
             primary_timeline,
-            deadline,
             probe,
             permits,
         } = copy;
@@ -166,7 +170,8 @@ impl ReplicaRequest<'_> {
             request,
             model,
             timeline,
-            deadline,
+            deadline: self.deadline,
+            bucket_deadline: &self.bucket_deadlines[index],
             unknown_latency: self.unknown_latency(),
             probe,
         }
@@ -208,7 +213,6 @@ enum Trigger {
 struct Followups<'a> {
     request: &'a ReplicaRequest<'a>,
     bytes: u64,
-    deadline: Instant,
     primary: usize,
     /// Buckets given a copy.
     tried: Vec<bool>,
@@ -222,7 +226,8 @@ impl<'a> Followups<'a> {
     /// The copy to start for `trigger`, if any. A fallback goes to an untried bucket, or else
     /// retries a failed body against its bucket once per read; the retry, like any copy while
     /// every bucket reports overload, draws on the retry budget. An early hedge skips a bucket
-    /// reporting overload.
+    /// reporting overload. A later copy to a bucket starts only while more than the bucket's p99
+    /// time to first byte remains before its deadline.
     fn next(&mut self, trigger: Trigger, hedge: &mut HedgeTimer<'_>) -> Option<CopyAttempt<'a>> {
         if let Trigger::Rescue(index) = trigger
             && self.tried[index]
@@ -232,7 +237,8 @@ impl<'a> Followups<'a> {
         let early = matches!(trigger, Trigger::Hedge);
         let downloader = self.request.downloader;
         let routing = downloader.bucketed_stats.snapshot(self.request.buckets);
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let remaining = self.request.deadline.saturating_duration_since(now);
         if remaining.is_zero() {
             return None;
         }
@@ -244,6 +250,12 @@ impl<'a> Followups<'a> {
                 .or(retry.filter(|_| !self.retried))?,
         };
         if early && routing.overloaded(index) {
+            return None;
+        }
+        if let Some(bucket_deadline) = self.request.bucket_deadlines[index].get()
+            && bucket_deadline.saturating_duration_since(now)
+                <= routing.model(index).first_byte_tail().unwrap_or_default()
+        {
             return None;
         }
         let overloaded = routing.all_overloaded();
@@ -280,11 +292,6 @@ impl<'a> Followups<'a> {
             index,
             model: routing.model(index),
             primary_timeline: None,
-            deadline: if index == self.primary {
-                hedge.deadline()
-            } else {
-                self.deadline
-            },
             probe: None,
             permits,
         })
@@ -292,8 +299,8 @@ impl<'a> Followups<'a> {
 }
 
 impl Downloader {
-    /// Copies sent back to the primary's bucket share its bucket deadline. An early hedge goes to
-    /// the primary's bucket once no other bucket is untried, so a single bucket hedges against
+    /// A bucket's copies share the deadline its first copy got at admission. An early hedge goes
+    /// to the primary's bucket once no other bucket is untried, so a single bucket hedges against
     /// itself; there, an error that another copy from the same bucket would repeat ends the read.
     /// A body that fails after its headers is retried against its bucket once no untried bucket or
     /// other copy remains.
@@ -314,6 +321,8 @@ impl Downloader {
             object,
             range,
             config,
+            deadline,
+            bucket_deadlines: vec![OnceLock::new(); buckets.len()],
             copies_in_flight: AtomicUsize::new(0),
             hedged: AtomicBool::new(false),
         };
@@ -336,7 +345,6 @@ impl Downloader {
         let mut followups = Followups {
             request: &request,
             bytes,
-            deadline,
             primary,
             tried,
             retried: false,
@@ -346,6 +354,7 @@ impl Downloader {
         let mut hedge = HedgeTimer::new(
             primary_model,
             &primary_timeline,
+            &request.bucket_deadlines[primary],
             deadline,
             self.limits.hedge_budget_percent > 0 && probe.is_none(),
         );
@@ -354,7 +363,6 @@ impl Downloader {
             index: primary,
             model: primary_model,
             primary_timeline: Some(&primary_timeline),
-            deadline,
             probe,
             permits: primary_permits,
         }));

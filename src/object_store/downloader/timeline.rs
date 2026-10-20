@@ -17,13 +17,12 @@ struct Headers {
     body_bytes: u64,
 }
 
-/// When a backend request started and must finish, when response headers with a validated range
-/// arrived with the announced body length, and when the hedge budget first denied a hedge against
-/// it and whether one started.
+/// When a backend request started, when response headers with a validated range arrived with the
+/// announced body length, and when the hedge budget first denied a hedge against it and whether
+/// one started.
 #[derive(Debug, Default)]
 pub(super) struct RequestTimeline {
     started: OnceLock<Instant>,
-    bucket_deadline: OnceLock<Instant>,
     headers: OnceLock<Headers>,
     hedge_denied: OnceLock<Instant>,
     hedge_started: AtomicBool,
@@ -31,11 +30,6 @@ pub(super) struct RequestTimeline {
 }
 
 impl RequestTimeline {
-    /// Set once the request is admitted, before it starts.
-    pub fn set_bucket_deadline(&self, deadline: Instant) {
-        _ = self.bucket_deadline.set(deadline);
-    }
-
     pub fn start(&self) -> Instant {
         let now = Instant::now();
         if self.started.set(now).is_ok() {
@@ -100,6 +94,7 @@ enum Phase {
 pub(super) struct HedgeTimer<'a> {
     model: LatencyModel,
     primary: &'a RequestTimeline,
+    bucket_deadline: &'a OnceLock<Instant>,
     deadline: Instant,
     next: Option<Phase>,
 }
@@ -108,12 +103,14 @@ impl<'a> HedgeTimer<'a> {
     pub fn new(
         model: LatencyModel,
         primary: &'a RequestTimeline,
+        bucket_deadline: &'a OnceLock<Instant>,
         deadline: Instant,
         enabled: bool,
     ) -> Self {
         Self {
             model,
             primary,
+            bucket_deadline,
             deadline,
             next: (enabled && model.first_byte_tail().is_some()).then_some(Phase::FirstByte),
         }
@@ -135,9 +132,8 @@ impl<'a> HedgeTimer<'a> {
     }
 
     /// The primary's bucket deadline once admitted, or else the page deadline.
-    pub fn deadline(&self) -> Instant {
-        self.primary
-            .bucket_deadline
+    fn deadline(&self) -> Instant {
+        self.bucket_deadline
             .get()
             .map_or(self.deadline, |&bucket_deadline| {
                 bucket_deadline.min(self.deadline)
@@ -201,7 +197,7 @@ impl<'a> HedgeTimer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::OnceLock, time::Duration};
 
     use bytesize::MIB;
     use tokio::time::{Instant, advance, sleep, timeout};
@@ -234,10 +230,13 @@ mod tests {
         Instant::now() + Duration::from_secs(10)
     }
 
+    static UNADMITTED: OnceLock<Instant> = OnceLock::new();
+
     #[tokio::test(start_paused = true)]
     async fn first_byte_phase_is_timed_from_the_request_start() {
         let timeline = RequestTimeline::default();
-        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline(), true);
+        let mut timer =
+            HedgeTimer::new(model(20, 4096, 3), &timeline, &UNADMITTED, deadline(), true);
         let start = Instant::now();
         tokio::join!(
             async {
@@ -252,7 +251,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hedge_not_taken_before_headers_can_be_taken_during_the_body() {
         let timeline = RequestTimeline::default();
-        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline(), true);
+        let mut timer =
+            HedgeTimer::new(model(20, 4096, 3), &timeline, &UNADMITTED, deadline(), true);
         timeline.start();
         assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
         sleep(Duration::from_millis(10)).await;
@@ -264,7 +264,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_zero_first_byte_tail_still_times_the_body() {
         let timeline = RequestTimeline::default();
-        let mut timer = HedgeTimer::new(model(0, 4096, 30), &timeline, deadline(), true);
+        let mut timer =
+            HedgeTimer::new(model(0, 4096, 30), &timeline, &UNADMITTED, deadline(), true);
         timeline.start();
         let (due, ()) = tokio::join!(due_after(&mut timer), async {
             sleep(Duration::from_millis(5)).await;
@@ -278,7 +279,7 @@ mod tests {
         advance(Duration::from_micros(500)).await;
         let timeline = RequestTimeline::default();
         let deadline = Instant::now() + Duration::from_micros(20_002);
-        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline, true);
+        let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, &UNADMITTED, deadline, true);
         timeline.start();
         assert_eq!(due_after(&mut timer).await, None);
     }
@@ -287,8 +288,15 @@ mod tests {
     async fn hedges_are_due_only_before_the_primarys_bucket_deadline() {
         for (bucket_timeout_ms, expected) in [(20, None), (21, Some(Duration::from_millis(20)))] {
             let timeline = RequestTimeline::default();
-            let mut timer = HedgeTimer::new(model(20, 4096, 3), &timeline, deadline(), true);
-            timeline.set_bucket_deadline(Instant::now() + Duration::from_millis(bucket_timeout_ms));
+            let bucket_deadline =
+                OnceLock::from(Instant::now() + Duration::from_millis(bucket_timeout_ms));
+            let mut timer = HedgeTimer::new(
+                model(20, 4096, 3),
+                &timeline,
+                &bucket_deadline,
+                deadline(),
+                true,
+            );
             timeline.start();
             assert_eq!(due_after(&mut timer).await, expected);
         }
@@ -304,7 +312,7 @@ mod tests {
                 Some(body_ms) => model(20, 4 * MIB, body_ms),
             };
             let timeline = RequestTimeline::default();
-            let mut timer = HedgeTimer::new(model, &timeline, deadline(), true);
+            let mut timer = HedgeTimer::new(model, &timeline, &UNADMITTED, deadline(), true);
             timeline.start();
             timeline.receive_headers(16 * MIB);
             assert_eq!(due_after(&mut timer).await, expected);
@@ -317,6 +325,7 @@ mod tests {
         let mut timer = HedgeTimer::new(
             model(20, 4 * MIB, 5_000_000_000),
             &timeline,
+            &UNADMITTED,
             deadline(),
             true,
         );
