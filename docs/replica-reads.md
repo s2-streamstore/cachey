@@ -89,12 +89,15 @@ headers may still start during the body.
 A single-bucket read hedges against its own bucket under the same rules. Each copy
 records its own health outcome, so throttling or a failure in one copy counts even when
 its peer succeeds, and a copy that fails transiently waits for its peer. An error that
-another copy from the same bucket would repeat, such as a missing object, ends the read.
+another copy from the same bucket would repeat, such as a missing object, settles that
+bucket: its other copies no longer hold the read open, so the read ends once no copy to
+another bucket is in flight or can start.
 
 A body whose transfer fails after its headers, which the SDK cannot retry, is retried
-once per read against its bucket when no untried bucket remains and no other copy is in
-flight. A body whose length disagrees with its `Content-Range` is an invalid response,
-which another request would likely repeat, so it is not retried against its bucket.
+once per read against its bucket when no untried bucket remains and no copy to an
+unsettled bucket is in flight. A body whose length disagrees with its `Content-Range`
+is an invalid response, which another request would likely repeat, so it is not
+retried against its bucket.
 
 By default, the shared budget permits one startup hedge and earns another per 20
 successful pages. Setting the budget to zero disables early hedges; fallback and
@@ -121,10 +124,12 @@ Rust callers configure `DownloadLimits` through `Downloader::new` or
 copies. The server requires memory for at least one page.
 
 Admission failure or backend overload returns HTTP 503; timeouts return 504. When a
-multi-bucket read fails, backend errors take precedence over timeouts, timeouts over
-admission failures, and admission failures over missing objects. The latest error
-within the same category is returned. This preserves backend diagnostics and
-prevents a partial miss from hiding a timeout or admission failure. Error precedence
+read fails, each bucket contributes one error, and backend errors take precedence over
+timeouts, timeouts over admission failures, and admission failures over missing
+objects. The latest error within the same category is returned. This preserves backend
+diagnostics and prevents a partial miss from hiding a timeout or admission failure.
+Within a bucket, an error that its other copies would repeat, such as a missing object,
+replaces the bucket's earlier errors and outlasts later ones. Error precedence
 is independent of bucket-health scoring and historical latency. Exhausting the
 retry budget produces HTTP 503 if the read would otherwise report only missing
 objects. Failures after response streaming begins terminate the body.

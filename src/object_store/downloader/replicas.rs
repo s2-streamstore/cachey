@@ -29,45 +29,73 @@ use crate::{
 
 const MAX_CONCURRENT_COPIES: usize = 3;
 
-type Completion = (usize, Result<ObjectPiece, DownloadError>);
+struct Completion {
+    index: usize,
+    is_primary: bool,
+    result: Result<ObjectPiece, DownloadError>,
+}
 
-#[derive(Default)]
+fn priority(error: &DownloadError) -> u8 {
+    match error {
+        DownloadError::NoSuchKey => 0,
+        DownloadError::AdmissionTimeout => 1,
+        DownloadError::Timeout { .. } => 2,
+        DownloadError::InvalidObjectState(_)
+        | DownloadError::InvalidResponse(_)
+        | DownloadError::BodyStreaming(_)
+        | DownloadError::Overloaded(_)
+        | DownloadError::Unknown(_)
+        | DownloadError::RangeNotSatisfied { .. }
+        | DownloadError::AdmissionExhausted { .. } => 3,
+    }
+}
+
 struct FallbackErrors {
-    last_error: Option<DownloadError>,
+    /// Each bucket's error, and the order in which it was recorded.
+    by_bucket: Vec<Option<(usize, DownloadError)>>,
+    recorded: usize,
     largest_object_size: Option<u64>,
 }
 
 impl FallbackErrors {
-    fn record(&mut self, error: DownloadError) {
-        if let DownloadError::RangeNotSatisfied { object_size, .. } = &error {
-            self.largest_object_size = self.largest_object_size.max(*object_size);
-        }
-        let priority = |error: &DownloadError| match error {
-            DownloadError::NoSuchKey => 0,
-            DownloadError::AdmissionTimeout => 1,
-            DownloadError::Timeout { .. } => 2,
-            DownloadError::InvalidObjectState(_)
-            | DownloadError::InvalidResponse(_)
-            | DownloadError::BodyStreaming(_)
-            | DownloadError::Overloaded(_)
-            | DownloadError::Unknown(_)
-            | DownloadError::RangeNotSatisfied { .. }
-            | DownloadError::AdmissionExhausted { .. } => 3,
-        };
-        if self
-            .last_error
-            .as_ref()
-            .is_none_or(|previous| priority(&error) >= priority(previous))
-        {
-            self.last_error = Some(error);
+    fn new(buckets: usize) -> Self {
+        Self {
+            by_bucket: vec![None; buckets],
+            recorded: 0,
+            largest_object_size: None,
         }
     }
 
-    fn into_error(mut self, retry_budget_exhausted: bool) -> DownloadError {
-        if let Some(DownloadError::RangeNotSatisfied { object_size, .. }) = &mut self.last_error {
+    /// An error that the bucket's other copies would repeat replaces its earlier errors and
+    /// outlasts later ones. Otherwise the bucket keeps the more relevant error, or the later of
+    /// two equally relevant.
+    fn record(&mut self, index: usize, error: DownloadError) {
+        if let DownloadError::RangeNotSatisfied { object_size, .. } = &error {
+            self.largest_object_size = self.largest_object_size.max(*object_size);
+        }
+        self.recorded += 1;
+        let kept = &mut self.by_bucket[index];
+        if error.repeats_within_bucket()
+            || kept.as_ref().is_none_or(|(_, previous)| {
+                !previous.repeats_within_bucket() && priority(&error) >= priority(previous)
+            })
+        {
+            *kept = Some((self.recorded, error));
+        }
+    }
+
+    /// The most relevant of the buckets' errors, or the latest of equally relevant ones.
+    fn into_error(self, retry_budget_exhausted: bool) -> DownloadError {
+        let mut last_error = self
+            .by_bucket
+            .into_iter()
+            .flatten()
+            .max_by_key(|(order, error)| (priority(error), *order))
+            .map(|(_, error)| error);
+        if let Some(DownloadError::RangeNotSatisfied { object_size, .. }) = &mut last_error {
             *object_size = self.largest_object_size;
         }
-        match self.last_error {
+        match last_error {
             None | Some(DownloadError::NoSuchKey) if retry_budget_exhausted => {
                 DownloadError::Overloaded(
                     "Replica retry budget exhausted during widespread overload".to_owned(),
@@ -183,7 +211,11 @@ impl ReplicaRequest<'_> {
             self.downloader.fetch_piece(request, timeline).await
         })
         .await;
-        (index, result)
+        Completion {
+            index,
+            is_primary: primary_timeline.is_some(),
+            result,
+        }
     }
 }
 
@@ -200,22 +232,27 @@ async fn next_rescue(rescues: &mut VecDeque<(Duration, usize)>, start: Instant) 
 /// What may start a copy after the primary.
 #[derive(Debug, Clone, Copy)]
 enum Trigger {
-    /// A copy failed. With no other copy in flight, `retry` names the bucket whose body last
-    /// failed after headers.
-    Fallback { retry: Option<usize> },
+    /// A copy failed.
+    Fallback,
     /// The rescue timer reserved for a bucket fired.
     Rescue(usize),
     /// The primary's hedge timer fired.
     Hedge,
 }
 
-/// Chooses the bucket and permits for each copy after the primary.
+/// Tracks each bucket's copies, and chooses the bucket and permits for each copy after the
+/// primary.
 struct Followups<'a> {
     request: &'a ReplicaRequest<'a>,
     bytes: u64,
     primary: usize,
     /// Buckets given a copy.
     tried: Vec<bool>,
+    in_flight: Vec<usize>,
+    /// Buckets whose copy failed with an error their other copies would repeat.
+    settled: Vec<bool>,
+    /// The bucket whose body last failed after its headers.
+    body_failed: Option<usize>,
     /// Whether a failed body was retried against its bucket.
     retried: bool,
     retry_budget_exhausted: bool,
@@ -223,11 +260,27 @@ struct Followups<'a> {
 }
 
 impl<'a> Followups<'a> {
+    /// Whether a copy to an unsettled bucket is in flight.
+    fn awaiting(&self) -> bool {
+        self.in_flight
+            .iter()
+            .zip(&self.settled)
+            .any(|(copies, settled)| *copies > 0 && !settled)
+    }
+
+    fn failed(&mut self, index: usize, error: &DownloadError) {
+        self.in_flight[index] -= 1;
+        self.settled[index] |= error.repeats_within_bucket();
+        if error.should_retry_same_bucket() {
+            self.body_failed = Some(index);
+        }
+    }
+
     /// The copy to start for `trigger`, if any. A fallback goes to an untried bucket, or else
-    /// retries a failed body against its bucket once per read; the retry, like any copy while
-    /// every bucket reports overload, draws on the retry budget. An early hedge skips a bucket
-    /// reporting overload. A later copy to a bucket starts only while more than the bucket's p99
-    /// time to first byte remains before its deadline.
+    /// retries a failed body against its bucket once per read when no copy is awaited; the
+    /// retry, like any copy while every bucket reports overload, draws on the retry budget. An
+    /// early hedge skips a bucket reporting overload. A later copy to a bucket starts only while
+    /// more than the bucket's p99 time to first byte remains before its deadline.
     fn next(&mut self, trigger: Trigger, hedge: &mut HedgeTimer<'_>) -> Option<CopyAttempt<'a>> {
         if let Trigger::Rescue(index) = trigger
             && self.tried[index]
@@ -245,9 +298,10 @@ impl<'a> Followups<'a> {
         let index = match trigger {
             Trigger::Rescue(index) => index,
             Trigger::Hedge => routing.best(&self.tried, remaining).unwrap_or(self.primary),
-            Trigger::Fallback { retry } => routing
-                .best(&self.tried, remaining)
-                .or(retry.filter(|_| !self.retried))?,
+            Trigger::Fallback => routing.best(&self.tried, remaining).or_else(|| {
+                self.body_failed
+                    .filter(|index| !self.retried && !self.settled[*index] && !self.awaiting())
+            })?,
         };
         if early && routing.overloaded(index) {
             return None;
@@ -288,6 +342,7 @@ impl<'a> Followups<'a> {
                 })
         };
         self.tried[index] = true;
+        self.in_flight[index] += 1;
         Some(CopyAttempt {
             index,
             model: routing.model(index),
@@ -301,9 +356,9 @@ impl<'a> Followups<'a> {
 impl Downloader {
     /// A bucket's copies share the deadline its first copy got at admission. An early hedge goes
     /// to the primary's bucket once no other bucket is untried, so a single bucket hedges against
-    /// itself; there, an error that another copy from the same bucket would repeat ends the read.
-    /// A body that fails after its headers is retried against its bucket once no untried bucket or
-    /// other copy remains.
+    /// itself. An error that another copy from the same bucket would repeat settles the bucket,
+    /// whose other copies then no longer hold the read open. A body that fails after its headers
+    /// is retried against its bucket once no untried bucket or awaited copy remains.
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -314,7 +369,6 @@ impl Downloader {
         deadline: Instant,
     ) -> Result<DownloadOutput, DownloadError> {
         let bytes = range.end - range.start;
-        let single_bucket = buckets.len() == 1;
         let request = ReplicaRequest {
             downloader: self,
             buckets,
@@ -340,17 +394,20 @@ impl Downloader {
         );
         let primary_model = routing.model(primary);
         let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
-        let mut tried = vec![false; buckets.len()];
-        tried[primary] = true;
         let mut followups = Followups {
             request: &request,
             bytes,
             primary,
-            tried,
+            tried: vec![false; buckets.len()],
+            in_flight: vec![0; buckets.len()],
+            settled: vec![false; buckets.len()],
+            body_failed: None,
             retried: false,
             retry_budget_exhausted: false,
             backup_admission,
         };
+        followups.tried[primary] = true;
+        followups.in_flight[primary] = 1;
         let mut hedge = HedgeTimer::new(
             primary_model,
             &primary_timeline,
@@ -366,29 +423,24 @@ impl Downloader {
             probe,
             permits: primary_permits,
         }));
-        let mut fallback_errors = FallbackErrors::default();
-        let mut body_failed = None;
-        while !active.is_empty() {
+        let mut fallback_errors = FallbackErrors::new(buckets.len());
+        while followups.awaiting() {
             let trigger = select! {
                 biased;
-                Some((index, result)) = active.next() => {
+                Some(Completion { index, is_primary, result }) = active.next() => {
                     let error = match result {
                         Ok(piece) => return Ok(request.output(piece, primary, index, start)),
                         Err(error) => error,
                     };
-                    if !error.should_attempt_fallback_bucket()
-                        || (single_bucket && !error.should_wait_for_hedged_peer())
-                    {
+                    if !error.should_attempt_fallback_bucket() {
                         return Err(error);
                     }
-                    if error.should_retry_same_bucket() {
-                        body_failed = Some(index);
-                    }
-                    fallback_errors.record(error);
-                    if index == primary {
+                    if is_primary {
                         hedge.disarm();
                     }
-                    Trigger::Fallback { retry: body_failed.filter(|_| active.is_empty()) }
+                    followups.failed(index, &error);
+                    fallback_errors.record(index, error);
+                    Trigger::Fallback
                 },
                 index = next_rescue(&mut rescues, start) => Trigger::Rescue(index),
                 () = hedge.due() => Trigger::Hedge,
@@ -458,17 +510,27 @@ mod tests {
         ]
     }
 
-    fn assert_accumulated_error(
-        errors: impl IntoIterator<Item = DownloadError>,
+    fn assert_bucket_errors(
+        errors: impl IntoIterator<Item = (usize, DownloadError)>,
         expected: &DownloadError,
     ) {
-        let mut fallback_errors = FallbackErrors::default();
-        for error in errors {
-            fallback_errors.record(error);
+        let errors = errors.into_iter().collect::<Vec<_>>();
+        let buckets = errors.iter().map(|(index, _)| index + 1).max();
+        let mut fallback_errors = FallbackErrors::new(buckets.unwrap_or_default());
+        for (index, error) in errors {
+            fallback_errors.record(index, error);
         }
         let actual = fallback_errors.into_error(false);
         assert_eq!(discriminant(&actual), discriminant(expected), "{actual:?}");
         assert_eq!(actual.to_string(), expected.to_string());
+    }
+
+    /// Records each error from its own bucket.
+    fn assert_accumulated_error(
+        errors: impl IntoIterator<Item = DownloadError>,
+        expected: &DownloadError,
+    ) {
+        assert_bucket_errors(errors.into_iter().enumerate(), expected);
     }
 
     fn assert_preferred_in_either_order(preferred: &DownloadError, other: &DownloadError) {
@@ -492,6 +554,31 @@ mod tests {
             for fallback in [DownloadError::AdmissionTimeout, timeout("peer")] {
                 assert_preferred_in_either_order(&error, &fallback);
             }
+        }
+    }
+
+    #[test]
+    fn an_error_its_bucket_would_repeat_replaces_that_buckets_other_errors() {
+        let overloaded = DownloadError::Overloaded("slow down".to_owned());
+        for (errors, expected) in [
+            (
+                vec![(0, overloaded.clone()), (0, DownloadError::NoSuchKey)],
+                &DownloadError::NoSuchKey,
+            ),
+            (
+                vec![(0, DownloadError::NoSuchKey), (0, timeout("primary"))],
+                &DownloadError::NoSuchKey,
+            ),
+            (
+                vec![
+                    (1, overloaded.clone()),
+                    (0, timeout("primary")),
+                    (0, DownloadError::NoSuchKey),
+                ],
+                &overloaded,
+            ),
+        ] {
+            assert_bucket_errors(errors, expected);
         }
     }
 

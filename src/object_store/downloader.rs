@@ -83,18 +83,17 @@ impl DownloadError {
         }
     }
 
-    fn should_wait_for_hedged_peer(&self) -> bool {
+    /// Another copy from the same bucket would return the same error.
+    fn repeats_within_bucket(&self) -> bool {
         match self {
+            Self::InvalidObjectState(_) | Self::NoSuchKey | Self::RangeNotSatisfied { .. } => true,
             Self::InvalidResponse(_)
             | Self::BodyStreaming(_)
-            | Self::Unknown(_)
-            | Self::Timeout { .. }
-            | Self::Overloaded(_) => true,
-            Self::InvalidObjectState(_)
-            | Self::NoSuchKey
-            | Self::RangeNotSatisfied { .. }
+            | Self::Overloaded(_)
             | Self::AdmissionTimeout
-            | Self::AdmissionExhausted { .. } => false,
+            | Self::AdmissionExhausted { .. }
+            | Self::Timeout { .. }
+            | Self::Unknown(_) => false,
         }
     }
 
@@ -1081,6 +1080,44 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_body_retry_denied_admission_preserves_the_body_failure() {
+        let (downloader, script) = scripted_downloader([("bucket", 5, 5, true)]);
+        let page_timeout = Duration::from_millis(100);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                page_timeout,
+                max_inflight_requests: 1,
+                max_inflight_bytes: 4,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let read = async {
+            let result =
+                fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+            assert_eq!(start.elapsed(), page_timeout);
+            result
+        };
+        let competing_read = async {
+            sleep(Duration::from_millis(1)).await;
+            let permit = downloader
+                .admission
+                .acquire(4, start + page_timeout)
+                .await
+                .unwrap();
+            sleep(page_timeout).await;
+            drop(permit);
+        };
+        let (result, ()) = tokio::join!(read, competing_read);
+        assert!(
+            matches!(result, Err(DownloadError::BodyStreaming(_))),
+            "{result:?}"
+        );
+        assert_eq!(script.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_retry_past_its_buckets_deadline_spends_no_retry_credit() {
         let (downloader, script) =
             scripted_downloader([("local", 5, 5, true), ("peer", 1_000, 0, false)]);
@@ -1175,6 +1212,26 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_same_bucket_miss_ends_the_read_once_no_other_bucket_can_serve_it() {
+        let (downloader, script, _) = hedge_after_rescue([
+            ("local", 29, 1_000, false),
+            ("peer", 1, 0, false),
+            ("local", 1, 0, false),
+        ]);
+        script.service_errors.lock().extend([(1, 404), (2, 404)]);
+        let start = tokio::time::Instant::now();
+        let result =
+            fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
+        assert!(
+            matches!(result, Err(DownloadError::NoSuchKey)),
+            "{result:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(60));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
