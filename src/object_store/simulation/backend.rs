@@ -453,7 +453,7 @@ impl Backend {
             ) - 100;
             (i128::from(millis) * (10_000 + percent * adjustment) / 10_000) as u64
         };
-        let mut headers_ms = jitter(replica.headers_ms, 1000);
+        let mut headers_ms = jitter(replica.headers_ms(body_bytes), 1000);
         let mut body_ms = jitter(replica.body_ms(body_bytes), 1001);
         if let Some((kind, duration)) = fault {
             match kind {

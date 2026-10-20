@@ -45,13 +45,52 @@ wire attempt instead. Healthy downloads calibrate replicas before measurement;
 a run with zero warmup reads exercises cold starts. `request_bytes` controls admission
 reservations independently of `body_bytes`; page-admission fixtures reserve 16 MiB.
 `short_body` gives a seeded share of reads a shorter response: the last page of an
-object, or an exact-range read when `request_bytes` is unset. A replica's
-`body_ms_per_mib` adds body time in proportion to the response length.
+object, or an exact-range read when `request_bytes` is unset. With `max_bytes`, short
+responses spread uniformly from `bytes` up to that length, as the last pages of objects
+of varied sizes do. A replica's `body_ms_per_mib` adds body time in proportion to the
+response length.
 
 Seeds control faults, latency jitter, and recovery probes. SDK retries use the real
 classifier and quota with deterministic backoff. The default histogram reservoir
 retains all observations, but its priorities remain unseeded. Production-reservoir
 comparisons are statistical; repeat runs when investigating small differences.
+
+## Fixtures
+
+Each fixture models one backend, named by its prefix, and uses that backend's latency
+profile, so fixtures within a family differ only in faults, limits, and load. On every
+backend a small body arrives with its headers. S3 then streams the body, so its time
+grows with length after headers; Capacitor reads and verifies the whole range before
+sending headers and sends the body from memory, so a replica's `headers_ms_per_mib`
+adds its time before headers instead.
+
+| Profile | Replicas | Before headers | After headers |
+|---------|----------|----------------|---------------|
+| S3 Standard | one bucket in the region | 25 ms | 11 ms per MiB |
+| S3 Standard, cross-region | the local bucket and replicas in two other regions | 25, 85, 165 ms | 11 ms per MiB |
+| S3 Express One Zone | a directory bucket per AZ, the first local | 3, 4, 5 ms | 4 ms per MiB |
+| Capacitor | a deployment per AZ, the first local, chunks up to 4 MiB | 1, 2, 2 ms plus 1 ms per MiB | 1 ms per MiB |
+
+AWS describes S3 Standard medians for small requests in the tens of milliseconds, and
+earlier guidance planned on 85–90 MB/s per request. S3 Express One Zone promises
+single-digit-millisecond first bytes; crossing an AZ adds about a millisecond, and its
+time per MiB is an assumption. Capacitor's figures follow its p99 goals of 5 ms under
+1 MiB and 10 ms up to 4 MiB. Calibrate profiles against the bucket latency gauges.
+
+| Scenario | S3 Standard | S3 Express One Zone | Capacitor |
+|----------|-------------|---------------------|-----------|
+| Healthy | `s3_standard_healthy`, `s3_standard_cross_region_healthy` | `s3_express_healthy`, `s3_express_healthy_jitter`, `s3_express_healthy_page_admission` | `capacitor_healthy` |
+| Stalls | `s3_standard_stalls`, `s3_standard_cross_region_deadline`, `s3_standard_cross_region_deadline_page_admission` | `s3_express_two_zones_header_stall`, `s3_express_two_zones_header_stall_page_admission`, `s3_express_two_zones_body_stall`, `s3_express_header_stalls_page_admission`, `s3_express_local_slowdown` | `capacitor_stalls` |
+| One bucket or zone | `s3_standard_stalls`, `s3_standard_body_resets` | `s3_express_single_zone_header_stalls`, `s3_express_single_zone_slow_bodies` | |
+| Errors and outages | `s3_standard_internal_errors`, `s3_standard_distant_region_cannot_fit` | `s3_express_independent_errors`, `s3_express_independent_errors_large`, `s3_express_correlated_errors`, `s3_express_two_zones_fail`, `s3_express_sdk_retry_with_hedges` | `capacitor_zone_loss` |
+| Missing objects | `s3_standard_replication_lag` | | `capacitor_missing_chunks` |
+| Cold start and recovery | `s3_standard_cold_cross_region_failover` | `s3_express_guarded_recovery`, `s3_express_recovery_during_peer_outage` | |
+| Throttling and overload | `s3_standard_slowdown` | `s3_express_overload_sdk_retries` | `capacitor_overload`, `capacitor_overload_delayed_cancel` |
+| Admission | `s3_standard_admission_saturation`, `s3_standard_queued_long_read` | `s3_express_stalled_admission` | |
+| Cancellation | | `s3_express_caller_cancellation`, `s3_express_delayed_cancellation` | `capacitor_cancel_storm`, `capacitor_cancel_immediate` |
+
+`synthetic_fixed_body_time_slow_bodies` alone puts fixed time after headers, which no
+backend above does.
 
 ## Interpreting results
 
@@ -60,7 +99,7 @@ caller cancellations. Reports separate successful latency from all-arrival laten
 and admitted copies from SDK invocations and wire attempts. Service work measures
 occupied slot time; post-read work is the portion after the originating read finishes.
 Recovery timestamps are sampled when reads complete. Fixtures with short bodies also
-report successful latency by response length.
+report successful latency for full and short responses.
 
 The model omits connection setup, network contention, and interactions among cachey
 instances. Millisecond timing and prescribed service distributions limit conclusions
