@@ -90,7 +90,7 @@ pub struct Read {
 pub struct Latency {
     mean_us: u64,
     p50_us: u64,
-    pub p99_us: u64,
+    p99_us: u64,
     max_us: u64,
 }
 
@@ -139,7 +139,7 @@ pub struct Report {
     success_latency: Latency,
     /// Successful latency of full and short responses, in fixtures with short bodies.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub success_latency_by_response: BTreeMap<&'static str, Latency>,
+    success_latency_by_response: BTreeMap<&'static str, Latency>,
     all_arrival_latency: Latency,
     copy_operations: usize,
     pub transport_attempts: usize,
