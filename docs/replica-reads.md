@@ -92,9 +92,10 @@ another bucket is in flight or can start.
 
 A body whose transfer fails after its headers, which the SDK cannot retry, is retried
 once per read against its bucket when no untried bucket remains and no copy to an
-unsettled bucket is in flight. A body whose length disagrees with its `Content-Range`
-is an invalid response, which another request would likely repeat, so it is not
-retried against its bucket.
+unsettled bucket is in flight. If bodies failed in several buckets, the retry goes to
+the preferred one that still has time before its deadline, by the rule above for later
+copies. A body whose length disagrees with its `Content-Range` is an invalid response,
+which another request would likely repeat, so it is not retried against its bucket.
 
 By default, the shared budget permits one startup hedge and earns another per 20
 successful pages. Setting the budget to zero disables early hedges; fallback and

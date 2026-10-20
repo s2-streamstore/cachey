@@ -1126,6 +1126,35 @@ mod tests {
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
+    /// The primary's body hedge goes to the peer at 90ms, whose body fails at 200ms while the
+    /// primary is awaited. The primary's body then fails at 450ms with 50ms left before its bucket
+    /// deadline, short of the 100ms request tail, but the peer still has 140ms.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_retry_goes_to_a_failed_bucket_with_time_left() {
+        let (downloader, script) = scripted_downloader([
+            ("local", 10, 440, true),
+            ("peer", 10, 100, true),
+            ("peer", 10, 20, false),
+        ]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                bucket_timeout: Duration::from_millis(500),
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        for bucket in ["local", "peer"] {
+            downloader.bucketed_stats.seed(
+                &BucketName::new(bucket).unwrap(),
+                Sample::from_millis(20, 4, 80),
+            );
+        }
+        let output = fetch(&downloader, &["local", "peer"]).await;
+        assert_eq!(output.used_bucket_idx, 1);
+        assert_eq!(output.latency, Duration::from_millis(480));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
     /// The local primary's body hedge is due at 59ms, after a rescue gave the peer a copy at 40ms.
     fn hedge_after_rescue(responses: [ResponseStep; 3]) -> (Downloader, Arc<ScriptState>) {
         let (downloader, script) = scripted_downloader(responses);

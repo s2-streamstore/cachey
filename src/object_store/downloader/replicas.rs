@@ -256,8 +256,8 @@ struct Followups<'a> {
     tried: Vec<bool>,
     in_flight: Vec<usize>,
     errors: FallbackErrors,
-    /// The bucket whose body last failed after its headers.
-    body_failed: Option<usize>,
+    /// Buckets whose body failed after its headers.
+    body_failed: Vec<bool>,
     /// Whether a failed body was retried against its bucket.
     retried: bool,
     retry_budget_exhausted: bool,
@@ -281,7 +281,7 @@ impl<'a> Followups<'a> {
     fn failed(&mut self, index: usize, error: DownloadError) {
         self.in_flight[index] -= 1;
         if error.should_retry_same_bucket() {
-            self.body_failed = Some(index);
+            self.body_failed[index] = true;
         }
         self.errors.record(index, error);
     }
@@ -290,11 +290,24 @@ impl<'a> Followups<'a> {
         self.errors.into_error(self.retry_budget_exhausted)
     }
 
+    /// Whether a later copy to the bucket would have more than its p99 request latency before
+    /// the bucket's deadline. A bucket without an admitted copy has no deadline yet.
+    fn has_time(&self, routing: &RoutingSnapshot, index: usize, now: Instant) -> bool {
+        self.request
+            .bucket_deadline(index)
+            .admitted()
+            .is_none_or(|deadline| {
+                deadline.saturating_duration_since(now)
+                    > routing.model(index).tail().unwrap_or_default()
+            })
+    }
+
     /// The copy to start for `trigger`, if any. A fallback goes to an untried bucket, or else
-    /// retries a failed body against its bucket once per read when no copy is awaited; the
-    /// retry, like any copy while every bucket reports overload, draws on the retry budget. An
-    /// early hedge skips a bucket reporting overload. A later copy to a bucket starts only while
-    /// more than the bucket's p99 request latency remains before its deadline.
+    /// retries a failed body once per read when no copy is awaited, against the best bucket
+    /// whose body failed that still has time; the retry, like any copy while every bucket
+    /// reports overload, draws on the retry budget. An early hedge skips a bucket reporting
+    /// overload. A later copy to a bucket starts only while more than the bucket's p99 request
+    /// latency remains before its deadline.
     fn next(&mut self, trigger: Trigger, hedge: &mut HedgeTimer<'_>) -> Option<CopyAttempt<'a>> {
         if let Trigger::Rescue(index) = trigger
             && self.tried[index]
@@ -313,20 +326,23 @@ impl<'a> Followups<'a> {
             Trigger::Rescue(index) => index,
             Trigger::Hedge => routing.best(&self.tried, remaining).unwrap_or(self.primary),
             Trigger::Fallback => routing.best(&self.tried, remaining).or_else(|| {
-                self.body_failed.filter(|index| {
-                    !self.retried && !self.errors.settled(*index) && !self.awaiting()
-                })
+                if self.retried || self.awaiting() {
+                    return None;
+                }
+                let unretriable = (0..self.tried.len())
+                    .map(|index| {
+                        !self.body_failed[index]
+                            || self.errors.settled(index)
+                            || !self.has_time(&routing, index, now)
+                    })
+                    .collect::<Vec<_>>();
+                routing.best(&unretriable, remaining)
             })?,
         };
-        if early && routing.overloaded(index) {
+        if (early && routing.overloaded(index)) || !self.has_time(&routing, index, now) {
             return None;
         }
         let model = routing.model(index);
-        if let Some(bucket_deadline) = self.request.bucket_deadline(index).admitted()
-            && bucket_deadline.saturating_duration_since(now) <= model.tail().unwrap_or_default()
-        {
-            return None;
-        }
         let overloaded = routing.all_overloaded();
         let retrying = !early && self.tried[index];
         if (overloaded || retrying) && !downloader.attempt_budget.try_retry() {
@@ -411,7 +427,7 @@ impl Downloader {
             tried: vec![false; buckets.len()],
             in_flight: vec![0; buckets.len()],
             errors: FallbackErrors::default(),
-            body_failed: None,
+            body_failed: vec![false; buckets.len()],
             retried: false,
             retry_budget_exhausted: false,
             backup_admission,
