@@ -136,8 +136,10 @@ an authoritative size or replica agreement.
 Bucket latency gauges describe the [latency model](#latency-model): samples come from
 each validated backend request, including hedges, except the copies it leaves out.
 Those copies, in-flight stalls, and canceled reads can still raise routing latency.
-Page latency counts every successful page, and for a hedge win is timed from the
-original primary start. Latency histograms exclude client body transmission.
+The body overhead, throughput, and ratio gauges expose the fitted body model for
+diagnosis, and may change with it. Page latency counts every successful page, and for a
+hedge win is timed from the original primary start. Latency histograms exclude client
+body transmission.
 
 `DownloadOutput` reports the initial and winning buckets. `hedged` means copies
 overlapped, including rescue and recovery probes; the page `fallback` metric counts
