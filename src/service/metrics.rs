@@ -59,7 +59,7 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
             (
                 gauge(
                     "cachey_bucket_body_model_bytes",
-                    "Largest observed response-size band used for the exported body transfer estimate",
+                    "Representative response size of the largest pooled body estimate",
                 ),
                 |metrics| metrics.body_model_bytes.map(|bytes| bytes as f64),
             ),

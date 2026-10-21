@@ -57,6 +57,10 @@ pub struct ShortBody {
     /// Spreads short responses uniformly from `bytes` up to, but excluding, this length, as the
     /// last pages of objects of varied sizes are.
     pub max_bytes: Option<usize>,
+    /// Distribute exact reads across orders of magnitude instead of concentrating near the
+    /// maximum.
+    #[serde(default)]
+    pub log_uniform: bool,
     pub probability_ppm: u32,
 }
 
@@ -230,9 +234,15 @@ impl Scenario {
                 ) =>
             {
                 short.max_bytes.map_or(short.bytes, |max| {
-                    let spread = draw(seed, read, 0, 0, 0, SHORT_BODY_LENGTH_DOMAIN)
-                        % (max - short.bytes) as u64;
-                    short.bytes + spread as usize
+                    let value = draw(seed, read, 0, 0, 0, SHORT_BODY_LENGTH_DOMAIN);
+                    if short.log_uniform {
+                        let fraction = (value >> 11) as f64 / (1_u64 << 53) as f64;
+                        let bytes =
+                            short.bytes as f64 * (max as f64 / short.bytes as f64).powf(fraction);
+                        (bytes as usize).clamp(short.bytes, max - 1)
+                    } else {
+                        short.bytes + (value % (max - short.bytes) as u64) as usize
+                    }
                 })
             }
             _ => self.body_bytes,

@@ -593,20 +593,19 @@ async fn campaign() {
 
 #[tokio::test(start_paused = true)]
 async fn simulation_fixed_body_overhead_preserves_hedges_for_stalls() {
-    for seed in [7, 42, 2026] {
-        let report = simulate(
-            scenario_named("synthetic_fixed_body_time_healthy"),
-            seed,
-            false,
-            false,
-        )
-        .await;
-        assert_eq!(report.completed, report.arrivals);
-        assert!(
-            report.overlapping_reads <= 1,
-            "seed {seed}: {} unnecessary hedges",
-            report.overlapping_reads
-        );
+    for name in [
+        "synthetic_fixed_body_time_healthy",
+        "synthetic_exact_ranges_fixed_body",
+    ] {
+        for seed in [7, 42, 2026] {
+            let report = simulate(scenario_named(name), seed, false, false).await;
+            assert_eq!(report.completed, report.arrivals);
+            assert!(
+                report.overlapping_reads <= 1,
+                "{name} seed {seed}: {} unnecessary hedges",
+                report.overlapping_reads
+            );
+        }
     }
     assert_stalls_are_rescued(
         scenario_named("synthetic_fixed_body_time_slow_bodies"),

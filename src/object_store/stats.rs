@@ -41,7 +41,7 @@ pub struct BucketMetrics {
     /// retries.
     pub first_byte_mean: Option<Duration>,
     pub first_byte_p99: Option<Duration>,
-    /// Size at which `body_seconds_per_byte` is estimated: the largest observed size band.
+    /// Representative response size of the largest pooled body estimate.
     pub body_model_bytes: Option<u64>,
     /// Uncapped p99 body time per byte beyond a 1 ms timer allowance at `body_model_bytes`.
     /// Smaller responses have their own estimates, including their fixed transfer overhead.
@@ -182,7 +182,7 @@ fn histogram_micros(duration: Duration) -> i64 {
     duration.as_micros().min(i64::MAX as u128) as i64
 }
 
-fn histogram(now: Instant) -> ExponentialDecayHistogram {
+fn histogram<T>(now: Instant) -> ExponentialDecayHistogram<T> {
     let mut builder = ExponentialDecayHistogram::builder();
     builder.at(now.into_std()).alpha(LATENCY_DECAY);
     #[cfg(test)]
@@ -351,9 +351,8 @@ impl BucketStats {
             )
     }
 
-    /// Changed histograms are summarized again at most once per interval, except that a phase is
-    /// summarized as soon as it holds its first samples, including after a probe replaces its
-    /// history.
+    /// Summarize changed history once per interval. First samples are available immediately;
+    /// the body model also refreshes when its observation count doubles to learn during startup.
     fn model(&mut self, now: Instant) -> LatencyModel {
         let due = now.duration_since(self.summarized_at) >= LATENCY_SNAPSHOT_INTERVAL;
         if due {
@@ -1038,19 +1037,15 @@ mod tests {
             stats.seed(&bucket, Sample::from_millis(10, MIB / 16, 20));
         }
         let model = stats.model(&bucket);
-        for (bytes, micros) in [(16 * MIB, 161_000), (3 * MIB / 2, 16_000), (4096, 2187)] {
-            assert_eq!(
-                model.body_tail(bytes).map(|tail| tail.as_micros()),
-                Some(micros),
-                "{bytes}"
-            );
-        }
+        assert_eq!(model.body_tail(16 * MIB), Some(Duration::from_millis(161)));
+        assert!(model.body_tail(3 * MIB / 2).unwrap() <= Duration::from_millis(20));
+        assert!(model.body_tail(4096).unwrap() <= Duration::from_millis(5));
     }
 
     #[tokio::test(start_paused = true)]
     async fn quantiles_take_the_nearest_rank_of_samples_recorded_together() {
         let now = Instant::now();
-        let mut samples = histogram(now);
+        let mut samples = histogram::<()>(now);
         for value in [5, 1, 3, 3, 3, 9, 7, 7, 2, 8] {
             samples.update_at(now.into_std(), value);
         }
@@ -1078,7 +1073,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_decayed_outlier_does_not_become_the_tail_above_recent_samples() {
         let start = Instant::now();
-        let mut samples = histogram(start);
+        let mut samples = histogram::<()>(start);
         for value in (50..80).chain([1000]) {
             samples.update_at(start.into_std(), value);
         }
@@ -1102,12 +1097,16 @@ mod tests {
     async fn phases_are_summarized_on_their_first_samples_then_once_per_interval() {
         let stats = BucketedStats::default();
         let bucket = BucketName::new("local").unwrap();
-        stats.seed(&bucket, Sample::from_millis(10, 4096, 2));
+        for _ in 0..4 {
+            stats.seed(&bucket, Sample::from_millis(10, 4096, 2));
+        }
         assert_eq!(
             stats.model(&bucket).first_byte_tail(),
             Some(Duration::from_millis(10))
         );
-        stats.seed(&bucket, Sample::from_millis(30, 4 * MIB, 40));
+        for _ in 0..4 {
+            stats.seed(&bucket, Sample::from_millis(30, 4 * MIB, 40));
+        }
         let model = stats.model(&bucket);
         assert_eq!(model.first_byte_tail(), Some(Duration::from_millis(10)));
         assert_eq!(model.body_tail(4 * MIB), Some(Duration::from_millis(40)));
@@ -1168,7 +1167,9 @@ mod tests {
             Duration::from_millis(200)
         );
 
-        stats.seed(&bucket, Sample::from_millis(20, 4 * MIB, 251));
+        for _ in 0..4 {
+            stats.seed(&bucket, Sample::from_millis(20, 4 * MIB, 251));
+        }
         advance(LATENCY_SNAPSHOT_INTERVAL).await;
         let model = stats.model(&bucket);
         assert_eq!(model.body_tail(16 * MIB), Some(Duration::from_millis(1001)));

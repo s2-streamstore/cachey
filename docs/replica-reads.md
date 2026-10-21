@@ -29,17 +29,28 @@ completed stalls do not set future hedge delays. Health classification and retry
 feasibility use uncapped predictions; changing the hedge policy does not change
 those decisions.
 
-Body observations are grouped into power-of-two size bands. Each band retains its
-own decaying histogram, so many tiny reads cannot evict evidence from large reads.
-Predictions interpolate between bands, allowing both fixed transfer overhead and
-size-dependent transfer time. The largest band also supplies transfer-rate evidence
-for sparsely observed smaller sizes. Within each band, durations beyond a 1 ms timer
-allowance are normalized to the band's upper size bound.
+Latency history is shared across objects and callers within each bucket. Body
+observations are retained in power-of-two size bands so tiny reads cannot evict
+rare transfers. Estimation pools neighboring sizes, using their decayed observation
+counts rather than giving every populated band independent authority. Each group
+needs the weight of three recent observations; a sparse remainder joins its
+neighbor. The whole model starts with one pooled group when history is shorter.
 
-Outside measured bands, predictions scale the nearest estimate with response
-length. Buffered-only history cannot establish throughput for larger responses.
-Sparse history can still cause startup hedges; deadline rescue remains available
-when an early hedge has no estimate.
+Up to 16 groups describe the curve. Supported groups teach a shared fixed body
+cost, with a 1 ms timer allowance until that cost can be distinguished from transfer
+time. Their median and p99 transfer estimates interpolate with response size. The
+largest group also supplies transfer-rate evidence for smaller sizes. Tiny
+observations receive less weight when scaled up within a group, preventing their
+timer noise from dominating large-transfer estimates.
+
+Snapshots refresh once per second and when the observation count doubles. This
+lets early reads improve the model without rebuilding it on every completion.
+
+Outside the curve, predictions scale transfer time while preserving fixed overhead.
+A flat or buffered-only history cannot establish throughput beyond the largest
+representative size. Sparse history can still cause startup hedges; deadline rescue
+remains available when an early hedge has no estimate. Three observations prevent
+an isolated size from controlling the curve; they do not establish a precise p99.
 
 ## Deadlines and hedging
 
@@ -91,7 +102,7 @@ contacting a backend.
 |-------------|---------|
 | `cachey_bucket_latency_{mean,p99}_seconds` | Request start through validated body, including SDK retries |
 | `cachey_bucket_first_byte_{mean,p99}_seconds` | Request start through successful headers |
-| `cachey_bucket_body_model_bytes` | Largest observed size band's upper bound |
+| `cachey_bucket_body_model_bytes` | Representative response size of the largest pooled body estimate |
 | `cachey_bucket_body_seconds_per_byte` | Uncapped p99 body time per byte beyond 1 ms at that size; smaller sizes have separate estimates |
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |

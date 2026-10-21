@@ -1282,5 +1282,113 @@
     ],
     "faults": [],
     "duration_ms": 6000
+  },
+  {
+    "name": "s3_standard_exact_ranges_healthy",
+    "duration_ms": 12000,
+    "interval_ms": 20,
+    "warmup_per_replica": 0,
+    "body_bytes": 262144,
+    "short_body": {
+      "bytes": 1024,
+      "max_bytes": 262144,
+      "log_uniform": true,
+      "probability_ppm": 1000000
+    },
+    "jitter_percent": 20,
+    "hedge_percent": 5,
+    "replicas": [
+      {
+        "headers_ms": 25,
+        "body_ms_per_mib": 11
+      }
+    ]
+  },
+  {
+    "name": "s3_standard_exact_ranges_stalls",
+    "duration_ms": 12000,
+    "interval_ms": 20,
+    "warmup_per_replica": 0,
+    "body_bytes": 262144,
+    "short_body": {
+      "bytes": 1024,
+      "max_bytes": 262144,
+      "log_uniform": true,
+      "probability_ppm": 1000000
+    },
+    "jitter_percent": 20,
+    "hedge_percent": 5,
+    "replicas": [
+      {
+        "headers_ms": 25,
+        "body_ms_per_mib": 11
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0
+        ],
+        "kind": "header_stall",
+        "start_ms": 1000,
+        "end_ms": 12000,
+        "probability_ppm": 10000,
+        "duration_ms": 1000
+      },
+      {
+        "replicas": [
+          0
+        ],
+        "kind": "slow",
+        "start_ms": 1000,
+        "end_ms": 12000,
+        "probability_ppm": 10000,
+        "duration_ms": 1500
+      }
+    ]
+  },
+  {
+    "name": "synthetic_exact_ranges_fixed_body",
+    "duration_ms": 6000,
+    "interval_ms": 20,
+    "warmup_per_replica": 0,
+    "body_bytes": 262144,
+    "short_body": {
+      "bytes": 1024,
+      "max_bytes": 262144,
+      "log_uniform": true,
+      "probability_ppm": 1000000
+    },
+    "jitter_percent": 0,
+    "hedge_percent": 5,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 20,
+        "body_ms_per_mib": 10
+      }
+    ]
+  },
+  {
+    "name": "synthetic_mixed_exact_sizes",
+    "duration_ms": 12000,
+    "interval_ms": 20,
+    "warmup_per_replica": 0,
+    "body_bytes": 16777216,
+    "short_body": {
+      "bytes": 1024,
+      "max_bytes": 16777216,
+      "log_uniform": true,
+      "probability_ppm": 1000000
+    },
+    "jitter_percent": 10,
+    "hedge_percent": 5,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "body_ms": 20,
+        "body_ms_per_mib": 10
+      }
+    ]
   }
 ]

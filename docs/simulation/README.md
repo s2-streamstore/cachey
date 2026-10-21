@@ -80,6 +80,14 @@ The `synthetic_fixed_body_time_healthy` and
 `synthetic_fixed_body_time_slow_bodies` fixtures also put a fixed cost after headers.
 They check that mixed-size reads learn that cost and preserve hedge credits for stalls.
 
+The `s3_standard_exact_ranges_{healthy,stalls}` fixtures exercise 1–256 KiB
+responses with no page-sized reservation and no warmup.
+`synthetic_exact_ranges_fixed_body` adds fixed body overhead, while
+`synthetic_mixed_exact_sizes` spans 1 KiB–16 MiB. Their `short_body.log_uniform`
+setting spreads reads across orders of magnitude. These are prospective workloads
+for [exact-range support](https://github.com/s2-streamstore/cachey/pull/169);
+they do not represent deployed traffic measurements.
+
 ## Interpreting results
 
 Compare revisions with the same harness, fixtures, and controls. Assess completion
