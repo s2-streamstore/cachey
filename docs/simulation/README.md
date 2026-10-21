@@ -45,8 +45,8 @@ can still reserve a full page.
 
 Seeds control faults, jitter, and recovery probes. SDK retries use the real
 classifier and quota with deterministic backoff. All latency histograms retain
-observations by default, including each body size band. Production sampling is unseeded, so repeat those runs when comparing small
-differences.
+observations by default, including each body size band. Production sampling is
+unseeded, so repeat those runs when comparing small differences.
 
 ## Fixtures
 
@@ -97,4 +97,4 @@ instances. Millisecond timers distort fast-body latency and favor completed
 responses over hedges on the same tick. Results describe these fixtures, not
 production latency.
 
-See the [reference results](REFERENCE.md) for pinned revisions and measured limits.
+See the [reference results](REFERENCE.md) for pinned comparisons and measured limits.

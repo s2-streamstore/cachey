@@ -25,8 +25,9 @@ copies do not contribute completed samples.
 Before headers arrive, early hedges use first-byte observations. After headers,
 they use body observations for the announced response length. Both hedge delays
 use p99 capped at 1.5 times the median, with a 1 ms median floor, so occasional
-completed stalls do not set future hedge delays. Health classification and retry feasibility use uncapped
-predictions; changing the hedge policy does not change those decisions.
+completed stalls do not set future hedge delays. Health classification and retry
+feasibility use uncapped predictions; changing the hedge policy does not change
+those decisions.
 
 Body observations are grouped into power-of-two size bands. Each band retains its
 own decaying histogram, so many tiny reads cannot evict evidence from large reads.
