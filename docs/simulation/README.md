@@ -23,9 +23,9 @@ CACHEY_SIM_OUTPUT=/tmp/cachey-simulation.json \
 | `CACHEY_SIM_OUTPUT` | Required output JSON path |
 | `CACHEY_SIM_SCENARIOS` | Comma-separated fixture names; default all |
 | `CACHEY_SIM_SEEDS` | Comma-separated seeds; default `7,42,2026` |
-| `CACHEY_SIM_RATE_MULTIPLIERS` | Comma-separated positive integers; default `1`. Divides arrival spacing, truncated to milliseconds; spacing must remain positive. |
+| `CACHEY_SIM_RATE_MULTIPLIERS` | Comma-separated positive integer load multipliers; default `1` |
 | `CACHEY_SIM_REQUEST_LIMIT` | Override global active-copy limit |
-| `CACHEY_SIM_NATIVE_RESERVOIR` | `1` uses production 1,028-sample request and first-byte reservoirs |
+| `CACHEY_SIM_NATIVE_RESERVOIR` | `1` uses production sampling for request and first-byte latency |
 | `CACHEY_SIM_TRACE` | `1` includes every read, admitted copy, and wire attempt |
 
 [Fixtures](../../tests/scenarios/replica_reads.json) inherit omitted fields from
@@ -34,38 +34,26 @@ resolved configuration, seed, sampling mode, Git revision, and dirty-tree flag.
 
 ## Model
 
-Each replica has service slots and a finite FIFO queue. Queue overflow returns
-`SlowDown`; accepted work occupies a slot through headers and body generation.
-Cancellation frees backend capacity after the configured delay or normal completion,
-whichever comes first. Every run drains workers and checks that capacity is released.
+Each replica has service slots and a finite queue. Queue overflow returns
+`SlowDown`. Cancellation may leave backend work running for a configurable delay.
+Every run checks that workers release their capacity.
 
-Faults cover errors, missing objects, slow service, and stalled headers or bodies.
-Fault timing uses read arrival by default; `clock_at_arrival=false` evaluates each
-wire attempt instead. Healthy downloads calibrate replicas before measurement;
-a run with zero warmup reads exercises cold starts. `request_bytes` controls admission
-reservations independently of `body_bytes`; page-admission fixtures reserve 16 MiB.
-`short_body` gives a seeded share of reads a shorter response: the last page of an
-object, or an exact-range read when `request_bytes` is unset. With `max_bytes`, short
-responses spread uniformly from `bytes` up to that length, as the last pages of objects
-of varied sizes do. A replica's `body_ms_per_mib` adds body time in proportion to the
-response length, so mixed lengths exercise the size-aware body tails.
+Faults cover errors, missing objects, slow service, and stalls. Warmup reads
+establish latency history before measurement; zero warmup exercises cold starts.
+Admission reservations and response lengths are independent, so mixed-size reads
+can still reserve a full page.
 
-Seeds control faults, latency jitter, and recovery probes. SDK retries use the real
-classifier and quota with deterministic backoff. By default the request and first-byte
-histogram reservoirs retain all observations, but their priorities remain unseeded.
-The retention counts in reports cover these two reservoirs. The byte-weighted body
-histogram always uses production aggregation and decay; it has no reservoir.
-Production-reservoir comparisons are statistical; repeat runs when investigating small
-differences.
+Seeds control faults, jitter, and recovery probes. SDK retries use the real
+classifier and quota with deterministic backoff. Request and first-byte estimates
+retain all observations by default. Production sampling is unseeded, so repeat
+those runs when comparing small differences. The body model always uses production
+aggregation and decay.
 
 ## Fixtures
 
-Each fixture models one backend, named by its prefix, and uses that backend's latency
-profile, so fixtures within a family differ only in faults, limits, and load. On every
-backend a small body arrives with its headers. S3 then streams the body, so its time
-grows with length after headers; Capacitor reads and verifies the whole range before
-sending headers and sends the body from memory, so a replica's `headers_ms_per_mib`
-adds its time before headers instead.
+Fixtures share their backend family's latency profile. The S3 model streams bodies
+after headers. The Capacitor model reads and verifies the range before headers,
+then serves it from memory.
 
 | Profile | Replicas | Before headers | After headers |
 |---------|----------|----------------|---------------|
@@ -74,11 +62,8 @@ adds its time before headers instead.
 | S3 Express One Zone | a directory bucket per AZ, the first local | 3, 4, 5 ms | 4 ms per MiB |
 | Capacitor | a deployment per AZ, the first local, chunks up to 4 MiB | 1, 2, 2 ms plus 1 ms per MiB | 1 ms per MiB |
 
-AWS describes S3 Standard medians for small requests in the tens of milliseconds, and
-earlier guidance planned on 85–90 MB/s per request. S3 Express One Zone promises
-single-digit-millisecond first bytes; crossing an AZ adds about a millisecond, and its
-time per MiB is an assumption. Capacitor's figures follow its p99 goals of 5 ms under
-1 MiB and 10 ms up to 4 MiB. Calibrate profiles against the bucket latency gauges.
+These profiles are illustrative and should be calibrated against bucket latency
+gauges.
 
 | Scenario | S3 Standard | S3 Express One Zone | Capacitor |
 |----------|-------------|---------------------|-----------|
@@ -94,26 +79,19 @@ time per MiB is an assumption. Capacitor's figures follow its p99 goals of 5 ms 
 
 ## Interpreting results
 
-Completion includes **every scheduled arrival**, including admission failures and
-caller cancellations. Reports separate successful latency from all-arrival latency,
-and admitted copies from SDK invocations and wire attempts. Service work measures
-occupied slot time; post-read work is the portion after the originating read finishes.
-Recovery timestamps are sampled when reads complete. Fixtures with short bodies also
-report successful latency for full and short responses. Each bucket's exported latency
-estimates are sampled after every read; reports give the final values and the slowest
-seen (highest p99 durations and body transfer slope), which show how far stalls moved
-them.
+Compare revisions with the same harness, fixtures, and controls. Assess completion
+first, then latency and extra backend work:
+
+- Completion includes every scheduled arrival, including admission failures and
+  caller cancellations.
+- Latency is reported for successful reads and for all arrivals. Mixed-size
+  fixtures also separate results by response size.
+- Backend work includes occupied service time and work that continues after a read
+  ends. Reports distinguish admitted copies, SDK invocations, and wire attempts.
 
 The model omits connection setup, network contention, and interactions among cachey
-instances. Millisecond timing and prescribed service distributions limit conclusions
-about real S3 or Capacitor latency. Capacitor's bodies take a few milliseconds, so
-whole-millisecond timing inflates their measured spread. Whole-millisecond timing also
-makes responses land exactly on a learned tail far more often than real ones do. Each
-server fixes its response schedule when it starts serving, and the reading task delivers
-headers and body chunks on its own timers, so a response landing on the tail reaches
-the downloader before a hedge timer firing on the same tick, and such ties do not spend
-the budget.
+instances. Millisecond timers distort fast-body latency and favor completed
+responses over hedges on the same tick. Results describe these fixtures, not
+production latency.
 
-Compare revisions with the same harness, fixtures, and controls; retain patches for
-dirty trees. Assess completion first, then latency and extra backend work. See the
-[reference results](REFERENCE.md) for pinned revisions and measured limits.
+See the [reference results](REFERENCE.md) for pinned revisions and measured limits.
