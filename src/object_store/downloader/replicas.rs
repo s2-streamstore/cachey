@@ -244,19 +244,13 @@ async fn next_rescue(rescues: &mut VecDeque<(Duration, usize)>, start: Instant) 
     index
 }
 
-/// What may start a copy after the primary.
 #[derive(Debug, Clone, Copy)]
 enum Trigger {
-    /// A copy failed.
     Fallback,
-    /// The rescue timer reserved for a bucket fired.
     Rescue(usize),
-    /// The primary's hedge timer fired.
     Hedge,
 }
 
-/// Tracks each bucket's copies, and chooses the bucket and permits for each copy after the
-/// primary.
 struct Followups<'a> {
     request: &'a ReplicaRequest<'a>,
     bytes: u64,
@@ -293,8 +287,7 @@ impl Followups<'_> {
         self.states.into_error(self.retry_budget_exhausted)
     }
 
-    /// Later copies need time for a fresh request, using the first copy's announced length once
-    /// known. A bucket without an admitted copy has no deadline yet.
+    /// A later copy needs time for a fresh request within the bucket's shared deadline.
     fn has_time(&self, routing: &RoutingSnapshot, index: usize, now: Instant) -> bool {
         let progress = &self.request.progress[index];
         progress.deadline.get().is_none_or(|deadline| {
@@ -306,11 +299,8 @@ impl Followups<'_> {
         })
     }
 
-    /// The copy to start for `trigger`, if any. A fallback goes to an untried bucket, or else
-    /// retries a failed body once per read when no copy is awaited, against the best bucket
-    /// whose body failed that still has time; the retry, like any copy while every bucket
-    /// reports overload, draws on the retry budget. An early hedge skips a bucket reporting
-    /// overload. Later copies must have time to finish before their bucket's deadline.
+    /// Prefer untried buckets. Retry a failed body only after other copies finish,
+    /// at most once per page and within the retry budget.
     fn next(&mut self, trigger: Trigger, hedge: &mut HedgeTimer<'_>) -> Option<CopyAttempt> {
         if let Trigger::Rescue(index) = trigger
             && self.states.buckets[index].tried
@@ -388,11 +378,7 @@ impl Followups<'_> {
 }
 
 impl Downloader {
-    /// A bucket's copies share the deadline its first copy got at admission. An early hedge goes
-    /// to the primary's bucket once no other bucket is untried, so a single bucket hedges against
-    /// itself. An error that another copy from the same bucket would repeat settles the bucket,
-    /// whose other copies then no longer hold the read open. A body that fails after its headers
-    /// is retried against its bucket once no untried bucket or awaited copy remains.
+    /// Conclusive errors settle a bucket, so its remaining copies cannot keep the page waiting.
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,

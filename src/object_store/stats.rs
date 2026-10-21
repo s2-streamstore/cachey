@@ -27,23 +27,22 @@ const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const RECOVERY_SUCCESSES: u32 = 20;
 const OVERLOAD_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Bucket health and latency. Estimates are `None` until measured.
 #[derive(Debug, Clone)]
 pub struct BucketMetrics {
     pub error_rate: f64,
     pub deprioritized: bool,
     pub consecutive_failures: u32,
     pub recovery_successes: u32,
-    /// Time from starting a request to its validated body, including SDK retries, or `None` before
-    /// one is measured, as for each estimate below.
+    /// Request start through body validation, including SDK retries.
     pub latency_mean: Option<Duration>,
     pub latency_p99: Option<Duration>,
-    /// Time from starting a request to receiving successful response headers, including SDK
-    /// retries.
+    /// Request start through successful headers, including SDK retries.
     pub first_byte_mean: Option<Duration>,
     pub first_byte_p99: Option<Duration>,
     /// Largest response size retained by the body model.
     pub body_model_bytes: Option<u64>,
-    /// Transfer slope of the uncapped p99 body-time model, excluding its learned fixed cost.
+    /// p99 transfer cost per byte, excluding fixed cost.
     pub body_seconds_per_byte: Option<f64>,
 }
 
@@ -113,9 +112,7 @@ impl Sample {
     }
 }
 
-/// Latency summaries for one bucket. The body length is unknown until response headers announce
-/// it: earlier decisions use complete request latency across the lengths the bucket actually
-/// served, and later ones predict body time for the announced length.
+/// Per-bucket latency estimates. Body predictions use the length announced in headers.
 #[derive(Debug, Clone)]
 pub(super) struct LatencyModel {
     latency: Option<Summary>,
@@ -142,13 +139,12 @@ impl LatencyModel {
         self.body.predict(bytes).map(Quantiles::hedge_delay)
     }
 
-    /// Uncapped duration predictions keep speculation policy out of health and retry decisions.
+    /// Uncapped p99 for health and retry decisions.
     pub fn body_tail(&self, bytes: u64) -> Option<Duration> {
         self.body.predict(bytes).map(|quantiles| quantiles.p99)
     }
 
-    /// A fresh copy's tail for the known body length, or the observed request tail while its
-    /// length or transfer time is unknown.
+    /// Predict a fresh request, falling back to observed latency if body time is unknown.
     pub fn request_tail(&self, body_bytes: Option<u64>) -> Option<Duration> {
         body_bytes
             .and_then(|bytes| {
@@ -160,9 +156,8 @@ impl LatencyModel {
             .or_else(|| self.tail())
     }
 
-    /// A timeout counts against health only after the request had time for the phases it reached.
-    /// Known body lengths use their predicted transfer time; unmeasured phases get `unmeasured`
-    /// and retain the observed request tail as a floor.
+    /// Timeouts affect health only after allowing time for each phase reached.
+    /// Use `unmeasured` for unknown phases and the request tail as a floor.
     pub fn timeout_allowance(
         &self,
         announced_body_bytes: Option<u64>,
@@ -191,11 +186,8 @@ fn histogram<T>(now: Instant) -> ExponentialDecayHistogram<T> {
     builder.build()
 }
 
-/// The first value whose cumulative weight, including its own, reaches `q`: the nearest rank.
-/// `Snapshot::value` instead takes the first value whose preceding weight reaches `q`, so once a
-/// few recent samples carry nearly all the weight, whichever decayed value lies just above them
-/// becomes the tail, however old. A tolerance absorbs floating-point sums that land exactly on the
-/// quantile.
+/// Include the current sample's weight. `Snapshot::value` uses only preceding weight,
+/// which can select an old outlier after recent samples dominate.
 fn quantile(snapshot: &Snapshot, q: f64) -> i64 {
     const TOLERANCE: f64 = 1e-9;
     let mut cumulative = 0.0;
@@ -350,8 +342,7 @@ impl BucketStats {
             )
     }
 
-    /// Summarize changed history once per interval. First samples are available immediately;
-    /// the body model also refreshes when its observation count doubles to learn during startup.
+    /// Refresh once per interval, or sooner for first samples and a doubling body sample count.
     fn model(&mut self, now: Instant) -> LatencyModel {
         let due = now.duration_since(self.summarized_at) >= LATENCY_SNAPSHOT_INTERVAL;
         if due {
@@ -360,8 +351,7 @@ impl BucketStats {
         self.estimates.model(due)
     }
 
-    /// Replacing history starts the latency model over from the sample, as for a bucket never
-    /// measured, so a recovered bucket is judged by its probe.
+    /// On recovery, reset history so the probe replaces stale estimates.
     fn record(&mut self, now: Instant, sample: &Sample, replace_history: bool) {
         let latency = sample.latency();
         self.routing_latency = if replace_history || self.best_latency.is_none() {
@@ -386,9 +376,8 @@ impl BucketStats {
         self.routing_updated_at = now;
     }
 
-    /// Routing latency above the bucket's measured mean decays toward it with a 5-second
-    /// half-life, so a rise fades even while the bucket receives no copies to lower it. A bucket
-    /// without measurements keeps its rise.
+    /// Decay excess routing latency toward the measured mean, even while the bucket is idle.
+    /// Without a measured mean, keep the penalty.
     fn current_routing_latency(&self, now: Instant) -> Duration {
         let Some(mean) = self.estimates.latency.summary.map(Summary::mean_duration) else {
             return self.routing_latency;

@@ -16,7 +16,7 @@ pub struct Copy {
     pub end_us: u64,
 }
 
-/// A bucket's exported latency model, with each estimate absent until measured.
+/// Exported bucket estimates; absent until measured.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct Estimates {
     latency_p99_us: Option<u64>,
@@ -158,10 +158,9 @@ pub struct Report {
     useful_bytes: u64,
     pub overlapping_reads: usize,
     wins_by_replica: Vec<usize>,
-    /// Each bucket's estimates after the last read completed.
+    /// Per-bucket estimates after the last read.
     final_estimates: Vec<Estimates>,
-    /// Each bucket's slowest estimates observed after any read: highest durations and transfer
-    /// slope.
+    /// Per-bucket maximum durations and transfer slope observed after reads.
     slowest_estimates: Vec<Estimates>,
     pub recoveries: Vec<Recovery>,
     #[serde(skip_serializing_if = "Option::is_none")]

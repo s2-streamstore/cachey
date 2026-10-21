@@ -93,9 +93,7 @@ impl DownloadError {
         }
     }
 
-    /// A body whose transfer fails after its headers, which the SDK cannot retry, is likely to
-    /// succeed on another request to the same bucket. A body whose length disagrees with its
-    /// headers is an invalid response instead.
+    /// The SDK cannot retry body transfer failures. Length mismatches are not retried here.
     fn should_retry_same_bucket(&self) -> bool {
         matches!(self, Self::BodyStreaming(_))
     }
@@ -209,8 +207,7 @@ struct BucketOperation<'a> {
 }
 
 impl BucketOperation<'_> {
-    /// The model's timeout allowance, with half the copy's share of the deadline for each phase
-    /// the bucket has not measured.
+    /// Allow each unmeasured phase half the copy's available time.
     fn timeout_allowance(&self) -> Duration {
         let unmeasured = self
             .unknown_latency
@@ -606,8 +603,7 @@ mod tests {
         (downloader, state)
     }
 
-    /// Spends the retry budget, so a read ends on its copies' errors rather than retrying a failed
-    /// body.
+    /// Exhaust the retry budget to test errors without a body retry.
     fn spend_retry_budget(downloader: &Downloader) {
         while downloader.attempt_budget.try_retry() {}
     }
@@ -1129,9 +1125,7 @@ mod tests {
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
-    /// The primary's body hedge goes to the peer at 90ms, whose body fails at 200ms while the
-    /// primary is awaited. The primary's body then fails at 450ms with 50ms left before its bucket
-    /// deadline, short of the 100ms request tail, but the peer still has 140ms.
+    /// Both bodies fail, but only the peer has enough time left for another request.
     #[tokio::test(start_paused = true)]
     async fn a_body_retry_goes_to_a_failed_bucket_with_time_left() {
         let (downloader, script) = scripted_downloader([
@@ -1425,9 +1419,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn same_bucket_hedges_need_the_request_tail_before_the_bucket_deadline() {
-        // A sub-millisecond body tail makes the hedge due before a 100ms deadline, but its timer
-        // fires on the deadline's tick. Once it fires, a hedge against the same bucket also needs
-        // more than its 99.5ms request tail before the deadline.
+        // Timer rounding reaches the bucket deadline. A later deadline must also leave
+        // time for a fresh request.
         for (body_tail_us, body_ms, bucket_timeout_ms, requests) in [
             (90_000, 90, 100, 1),
             (90_000, 400, 100, 1),

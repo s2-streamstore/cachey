@@ -170,8 +170,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 for warm in 0..scenario.warmup_per_replica {
                     let id = WARM_READ + replica as u64 * 1_000_000 + u64::from(warm);
                     let range = 0..scenario.read_request_bytes(seed, id);
-                    // Calibration needs to measure even a replica that cannot meet the campaign
-                    // deadline.
+                    // Calibrate even replicas too slow for the campaign deadline.
                     let calibration = downloader
                         .clone()
                         .with_test_limits(super::DownloadLimits {
@@ -371,9 +370,7 @@ async fn simulation_reads_finishing_at_their_tail_are_not_hedged() {
     assert_eq!(report.overlapping_reads, 0, "{report:?}");
 }
 
-/// Checks that at least `min_rescued` reads were hedged, that each finished within `bound_ms` of
-/// the fixture and its length when a copy escaped the injected faults, and that at most 1% of
-/// reads took longer unhedged.
+/// Check latency bounds for hedges that escape faults; allow at most 1% late unhedged reads.
 async fn assert_stalls_are_rescued(
     scenario: Scenario,
     min_rescued: usize,
@@ -414,10 +411,8 @@ async fn assert_stalls_are_rescued(
     reports
 }
 
-/// As on S3, fixed latency comes before the first byte and bodies stream at a steady rate. A hedge
-/// started at the first-byte p99, or at the bounded body prediction for its length, finishes within
-/// about two and a half nominal reads of that length. Stalls outnumber 1% of reads, so they must
-/// not set hedge delays; only reads the budget leaves unhedged may take longer.
+/// Stalls exceed 1% of reads, so uncapped p99 would delay hedges too long.
+/// Allow 1.5 nominal reads for the hedge delay plus one for the replacement.
 #[tokio::test(start_paused = true)]
 async fn simulation_s3_shaped_stalls_are_hedged_at_size_aware_tails() {
     assert_stalls_are_rescued(
@@ -428,11 +423,8 @@ async fn simulation_s3_shaped_stalls_are_hedged_at_size_aware_tails() {
     .await;
 }
 
-/// As on Capacitor, the server reads and verifies the whole chunk before sending headers, so time
-/// to first byte grows with chunk length, and the body follows from memory. A stalled read of any
-/// length waits for the first-byte p99 of full chunks, then a hedge to another zone, and finishes
-/// within three nominal full-chunk reads from the local zone. Sparse startup history can send
-/// reads to peers, but must not keep them there: after a minute, at least 90% use the local zone.
+/// Buffering before headers requires a full-chunk latency bound even for small reads.
+/// Startup uncertainty must not cause lasting preference for another zone.
 #[tokio::test(start_paused = true)]
 async fn simulation_capacitor_shaped_stalls_are_hedged_to_another_zone() {
     let mut scenario = scenario_named("capacitor_stalls");
@@ -461,8 +453,7 @@ async fn simulation_capacitor_shaped_stalls_are_hedged_to_another_zone() {
     }
 }
 
-/// A connection reset after headers, which the SDK cannot retry, is retried against the same
-/// bucket, so a single-bucket read survives it.
+/// Body resets happen after the SDK's retry handling ends.
 #[tokio::test(start_paused = true)]
 async fn simulation_body_resets_on_one_bucket_are_retried() {
     let scenario = scenario_named("s3_standard_body_resets");

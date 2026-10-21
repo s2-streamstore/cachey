@@ -31,28 +31,28 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
             (
                 gauge(
                     "cachey_bucket_latency_mean_seconds",
-                    "Mean time from starting a request to its validated body, including SDK retries",
+                    "Mean request latency through body validation, including SDK retries",
                 ),
                 |metrics| seconds(metrics.latency_mean),
             ),
             (
                 gauge(
                     "cachey_bucket_latency_p99_seconds",
-                    "p99 time from starting a request to its validated body, including SDK retries",
+                    "p99 request latency through body validation, including SDK retries",
                 ),
                 |metrics| seconds(metrics.latency_p99),
             ),
             (
                 gauge(
                     "cachey_bucket_first_byte_mean_seconds",
-                    "Mean time from starting a request to successful response headers, including SDK retries",
+                    "Mean time to successful headers, including SDK retries",
                 ),
                 |metrics| seconds(metrics.first_byte_mean),
             ),
             (
                 gauge(
                     "cachey_bucket_first_byte_p99_seconds",
-                    "p99 time from starting a request to successful response headers, including SDK retries",
+                    "p99 time to successful headers, including SDK retries",
                 ),
                 |metrics| seconds(metrics.first_byte_p99),
             ),
@@ -66,7 +66,7 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
             (
                 gauge(
                     "cachey_bucket_body_seconds_per_byte",
-                    "Transfer slope of the uncapped p99 body-time model, excluding fixed cost",
+                    "p99 transfer cost per byte, excluding fixed cost",
                 ),
                 |metrics| metrics.body_seconds_per_byte,
             ),

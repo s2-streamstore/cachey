@@ -83,9 +83,8 @@ fn quantile(values: &mut [(f64, f64)], q: f64) -> f64 {
     values.last().map_or(0.0, |value| value.0)
 }
 
-/// Fit a nonnegative intercept and slope with iteratively reweighted quantile regression.
-/// Sizes are normalized for numerical stability. The one-microsecond residual floor matches
-/// stored timing precision; the iteration limit bounds work on each cached model refresh.
+/// Fit nonnegative coefficients with iteratively reweighted quantile regression.
+/// Normalize sizes for stability; floor residuals at the stored precision of 1 µs.
 fn fit(observations: &[Observation], largest_bytes: u64, q: f64, previous: Option<Line>) -> Line {
     let scale = largest_bytes as f64;
     let initial = || {
@@ -140,8 +139,7 @@ fn fit(observations: &[Observation], largest_bytes: u64, q: f64, previous: Optio
             break;
         }
     }
-    // Finish the intercept exactly: bounded iterations must not leave the tail below its
-    // observed residual quantile and spend hedge credits on ordinary timing variation.
+    // Refit the intercept exactly so iteration limits do not underestimate the tail.
     let mut residuals = observations
         .iter()
         .map(|sample| {

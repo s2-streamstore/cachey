@@ -14,7 +14,7 @@ struct Headers {
     body_bytes: u64,
 }
 
-/// A backend request's start and validated response headers, including the announced body length.
+/// Request timing and body length from validated headers.
 #[derive(Debug, Default)]
 pub(super) struct RequestTimeline {
     started: OnceLock<Instant>,
@@ -57,8 +57,7 @@ impl RequestTimeline {
     }
 }
 
-/// A page's deadline for one bucket, set when the page's first copy to the bucket is admitted and
-/// shared by its later copies.
+/// A deadline shared by a page's copies to one bucket, starting at first admission.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BucketDeadline<'a> {
     page: Instant,
@@ -79,8 +78,7 @@ impl<'a> BucketDeadline<'a> {
         self.admitted().unwrap_or(self.page)
     }
 
-    /// Admits a copy at `now`. The bucket's first copy sets its deadline `bucket_timeout` later,
-    /// capped by the page deadline.
+    /// First admission starts the bucket timeout, capped by the page deadline.
     pub fn admit(&self, now: Instant, bucket_timeout: Duration) -> Instant {
         *self
             .admitted
@@ -94,11 +92,8 @@ enum Phase {
     Body,
 }
 
-/// Times a page's early hedge against its primary request in two phases: the first-byte hedge
-/// delay after the request starts, then the body hedge delay predicted for its announced length.
-/// Each phase is due at most once, so a hedge that cannot start before headers may still start
-/// during the body. An unmeasured phase or a zero first-byte tail is not hedged early. No hedge is
-/// due once the primary's bucket deadline or the page deadline has passed.
+/// Times hedges before headers and during the body. Each phase fires at most once,
+/// allowing a body hedge if admission or budget blocked the header hedge.
 pub(super) struct HedgeTimer<'a> {
     model: LatencyModel,
     primary: &'a RequestTimeline,
@@ -142,10 +137,7 @@ impl<'a> HedgeTimer<'a> {
         (at < self.deadline.current()).then_some(at)
     }
 
-    /// Completes when a hedge is due, or never if none can be.
-    /// The primary's timeline stops changing once its headers arrive, so from then on only the
-    /// timer is polled. Timers fire on the next tick, so one that fires at or past the deadline
-    /// ends hedging.
+    /// Waits until a hedge is due; stays pending once hedging is no longer possible.
     pub async fn due(&mut self) {
         if self.next.is_none() {
             return std::future::pending().await;

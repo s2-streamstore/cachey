@@ -4,8 +4,7 @@ use aws_sdk_s3::config::{retry::RetryConfig, timeout::TimeoutConfig};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadLimits {
-    /// Maximum duration of a page's copies to one bucket, from the first copy's admission
-    /// through body validation.
+    /// Shared timeout for a page's copies to one bucket, from first admission through validation.
     pub bucket_timeout: Duration,
     /// Maximum duration across bucket selection and fallback.
     pub page_timeout: Duration,
