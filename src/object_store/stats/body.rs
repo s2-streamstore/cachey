@@ -1,126 +1,151 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use tokio::time::Instant;
 
-use super::{LATENCY_DECAY, LATENCY_SNAPSHOT_INTERVAL, Sample, decay};
+use super::{PhaseHistogram, Quantiles, Sample, histogram_micros};
 
-const SCHEDULING_ALLOWANCE: Duration = Duration::from_millis(1);
-// Retain seven mantissa bits: rates in one bin differ by less than 1/128.
-const DISCARDED_MANTISSA_BITS: u32 = 45;
+const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy)]
+struct Estimate {
+    bytes: u64,
+    quantiles: Quantiles,
+}
+
+#[derive(Debug, Clone, Default)]
 pub(super) struct BodyModel {
-    pub p99_seconds_per_byte: f64,
-    median_seconds_per_byte: f64,
-    buffered_bytes: u64,
+    estimates: Arc<[Estimate]>,
+    largest_observed: u64,
 }
 
 impl BodyModel {
-    pub fn tail(self, bytes: u64) -> Option<Duration> {
-        let tail = self.delay(bytes, self.p99_seconds_per_byte)?;
-        let median = self.delay(bytes, self.median_seconds_per_byte)?;
-        Some(tail.min(median.saturating_add(median / 2)))
-    }
-
-    fn delay(self, bytes: u64, seconds_per_byte: f64) -> Option<Duration> {
-        if seconds_per_byte == 0.0 && bytes > self.buffered_bytes {
+    pub fn predict(&self, bytes: u64) -> Option<Quantiles> {
+        let upper = self
+            .estimates
+            .partition_point(|estimate| estimate.bytes < bytes);
+        let first = self.estimates.first()?;
+        let last = self.estimates.last()?;
+        if bytes > self.largest_observed && last.quantiles.median <= TIMER_RESOLUTION {
             return None;
         }
-        let transfer =
-            Duration::try_from_secs_f64(seconds_per_byte * bytes as f64).unwrap_or(Duration::MAX);
-        Some(SCHEDULING_ALLOWANCE.saturating_add(transfer))
+        // Large transfers inform sparse smaller bands without erasing their fixed overhead.
+        let transfer = scale(last.quantiles, bytes as f64 / last.bytes as f64);
+        let quantiles = if upper == 0 {
+            scale(first.quantiles, bytes as f64 / first.bytes as f64)
+        } else if upper == self.estimates.len() {
+            transfer
+        } else {
+            let left = self.estimates[upper - 1];
+            let right = self.estimates[upper];
+            let fraction = (bytes - left.bytes) as f64 / (right.bytes - left.bytes) as f64;
+            Quantiles {
+                median: interpolate(left.quantiles.median, right.quantiles.median, fraction),
+                p99: interpolate(left.quantiles.p99, right.quantiles.p99, fraction),
+            }
+        };
+        Some(Quantiles {
+            median: quantiles.median.max(transfer.median),
+            p99: quantiles.p99.max(transfer.p99),
+        })
+    }
+
+    pub fn largest_bytes(&self) -> Option<u64> {
+        self.estimates.last().map(|estimate| estimate.bytes)
+    }
+
+    pub fn seconds_per_byte(&self) -> Option<f64> {
+        self.estimates.last().map(|estimate| {
+            estimate
+                .quantiles
+                .p99
+                .saturating_sub(TIMER_RESOLUTION)
+                .as_secs_f64()
+                / estimate.bytes as f64
+        })
     }
 }
 
-#[derive(Debug, Default)]
-struct Bin {
-    weight: f64,
-    timed_weight: f64,
-    slowest: f64,
+fn scale(quantiles: Quantiles, factor: f64) -> Quantiles {
+    let duration = |value: Duration| {
+        TIMER_RESOLUTION.saturating_add(
+            Duration::try_from_secs_f64(
+                value.saturating_sub(TIMER_RESOLUTION).as_secs_f64() * factor,
+            )
+            .unwrap_or(Duration::MAX),
+        )
+    };
+    Quantiles {
+        median: duration(quantiles.median),
+        p99: duration(quantiles.p99),
+    }
 }
 
-/// Timed transfers teach the p99 rate. Buffered bodies contribute conservative rate bounds to
-/// the median, but cannot dilute timed transfers. Aggregating nearby rates preserves byte weights
-/// with bounded storage; using each bin's slowest rate overestimates a quantile by at most 1/128.
-#[derive(Debug)]
+fn interpolate(left: Duration, right: Duration, fraction: f64) -> Duration {
+    if right >= left {
+        left.saturating_add(right.saturating_sub(left).mul_f64(fraction))
+    } else {
+        left.saturating_sub(left.saturating_sub(right).mul_f64(fraction))
+    }
+}
+
+/// Each power-of-two size band retains its own history. Normalizing to its upper size bound
+/// lets adjacent bands interpolate continuously without letting tiny reads evict large reads.
+#[derive(Debug, Default)]
 pub(super) struct BodyHistogram {
-    bins: BTreeMap<u64, Bin>,
-    updated_at: Instant,
-    buffered_bytes: u64,
-    summary: Option<BodyModel>,
+    bands: BTreeMap<u64, PhaseHistogram>,
+    model: BodyModel,
+    largest_observed: u64,
     changed: bool,
 }
 
 impl BodyHistogram {
-    pub fn new(now: Instant) -> Self {
-        Self {
-            bins: BTreeMap::new(),
-            updated_at: now,
-            buffered_bytes: 0,
-            summary: None,
-            changed: false,
-        }
-    }
-
     pub fn update(&mut self, now: Instant, sample: &Sample) {
         if sample.body_bytes == 0 {
             return;
         }
-        let mut elapsed = now.saturating_duration_since(self.updated_at);
-        if elapsed >= LATENCY_SNAPSHOT_INTERVAL {
-            let factor = decay(LATENCY_DECAY, elapsed);
-            self.bins.retain(|_, bin| {
-                bin.weight *= factor;
-                bin.timed_weight *= factor;
-                bin.weight > 0.0
-            });
-            self.updated_at = now;
-            elapsed = Duration::ZERO;
-        }
-        let timed = sample.body > SCHEDULING_ALLOWANCE;
-        let transfer = if timed {
-            sample.body.saturating_sub(SCHEDULING_ALLOWANCE)
-        } else {
-            self.buffered_bytes = self.buffered_bytes.max(sample.body_bytes);
-            SCHEDULING_ALLOWANCE
-        };
-        let seconds_per_byte = transfer.as_secs_f64() / sample.body_bytes as f64;
-        let bin = self
-            .bins
-            .entry(seconds_per_byte.to_bits() >> DISCARDED_MANTISSA_BITS)
-            .or_default();
-        // Weights share the epoch at updated_at; rescaling once per interval bounds their growth.
-        let weight = sample.body_bytes as f64 / decay(LATENCY_DECAY, elapsed);
-        bin.weight += weight;
-        if timed {
-            bin.timed_weight += weight;
-        }
-        bin.slowest = bin.slowest.max(seconds_per_byte);
+        self.largest_observed = self.largest_observed.max(sample.body_bytes);
+        let bytes = sample
+            .body_bytes
+            .checked_next_power_of_two()
+            .unwrap_or(u64::MAX);
+        let micros = histogram_micros(sample.body.saturating_sub(TIMER_RESOLUTION)) as u128;
+        let normalized = (micros * u128::from(bytes) / u128::from(sample.body_bytes))
+            .min(i64::MAX as u128) as i64;
+        self.bands
+            .entry(bytes)
+            .or_insert_with(|| PhaseHistogram::new(now))
+            .update(now.into_std(), normalized);
         self.changed = true;
     }
 
-    pub fn summary(&mut self, due: bool) -> Option<BodyModel> {
-        if self.changed && (due || self.summary.is_none()) {
-            self.changed = false;
-            self.summary = Some(BodyModel {
-                p99_seconds_per_byte: self.quantile(0.99, |bin| bin.timed_weight).unwrap_or(0.0),
-                median_seconds_per_byte: self.quantile(0.5, |bin| bin.weight).unwrap_or(0.0),
-                buffered_bytes: self.buffered_bytes,
-            });
-        }
-        self.summary
+    #[cfg(test)]
+    pub fn retention(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
+        self.bands.values().map(PhaseHistogram::retention)
     }
 
-    fn quantile(&self, q: f64, weight: impl Fn(&Bin) -> f64) -> Option<f64> {
-        let total: f64 = self.bins.values().map(&weight).sum();
-        if total == 0.0 {
-            return None;
+    pub fn summary(&mut self, due: bool) -> BodyModel {
+        if self.changed && (due || self.model.estimates.len() != self.bands.len()) {
+            self.model = BodyModel {
+                largest_observed: self.largest_observed,
+                estimates: self
+                    .bands
+                    .iter_mut()
+                    .filter_map(|(bytes, histogram)| {
+                        let summary = histogram.summary(due)?;
+                        Some(Estimate {
+                            bytes: *bytes,
+                            quantiles: Quantiles {
+                                median: TIMER_RESOLUTION
+                                    .saturating_add(Duration::from_micros(summary.median as u64)),
+                                p99: TIMER_RESOLUTION.saturating_add(summary.p99_duration()),
+                            },
+                        })
+                    })
+                    .collect(),
+            };
+            self.changed = self.bands.values().any(|histogram| histogram.changed);
         }
-        let mut cumulative = 0.0;
-        self.bins.values().find_map(|bin| {
-            cumulative += weight(bin);
-            (cumulative >= total * (q - 1e-9)).then_some(bin.slowest)
-        })
+        self.model.clone()
     }
 }
 
@@ -131,131 +156,137 @@ mod tests {
     use bytesize::MIB;
     use tokio::time::{Instant, advance};
 
-    use super::{BodyHistogram, DISCARDED_MANTISSA_BITS, SCHEDULING_ALLOWANCE};
+    use super::{BodyHistogram, TIMER_RESOLUTION};
     use crate::object_store::stats::Sample;
 
     #[tokio::test(start_paused = true)]
-    async fn one_transfer_predicts_continuously_across_sizes() {
-        let mut histogram = BodyHistogram::new(Instant::now());
-        histogram.update(Instant::now(), &Sample::from_millis(10, 4 * MIB, 41));
-        let model = histogram.summary(false).unwrap();
-        for bytes in [0, 4096, 1023 * 1024, MIB, 1025 * 1024, 16 * MIB] {
-            let expected =
-                SCHEDULING_ALLOWANCE + Duration::from_secs_f64(0.01 * bytes as f64 / MIB as f64);
-            assert_eq!(model.tail(bytes), Some(expected), "{bytes}");
+    async fn interpolation_retains_fixed_overhead_and_is_continuous() {
+        let mut histogram = BodyHistogram::default();
+        for (bytes, body_ms) in [(MIB, 30), (4 * MIB, 60), (16 * MIB, 180)] {
+            histogram.update(Instant::now(), &Sample::from_millis(10, bytes, body_ms));
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn tiny_reads_neither_evict_transfers_nor_amplify_rare_stalls() {
-        let mut histogram = BodyHistogram::new(Instant::now());
-        histogram.update(Instant::now(), &Sample::from_millis(10, 4 * MIB, 41));
-        for index in 0..500_000 {
-            let body_ms = if index < 20 { 100 } else { 0 };
-            histogram.update(Instant::now(), &Sample::from_millis(10, 1024, body_ms));
-        }
-        assert_eq!(histogram.bins.len(), 3);
-        let model = histogram.summary(false).unwrap();
-        assert_eq!(model.tail(4 * MIB), Some(Duration::from_millis(41)));
-        assert_eq!(model.tail(16 * MIB), Some(Duration::from_millis(161)));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn byte_weights_share_a_fifteen_second_half_life() {
-        let start = Instant::now();
-        let mut histogram = BodyHistogram::new(start);
-        histogram.update(start, &Sample::from_millis(10, MIB, 101));
-        advance(Duration::from_secs(15)).await;
-        histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
-        advance(Duration::from_millis(250)).await;
-        histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
-        advance(Duration::from_millis(250)).await;
-        histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
-        let weights: Vec<_> = histogram.bins.values().map(|bin| bin.weight).collect();
-        let slow = MIB as f64 / 2.0;
-        let fast = MIB as f64 * (1.0 + 2.0_f64.powf(0.25 / 15.0) + 2.0_f64.powf(0.5 / 15.0));
-        assert!((weights[0] - fast).abs() < 1e-6);
-        assert!((weights[1] - slow).abs() < 1e-6);
-        let model = histogram.summary(true).unwrap();
-        assert!((model.p99_seconds_per_byte * MIB as f64 - 0.1).abs() < 1e-9);
-        assert_eq!(model.tail(MIB), Some(Duration::from_micros(16_500)));
-
-        advance(Duration::from_secs(120)).await;
-        histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
-        assert_eq!(
-            histogram.summary(true).unwrap().tail(MIB),
-            Some(Duration::from_millis(11))
-        );
-
-        advance(Duration::from_mins(1000)).await;
-        histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 21));
-        assert_eq!(histogram.bins.len(), 1);
-        assert_eq!(
-            histogram.summary(true).unwrap().tail(MIB),
-            Some(Duration::from_millis(21))
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn buffered_bodies_only_establish_the_sizes_they_cover() {
-        let mut histogram = BodyHistogram::new(Instant::now());
-        histogram.update(Instant::now(), &Sample::from_millis(10, 4096, 0));
-        let model = histogram.summary(false).unwrap();
-        assert_eq!(model.tail(4096), Some(SCHEDULING_ALLOWANCE));
-        assert_eq!(model.tail(4097), None);
-        histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 1));
-        let model = histogram.summary(true).unwrap();
-        assert_eq!(model.tail(MIB), Some(SCHEDULING_ALLOWANCE));
-        assert_eq!(model.tail(MIB + 1), None);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_stall_among_buffered_reads_does_not_set_the_body_delay() {
-        let mut histogram = BodyHistogram::new(Instant::now());
-        for _ in 0..50 {
-            histogram.update(Instant::now(), &Sample::from_millis(5, MIB, 0));
-        }
-        histogram.update(Instant::now(), &Sample::from_millis(5, MIB, 1000));
-        let model = histogram.summary(false).unwrap();
-        assert!((model.p99_seconds_per_byte * MIB as f64 - 0.999).abs() < 1e-9);
-        let below = model.tail(1023 * 1024).unwrap();
-        let at = model.tail(MIB).unwrap();
-        let above = model.tail(1025 * 1024).unwrap();
-        assert_eq!(at, Duration::from_millis(3));
-        assert!(at.checked_sub(below).unwrap() < Duration::from_micros(2));
-        assert!(above.checked_sub(at).unwrap() < Duration::from_micros(2));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn empty_bodies_do_not_teach_a_transfer_rate() {
-        let mut histogram = BodyHistogram::new(Instant::now());
-        histogram.update(Instant::now(), &Sample::from_millis(10, 0, 100));
-        assert!(histogram.summary(false).is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn rate_bins_bound_error_and_handle_extreme_measurements() {
-        for body in [
-            SCHEDULING_ALLOWANCE + Duration::from_nanos(1),
-            Duration::from_millis(41),
-            Duration::MAX,
+        let model = histogram.summary(false);
+        for bytes in [
+            MIB,
+            2 * MIB,
+            4 * MIB - 1,
+            4 * MIB,
+            4 * MIB + 1,
+            8 * MIB,
+            16 * MIB,
         ] {
-            for bytes in [1, 4 * MIB, u64::MAX] {
-                let sample = Sample {
+            let expected = Duration::from_secs_f64(0.020 + 0.010 * bytes as f64 / MIB as f64);
+            assert_eq!(model.predict(bytes).unwrap().p99, expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tiny_reads_do_not_evict_transfers_or_share_their_stalls() {
+        let mut histogram = BodyHistogram::default();
+        histogram.update(Instant::now(), &Sample::from_millis(10, 4 * MIB, 41));
+        for index in 0..5000 {
+            histogram.update(
+                Instant::now(),
+                &Sample::from_millis(10, 1024, if index < 20 { 100 } else { 0 }),
+            );
+        }
+        let model = histogram.summary(true);
+        assert_eq!(histogram.bands.len(), 2);
+        assert_eq!(
+            model.predict(4 * MIB).unwrap().p99,
+            Duration::from_millis(41)
+        );
+        assert_eq!(
+            model.predict(16 * MIB).unwrap().p99,
+            Duration::from_millis(161)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_observations_decay_without_capping_the_tail() {
+        let mut histogram = BodyHistogram::default();
+        for _ in 0..50 {
+            histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
+        }
+        histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 101));
+        let model = histogram.summary(true);
+        let quantiles = model.predict(MIB).unwrap();
+        assert_eq!(quantiles.p99, Duration::from_millis(101));
+        assert_eq!(quantiles.hedge_delay(), Duration::from_micros(16_500));
+        advance(Duration::from_secs(300)).await;
+        histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 21));
+        assert_eq!(
+            histogram.summary(true).predict(MIB).unwrap().p99,
+            Duration::from_millis(21)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_bodies_do_not_establish_throughput_for_larger_sizes() {
+        let mut histogram = BodyHistogram::default();
+        histogram.update(Instant::now(), &Sample::from_millis(10, 3000, 0));
+        let model = histogram.summary(false);
+        assert_eq!(model.predict(3000).unwrap().p99, TIMER_RESOLUTION);
+        assert!(model.predict(3001).is_none());
+        histogram.update(Instant::now(), &Sample::from_millis(10, 3000, 1000));
+        let model = histogram.summary(true);
+        assert!(model.predict(MIB).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_bodies_and_extreme_measurements_are_bounded() {
+        let mut histogram = BodyHistogram::default();
+        histogram.update(Instant::now(), &Sample::from_millis(10, 0, 100));
+        assert!(histogram.summary(false).predict(0).is_none());
+        for bytes in [1, u64::MAX] {
+            histogram.update(
+                Instant::now(),
+                &Sample {
                     first_byte: Duration::ZERO,
                     body_bytes: bytes,
-                    body,
-                };
-                let mut histogram = BodyHistogram::new(Instant::now());
-                histogram.update(Instant::now(), &sample);
-                let model = histogram.summary(false).unwrap();
-                let key = *histogram.bins.first_key_value().unwrap().0;
-                let lower = f64::from_bits(key << DISCARDED_MANTISSA_BITS);
-                let upper = f64::from_bits((key + 1) << DISCARDED_MANTISSA_BITS);
-                assert!(model.p99_seconds_per_byte >= lower && model.p99_seconds_per_byte < upper);
-                assert!(upper / lower <= 1.0 + 1.0 / 128.0);
-                assert!(model.tail(u64::MAX).is_some());
+                    body: Duration::MAX,
+                },
+            );
+        }
+        assert!(histogram.summary(true).predict(u64::MAX).is_some());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn new_bands_do_not_refresh_existing_history_before_the_snapshot_is_due() {
+        let mut histogram = BodyHistogram::default();
+        histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
+        let snapshot = histogram.summary(false);
+        histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 21));
+        histogram.update(Instant::now(), &Sample::from_millis(10, 4 * MIB, 41));
+        let with_new_band = histogram.summary(false);
+        assert_eq!(
+            with_new_band.predict(MIB).unwrap().p99,
+            Duration::from_millis(11)
+        );
+        assert_eq!(
+            with_new_band.predict(4 * MIB).unwrap().p99,
+            Duration::from_millis(41)
+        );
+        assert_eq!(
+            histogram.summary(true).predict(MIB).unwrap().p99,
+            Duration::from_millis(21)
+        );
+        assert_eq!(
+            snapshot.predict(MIB).unwrap().p99,
+            Duration::from_millis(11)
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn sparse_small_bands_share_transfer_evidence_and_retain_fixed_overhead() {
+        for (small_body_ms, expected_ms) in [(11, 13), (30, 30)] {
+            let mut histogram = BodyHistogram::default();
+            histogram.update(Instant::now(), &Sample::from_millis(10, MIB, small_body_ms));
+            for _ in 0..50 {
+                histogram.update(Instant::now(), &Sample::from_millis(10, 16 * MIB, 161));
             }
+            histogram.update(Instant::now(), &Sample::from_millis(10, 16 * MIB, 193));
+            let prediction = histogram.summary(true).predict(MIB).unwrap();
+            assert_eq!(prediction.p99, Duration::from_millis(expected_ms));
+            assert_eq!(prediction.median, Duration::from_millis(small_body_ms));
         }
     }
 }

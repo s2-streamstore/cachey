@@ -113,11 +113,13 @@ impl<'a> HedgeTimer<'a> {
         deadline: BucketDeadline<'a>,
         enabled: bool,
     ) -> Self {
+        let next =
+            (enabled && model.first_byte_hedge_delay().is_some()).then_some(Phase::FirstByte);
         Self {
             model,
             primary,
             deadline,
-            next: (enabled && model.first_byte_tail().is_some()).then_some(Phase::FirstByte),
+            next,
         }
     }
 
@@ -127,10 +129,10 @@ impl<'a> HedgeTimer<'a> {
 
     fn due_at(&self, headers: Option<&Headers>) -> Option<Instant> {
         let next = self.next?;
-        let first_byte_tail = self.model.first_byte_tail()?;
+        let first_byte_delay = self.model.first_byte_hedge_delay()?;
         let (since, tail) = match (next, headers) {
-            (_, Some(headers)) => (headers.at, self.model.body_tail(headers.body_bytes)?),
-            (Phase::FirstByte, None) => (*self.primary.started.get()?, first_byte_tail),
+            (_, Some(headers)) => (headers.at, self.model.body_hedge_delay(headers.body_bytes)?),
+            (Phase::FirstByte, None) => (*self.primary.started.get()?, first_byte_delay),
             (Phase::Body, None) => return None,
         };
         if tail.is_zero() {

@@ -372,7 +372,8 @@ async fn simulation_reads_finishing_at_their_tail_are_not_hedged() {
 }
 
 /// Checks that at least `min_rescued` reads were hedged, that each finished within `bound_ms` of
-/// the fixture and its length, and that at most 1% of reads took longer unhedged.
+/// the fixture and its length when a copy escaped the injected faults, and that at most 1% of
+/// reads took longer unhedged.
 async fn assert_stalls_are_rescued(
     scenario: Scenario,
     min_rescued: usize,
@@ -392,7 +393,14 @@ async fn assert_stalls_are_rescued(
         );
         let late_rescues = rescued
             .iter()
-            .filter(|read| late(read))
+            .filter(|read| {
+                late(read)
+                    && report
+                        .transports
+                        .iter()
+                        .flatten()
+                        .any(|transport| transport.read == read.id && transport.fault.is_none())
+            })
             .map(|read| (read.body_bytes, read.latency_us()))
             .collect::<Vec<_>>();
         assert!(late_rescues.is_empty(), "seed {seed}: {late_rescues:?}");
@@ -581,4 +589,29 @@ async fn campaign() {
         "clock": "paused Tokio, millisecond timers, current-thread scheduler", "reports": reports });
     std::fs::write(output, serde_json::to_vec_pretty(&envelope).unwrap())
         .expect("write campaign report");
+}
+
+#[tokio::test(start_paused = true)]
+async fn simulation_fixed_body_overhead_preserves_hedges_for_stalls() {
+    for seed in [7, 42, 2026] {
+        let report = simulate(
+            scenario_named("synthetic_fixed_body_time_healthy"),
+            seed,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(report.completed, report.arrivals);
+        assert!(
+            report.overlapping_reads <= 1,
+            "seed {seed}: {} unnecessary hedges",
+            report.overlapping_reads
+        );
+    }
+    assert_stalls_are_rescued(
+        scenario_named("synthetic_fixed_body_time_slow_bodies"),
+        5,
+        |scenario, bytes| scenario.replicas[0].read_ms(bytes) * 5 / 2 + 30,
+    )
+    .await;
 }

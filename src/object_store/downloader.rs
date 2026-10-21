@@ -643,7 +643,7 @@ mod tests {
             .complete(outcome);
     }
 
-    /// The body tail for the 4-byte objects tests read.
+    /// The uncapped body tail for the 4-byte objects tests read.
     fn object_body_tail(downloader: &Downloader, bucket: &str) -> Option<Duration> {
         downloader
             .bucketed_stats
@@ -2363,5 +2363,69 @@ mod tests {
             assert_eq!(script.active.load(Ordering::SeqCst), 0);
             assert!(downloader.admission.try_acquire(4).is_some());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_header_stalls_do_not_disable_future_hedges() {
+        let (downloader, script) = scripted_downloader([
+            ("bucket", 1000, 90, false),
+            ("bucket", 1000, 90, false),
+            ("bucket", 10, 90, false),
+        ]);
+        let bucket = BucketName::new("bucket").unwrap();
+        for _ in 0..50 {
+            downloader
+                .bucketed_stats
+                .seed(&bucket, Sample::from_millis(10, 4, 90));
+        }
+        drop(downloader.attempt_budget.try_hedge(&bucket).unwrap());
+        let first = fetch(&downloader, &["bucket"]).await;
+        assert!(!first.hedged);
+        advance(Duration::from_secs(1)).await;
+        for _ in 0..20 {
+            downloader.attempt_budget.observe_success();
+        }
+        let second = fetch(&downloader, &["bucket"]).await;
+        assert_eq!(
+            downloader.bucketed_stats.model(&bucket).first_byte_tail(),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        assert!(second.hedged);
+        assert_eq!(second.latency, Duration::from_millis(115));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_health_uses_uncapped_predictions() {
+        let downloader = downloader([("bucket", 10, 400, false)])
+            .with_test_limits(DownloadLimits {
+                bucket_timeout: Duration::from_millis(100),
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        let bucket = BucketName::new("bucket").unwrap();
+        for _ in 0..50 {
+            downloader
+                .bucketed_stats
+                .seed(&bucket, Sample::from_millis(10, 4, 40));
+        }
+        downloader
+            .bucketed_stats
+            .seed(&bucket, Sample::from_millis(10, 4, 400));
+        let model = downloader.bucketed_stats.model(&bucket);
+        assert_eq!(model.body_hedge_delay(4), Some(Duration::from_millis(60)));
+        assert_eq!(
+            model.request_tail(Some(4)),
+            Some(Duration::from_millis(410))
+        );
+        assert_eq!(
+            model.timeout_allowance(Some(4), Duration::from_millis(50)),
+            Duration::from_millis(410)
+        );
+        let result = fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+        assert!(matches!(result, Err(DownloadError::Timeout { .. })));
+        let observed = metrics(&downloader, "bucket").await;
+        assert_eq!(observed.consecutive_failures, 0, "{observed:?}");
     }
 }

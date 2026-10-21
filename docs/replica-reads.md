@@ -22,18 +22,23 @@ headers, and body time. These observations have a 15-second half-life, balancing
 sample retention against adaptation to changing conditions. Failed and canceled
 copies do not contribute completed samples.
 
-Before headers arrive, early hedges use first-byte p99. After headers, the hedge
-delay scales with the announced body length. Nearby sizes receive similar delays;
-there is no fixed boundary between small and large bodies.
+Before headers arrive, early hedges use first-byte observations. After headers,
+they use body observations for the announced response length. Both hedge delays
+use p99 capped at 1.5 times the median, with a 1 ms median floor, so occasional
+completed stalls do not set future hedge delays. Health classification and retry feasibility use uncapped
+predictions; changing the hedge policy does not change those decisions.
 
-One body model shares evidence across sizes. Observations are weighted by byte
-count so that useful transfers remain informative among many tiny reads. Bodies
-too fast to time contribute an upper bound on transfer time.
+Body observations are grouped into power-of-two size bands. Each band retains its
+own decaying histogram, so many tiny reads cannot evict evidence from large reads.
+Predictions interpolate between bands, allowing both fixed transfer overhead and
+size-dependent transfer time. The largest band also supplies transfer-rate evidence
+for sparsely observed smaller sizes. Within each band, durations beyond a 1 ms timer
+allowance are normalized to the band's upper size bound.
 
-The body hedge delay uses the p99 prediction, capped at 1.5 times the median
-prediction. The cap limits the influence of occasional stalls on future hedge
-delays. It is a hedge policy, not a guarantee about request p99. When the model
-lacks evidence for an early hedge, deadline rescue still applies.
+Outside measured bands, predictions scale the nearest estimate with response
+length. Buffered-only history cannot establish throughput for larger responses.
+Sparse history can still cause startup hedges; deadline rescue remains available
+when an early hedge has no estimate.
 
 ## Deadlines and hedging
 
@@ -85,7 +90,8 @@ contacting a backend.
 |-------------|---------|
 | `cachey_bucket_latency_{mean,p99}_seconds` | Request start through validated body, including SDK retries |
 | `cachey_bucket_first_byte_{mean,p99}_seconds` | Request start through successful headers |
-| `cachey_bucket_body_seconds_per_byte` | Byte-weighted p99 transfer slope, before the hedge cap |
+| `cachey_bucket_body_model_bytes` | Largest observed size band's upper bound |
+| `cachey_bucket_body_seconds_per_byte` | Uncapped p99 body time per byte beyond 1 ms at that size; smaller sizes have separate estimates |
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |

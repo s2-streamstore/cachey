@@ -25,7 +25,7 @@ CACHEY_SIM_OUTPUT=/tmp/cachey-simulation.json \
 | `CACHEY_SIM_SEEDS` | Comma-separated seeds; default `7,42,2026` |
 | `CACHEY_SIM_RATE_MULTIPLIERS` | Comma-separated positive integer load multipliers; default `1` |
 | `CACHEY_SIM_REQUEST_LIMIT` | Override global active-copy limit |
-| `CACHEY_SIM_NATIVE_RESERVOIR` | `1` uses production sampling for request and first-byte latency |
+| `CACHEY_SIM_NATIVE_RESERVOIR` | `1` uses production sampling for all latency histograms |
 | `CACHEY_SIM_TRACE` | `1` includes every read, admitted copy, and wire attempt |
 
 [Fixtures](../../tests/scenarios/replica_reads.json) inherit omitted fields from
@@ -44,10 +44,9 @@ Admission reservations and response lengths are independent, so mixed-size reads
 can still reserve a full page.
 
 Seeds control faults, jitter, and recovery probes. SDK retries use the real
-classifier and quota with deterministic backoff. Request and first-byte estimates
-retain all observations by default. Production sampling is unseeded, so repeat
-those runs when comparing small differences. The body model always uses production
-aggregation and decay.
+classifier and quota with deterministic backoff. All latency histograms retain
+observations by default, including each body size band. Production sampling is unseeded, so repeat those runs when comparing small
+differences.
 
 ## Fixtures
 
@@ -76,6 +75,10 @@ gauges.
 | Throttling and overload | `s3_standard_slowdown` | `s3_express_overload_sdk_retries` | `capacitor_overload`, `capacitor_overload_delayed_cancel` |
 | Admission | `s3_standard_admission_saturation`, `s3_standard_queued_long_read` | `s3_express_stalled_admission` | |
 | Cancellation | | `s3_express_caller_cancellation`, `s3_express_delayed_cancellation` | `capacitor_cancel_storm`, `capacitor_cancel_immediate` |
+
+The `synthetic_fixed_body_time_healthy` and
+`synthetic_fixed_body_time_slow_bodies` fixtures also put a fixed cost after headers.
+They check that mixed-size reads learn that cost and preserve hedge credits for stalls.
 
 ## Interpreting results
 

@@ -51,50 +51,56 @@ fn priority(error: &DownloadError) -> u8 {
 }
 
 #[derive(Default)]
-struct FallbackErrors {
-    /// Each bucket's kept error, in the order it was recorded.
-    by_bucket: Vec<(usize, DownloadError)>,
+struct BucketState {
+    tried: bool,
+    in_flight: usize,
+    body_failed: bool,
+    error: Option<(usize, DownloadError)>,
+}
+
+impl BucketState {
+    fn settled(&self) -> bool {
+        self.error
+            .as_ref()
+            .is_some_and(|(_, error)| error.repeats_within_bucket())
+    }
+}
+
+#[derive(Default)]
+struct ReplicaStates {
+    buckets: Vec<BucketState>,
+    failure_sequence: usize,
     largest_object_size: Option<u64>,
 }
 
-impl FallbackErrors {
-    /// An error that the bucket's other copies would repeat replaces its earlier errors and
-    /// outlasts later ones. Otherwise the bucket keeps the more relevant error, or the later of
-    /// two equally relevant.
+impl ReplicaStates {
+    /// Conclusive errors settle their bucket; otherwise retain its highest-priority error.
+    /// Sequence numbers preserve the latest diagnostic across equally relevant bucket errors.
     fn record(&mut self, index: usize, error: DownloadError) {
         if let DownloadError::RangeNotSatisfied { object_size, .. } = &error {
             self.largest_object_size = self.largest_object_size.max(*object_size);
         }
-        if let Some(position) = self
-            .by_bucket
-            .iter()
-            .position(|(bucket, _)| *bucket == index)
-        {
-            let previous = &self.by_bucket[position].1;
-            if !error.repeats_within_bucket()
-                && (previous.repeats_within_bucket() || priority(&error) < priority(previous))
-            {
-                return;
-            }
-            self.by_bucket.remove(position);
+        if index >= self.buckets.len() {
+            self.buckets.resize_with(index + 1, BucketState::default);
         }
-        self.by_bucket.push((index, error));
+        let bucket = &mut self.buckets[index];
+        if let Some((_, previous)) = &bucket.error
+            && !error.repeats_within_bucket()
+            && (previous.repeats_within_bucket() || priority(&error) < priority(previous))
+        {
+            return;
+        }
+        self.failure_sequence += 1;
+        bucket.error = Some((self.failure_sequence, error));
     }
 
-    /// Whether the bucket failed with an error its other copies would repeat.
-    fn settled(&self, index: usize) -> bool {
-        self.by_bucket
-            .iter()
-            .any(|(bucket, error)| *bucket == index && error.repeats_within_bucket())
-    }
-
-    /// The most relevant of the buckets' errors, or the latest of equally relevant ones.
     fn into_error(self, retry_budget_exhausted: bool) -> DownloadError {
         let mut last_error = self
-            .by_bucket
+            .buckets
             .into_iter()
-            .map(|(_, error)| error)
-            .max_by_key(priority);
+            .filter_map(|bucket| bucket.error)
+            .max_by_key(|(sequence, error)| (priority(error), *sequence))
+            .map(|(_, error)| error);
         if let Some(DownloadError::RangeNotSatisfied { object_size, .. }) = &mut last_error {
             *object_size = self.largest_object_size;
         }
@@ -254,12 +260,7 @@ enum Trigger {
 struct Followups<'a> {
     request: &'a ReplicaRequest<'a>,
     bytes: u64,
-    /// Buckets given a copy.
-    tried: Vec<bool>,
-    in_flight: Vec<usize>,
-    errors: FallbackErrors,
-    /// Buckets whose body failed after its headers.
-    body_failed: Vec<bool>,
+    states: ReplicaStates,
     /// Whether a failed body was retried against its bucket.
     retried: bool,
     retry_budget_exhausted: bool,
@@ -269,27 +270,27 @@ struct Followups<'a> {
 impl Followups<'_> {
     /// Whether a copy to an unsettled bucket is in flight.
     fn awaiting(&self) -> bool {
-        self.in_flight
+        self.states
+            .buckets
             .iter()
-            .enumerate()
-            .any(|(index, copies)| *copies > 0 && !self.errors.settled(index))
+            .any(|bucket| bucket.in_flight > 0 && !bucket.settled())
     }
 
     fn started(&mut self, index: usize) {
-        self.tried[index] = true;
-        self.in_flight[index] += 1;
+        let bucket = &mut self.states.buckets[index];
+        bucket.tried = true;
+        bucket.in_flight += 1;
     }
 
     fn failed(&mut self, index: usize, error: DownloadError) {
-        self.in_flight[index] -= 1;
-        if error.should_retry_same_bucket() {
-            self.body_failed[index] = true;
-        }
-        self.errors.record(index, error);
+        let bucket = &mut self.states.buckets[index];
+        bucket.in_flight -= 1;
+        bucket.body_failed |= error.should_retry_same_bucket();
+        self.states.record(index, error);
     }
 
     fn into_error(self) -> DownloadError {
-        self.errors.into_error(self.retry_budget_exhausted)
+        self.states.into_error(self.retry_budget_exhausted)
     }
 
     /// Later copies need time for a fresh request, using the first copy's announced length once
@@ -312,7 +313,7 @@ impl Followups<'_> {
     /// overload. Later copies must have time to finish before their bucket's deadline.
     fn next(&mut self, trigger: Trigger, hedge: &mut HedgeTimer<'_>) -> Option<CopyAttempt> {
         if let Trigger::Rescue(index) = trigger
-            && self.tried[index]
+            && self.states.buckets[index].tried
         {
             return None;
         }
@@ -324,23 +325,25 @@ impl Followups<'_> {
         let early = matches!(trigger, Trigger::Hedge);
         let downloader = self.request.downloader;
         let routing = downloader.bucketed_stats.snapshot(self.request.buckets);
+        let untried = |index: usize| !self.states.buckets[index].tried;
         let index = match trigger {
             Trigger::Rescue(index) => index,
             Trigger::Hedge => routing
-                .best(&self.tried, remaining)
+                .best(untried, remaining)
                 .unwrap_or(self.request.primary),
-            Trigger::Fallback => routing.best(&self.tried, remaining).or_else(|| {
+            Trigger::Fallback => routing.best(untried, remaining).or_else(|| {
                 if self.retried || self.awaiting() {
                     return None;
                 }
-                let unretriable = (0..self.tried.len())
-                    .map(|index| {
-                        !self.body_failed[index]
-                            || self.errors.settled(index)
-                            || !self.has_time(&routing, index, now)
-                    })
-                    .collect::<Vec<_>>();
-                routing.best(&unretriable, remaining)
+                routing.best(
+                    |index| {
+                        let bucket = &self.states.buckets[index];
+                        bucket.body_failed
+                            && !bucket.settled()
+                            && self.has_time(&routing, index, now)
+                    },
+                    remaining,
+                )
             })?,
         };
         if (early && routing.overloaded(index)) || !self.has_time(&routing, index, now) {
@@ -348,7 +351,7 @@ impl Followups<'_> {
         }
         let model = routing.model(index);
         let overloaded = routing.all_overloaded();
-        let retrying = !early && self.tried[index];
+        let retrying = !early && self.states.buckets[index].tried;
         if (overloaded || retrying) && !downloader.attempt_budget.try_retry() {
             self.retry_budget_exhausted |= overloaded;
             return None;
@@ -372,7 +375,7 @@ impl Followups<'_> {
                     admission,
                 })
         };
-        let first_for_bucket = !self.tried[index];
+        let first_for_bucket = !self.states.buckets[index].tried;
         self.started(index);
         Some(CopyAttempt {
             index,
@@ -430,17 +433,17 @@ impl Downloader {
         let mut followups = Followups {
             request: &request,
             bytes,
-            tried: vec![false; buckets.len()],
-            in_flight: vec![0; buckets.len()],
-            errors: FallbackErrors::default(),
-            body_failed: vec![false; buckets.len()],
+            states: ReplicaStates {
+                buckets: (0..buckets.len()).map(|_| BucketState::default()).collect(),
+                ..ReplicaStates::default()
+            },
             retried: false,
             retry_budget_exhausted: false,
             backup_admission,
         };
         followups.started(primary);
         let mut hedge = HedgeTimer::new(
-            primary_model,
+            primary_model.clone(),
             &request.progress[primary].first_copy,
             request.bucket_deadline(primary),
             self.limits.hedge_budget_percent > 0 && probe.is_none(),
@@ -497,7 +500,7 @@ impl Downloader {
         });
         if probe.is_some() && reservations.is_none() {
             probe = None;
-            index = routing.best(&[], remaining).unwrap_or(index);
+            index = routing.best(|_| true, remaining).unwrap_or(index);
         }
         let (admission, backup_admission) = reservations.unzip();
         PrimaryAttempt {
@@ -518,7 +521,7 @@ mod tests {
 
     use itertools::Itertools;
 
-    use super::{DownloadError, FallbackErrors};
+    use super::{DownloadError, ReplicaStates};
     use crate::types::BucketName;
 
     fn timeout(bucket: &str) -> DownloadError {
@@ -542,7 +545,7 @@ mod tests {
         errors: impl IntoIterator<Item = (usize, DownloadError)>,
         expected: &DownloadError,
     ) {
-        let mut fallback_errors = FallbackErrors::default();
+        let mut fallback_errors = ReplicaStates::default();
         for (index, error) in errors {
             fallback_errors.record(index, error);
         }

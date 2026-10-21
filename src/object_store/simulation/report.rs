@@ -21,6 +21,7 @@ pub struct Copy {
 pub struct Estimates {
     latency_p99_us: Option<u64>,
     first_byte_p99_us: Option<u64>,
+    body_model_bytes: Option<u64>,
     body_seconds_per_byte: Option<f64>,
 }
 
@@ -31,6 +32,7 @@ impl From<&BucketMetrics> for Estimates {
         Self {
             latency_p99_us: micros(metrics.latency_p99),
             first_byte_p99_us: micros(metrics.first_byte_p99),
+            body_model_bytes: metrics.body_model_bytes,
             body_seconds_per_byte: metrics.body_seconds_per_byte,
         }
     }
@@ -38,14 +40,16 @@ impl From<&BucketMetrics> for Estimates {
 
 impl Estimates {
     fn slowest(self, other: Self) -> Self {
+        let body = match (self.body_seconds_per_byte, other.body_seconds_per_byte) {
+            (Some(left), Some(right)) if left > right => self,
+            (Some(_), None) => self,
+            _ => other,
+        };
         Self {
             latency_p99_us: self.latency_p99_us.max(other.latency_p99_us),
             first_byte_p99_us: self.first_byte_p99_us.max(other.first_byte_p99_us),
-            body_seconds_per_byte: self
-                .body_seconds_per_byte
-                .into_iter()
-                .chain(other.body_seconds_per_byte)
-                .max_by(f64::total_cmp),
+            body_model_bytes: body.body_model_bytes,
+            body_seconds_per_byte: body.body_seconds_per_byte,
         }
     }
 }
@@ -165,7 +169,7 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     copies: Option<Vec<Copy>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    transports: Option<Vec<Transport>>,
+    pub transports: Option<Vec<Transport>>,
 }
 
 impl Report {

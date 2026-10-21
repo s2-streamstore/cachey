@@ -41,15 +41,18 @@ pub struct BucketMetrics {
     /// retries.
     pub first_byte_mean: Option<Duration>,
     pub first_byte_p99: Option<Duration>,
-    /// Uncapped byte-weighted p99 transfer time per byte, measured beyond a 1 ms allowance.
-    /// Zero means buffered-only history; it does not establish throughput for larger responses.
+    /// Size at which `body_seconds_per_byte` is estimated: the largest observed size band.
+    pub body_model_bytes: Option<u64>,
+    /// Uncapped p99 body time per byte beyond a 1 ms timer allowance at `body_model_bytes`.
+    /// Smaller responses have their own estimates, including their fixed transfer overhead.
     pub body_seconds_per_byte: Option<f64>,
 }
 
-/// A histogram's mean and nearest-rank p99, in its units.
+/// A histogram's mean and nearest-rank quantiles, in its units.
 #[derive(Debug, Clone, Copy)]
 struct Summary {
     mean: f64,
+    median: i64,
     p99: i64,
 }
 
@@ -60,6 +63,26 @@ impl Summary {
 
     fn p99_duration(self) -> Duration {
         Duration::from_micros(self.p99 as u64)
+    }
+
+    fn quantiles(self) -> Quantiles {
+        Quantiles {
+            median: Duration::from_micros(self.median as u64),
+            p99: self.p99_duration(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Quantiles {
+    median: Duration,
+    p99: Duration,
+}
+
+impl Quantiles {
+    fn hedge_delay(self) -> Duration {
+        let median = self.median.max(Duration::from_millis(1));
+        self.p99.min(median.saturating_add(median / 2))
     }
 }
 
@@ -94,11 +117,11 @@ impl Sample {
 /// Latency summaries for one bucket. The body length is unknown until response headers announce
 /// it: earlier decisions use complete request latency across the lengths the bucket actually
 /// served, and later ones predict body time for the announced length.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct LatencyModel {
     latency: Option<Summary>,
     first_byte: Option<Summary>,
-    body: Option<BodyModel>,
+    body: BodyModel,
 }
 
 impl LatencyModel {
@@ -111,10 +134,18 @@ impl LatencyModel {
         self.first_byte.map(Summary::p99_duration)
     }
 
-    /// The continuous body prediction, capped at 1.5 times its median to limit isolated stalls.
-    /// Buffered bodies alone cannot predict transfer time for larger responses.
+    pub fn first_byte_hedge_delay(&self) -> Option<Duration> {
+        self.first_byte
+            .map(|summary| summary.quantiles().hedge_delay())
+    }
+
+    pub fn body_hedge_delay(&self, bytes: u64) -> Option<Duration> {
+        self.body.predict(bytes).map(Quantiles::hedge_delay)
+    }
+
+    /// Uncapped duration predictions keep speculation policy out of health and retry decisions.
     pub fn body_tail(&self, bytes: u64) -> Option<Duration> {
-        self.body?.tail(bytes)
+        self.body.predict(bytes).map(|quantiles| quantiles.p99)
     }
 
     /// A fresh copy's tail for the known body length, or the observed request tail while its
@@ -184,6 +215,7 @@ fn summarize(histogram: &ExponentialDecayHistogram) -> Option<Summary> {
     let snapshot = histogram.snapshot();
     (snapshot.count() > 0).then(|| Summary {
         mean: snapshot.mean(),
+        median: quantile(&snapshot, 0.5),
         p99: quantile(&snapshot, 0.99),
     })
 }
@@ -210,6 +242,12 @@ impl PhaseHistogram {
         self.changed = true;
     }
 
+    #[cfg(test)]
+    fn retention(&self) -> (u64, usize) {
+        let snapshot = self.histogram.snapshot();
+        (snapshot.count(), snapshot.exemplars().count())
+    }
+
     /// Summarizes a changed histogram once `due`, or as soon as it holds its first samples.
     fn summary(&mut self, due: bool) -> Option<Summary> {
         if self.changed && (due || self.summary.is_none()) {
@@ -232,7 +270,7 @@ impl LatencyEstimates {
         Self {
             latency: PhaseHistogram::new(now),
             first_byte: PhaseHistogram::new(now),
-            body: BodyHistogram::new(now),
+            body: BodyHistogram::default(),
         }
     }
 
@@ -253,11 +291,12 @@ impl LatencyEstimates {
     }
 
     #[cfg(test)]
-    fn retention(&self) -> [(u64, usize); 2] {
-        [&self.latency, &self.first_byte].map(|phase| {
-            let snapshot = phase.histogram.snapshot();
-            (snapshot.count(), snapshot.exemplars().count())
-        })
+    fn retention(&self) -> Vec<(u64, usize)> {
+        [&self.latency, &self.first_byte]
+            .into_iter()
+            .map(PhaseHistogram::retention)
+            .chain(self.body.retention())
+            .collect()
     }
 }
 
@@ -517,9 +556,9 @@ impl RoutingSnapshot {
             .then_with(|| (left_stats.latency, left).cmp(&(right_stats.latency, right)))
     }
 
-    pub fn best(&self, tried: &[bool], remaining: Duration) -> Option<usize> {
+    pub fn best(&self, eligible: impl Fn(usize) -> bool, remaining: Duration) -> Option<usize> {
         (0..self.0.len())
-            .filter(|index| tried.get(*index) != Some(&true))
+            .filter(|index| eligible(*index))
             .min_by(|left, right| self.compare(*left, *right, remaining))
     }
 
@@ -593,7 +632,7 @@ impl RoutingSnapshot {
     }
 
     pub fn primary(&self, remaining: Duration) -> (usize, Option<ProbePermit>) {
-        let winner = self.best(&[], remaining).expect("nonempty bucket set");
+        let winner = self.best(|_| true, remaining).expect("nonempty bucket set");
         let best = &self.0[winner];
         if best.deprioritized || self.tail(winner).is_some_and(|tail| tail >= remaining) {
             return (winner, None);
@@ -629,7 +668,7 @@ impl RoutingSnapshot {
     }
 
     pub fn model(&self, index: usize) -> LatencyModel {
-        self.0[index].model
+        self.0[index].model.clone()
     }
 
     pub fn overloaded(&self, index: usize) -> bool {
@@ -747,7 +786,8 @@ impl BucketedStats {
                     latency_p99: model.tail(),
                     first_byte_mean: model.first_byte.map(Summary::mean_duration),
                     first_byte_p99: model.first_byte_tail(),
-                    body_seconds_per_byte: model.body.map(|body| body.p99_seconds_per_byte),
+                    body_model_bytes: model.body.largest_bytes(),
+                    body_seconds_per_byte: model.body.seconds_per_byte(),
                 };
                 (entry.key().clone(), metrics)
             })
@@ -808,7 +848,9 @@ mod tests {
                 stats.seed_latency(bucket, millis);
             }
             assert_eq!(
-                stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+                stats
+                    .snapshot(&buckets)
+                    .best(|_| true, Duration::from_secs(1)),
                 Some(expected)
             );
         }
@@ -824,7 +866,9 @@ mod tests {
         }
         stats.seed(&buckets[0], Sample::from_millis(5, 2 * MIB, 100));
         assert_eq!(
-            stats.snapshot(&buckets).best(&[], Duration::from_secs(10)),
+            stats
+                .snapshot(&buckets)
+                .best(|_| true, Duration::from_secs(10)),
             Some(0)
         );
     }
@@ -874,7 +918,9 @@ mod tests {
             advance(Duration::from_millis(3)).await;
             observation.complete(Outcome::Success(Sample::from_millis(3, 4, 0)));
             assert_eq!(
-                stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+                stats
+                    .snapshot(&buckets)
+                    .best(|_| true, Duration::from_secs(1)),
                 Some(1)
             );
             let (index, probe) = stats.snapshot(&buckets).primary(Duration::from_secs(1));
@@ -971,7 +1017,7 @@ mod tests {
         let model = stats.model(&bucket);
         assert_eq!(model.first_byte_tail(), Some(Duration::from_millis(10)));
         assert_eq!(
-            model.body_tail(4 * MIB),
+            model.body_hedge_delay(4 * MIB),
             Some(Duration::from_micros(61_500))
         );
         assert!(
@@ -992,7 +1038,7 @@ mod tests {
             stats.seed(&bucket, Sample::from_millis(10, MIB / 16, 20));
         }
         let model = stats.model(&bucket);
-        for (bytes, micros) in [(16 * MIB, 161_000), (3 * MIB / 2, 16_000), (4096, 1039)] {
+        for (bytes, micros) in [(16 * MIB, 161_000), (3 * MIB / 2, 16_000), (4096, 2187)] {
             assert_eq!(
                 model.body_tail(bytes).map(|tail| tail.as_micros()),
                 Some(micros),
@@ -1064,7 +1110,7 @@ mod tests {
         stats.seed(&bucket, Sample::from_millis(30, 4 * MIB, 40));
         let model = stats.model(&bucket);
         assert_eq!(model.first_byte_tail(), Some(Duration::from_millis(10)));
-        assert_eq!(model.body_tail(4 * MIB), Some(Duration::from_millis(1025)));
+        assert_eq!(model.body_tail(4 * MIB), Some(Duration::from_millis(40)));
         advance(LATENCY_SNAPSHOT_INTERVAL).await;
         assert_eq!(
             stats.model(&bucket).body_tail(4 * MIB),
@@ -1141,17 +1187,23 @@ mod tests {
             .collect::<Vec<_>>();
         advance(Duration::from_millis(20)).await;
         assert_eq!(
-            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+            stats
+                .snapshot(&buckets)
+                .best(|_| true, Duration::from_secs(1)),
             Some(1)
         );
         drop(active);
         assert_eq!(
-            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+            stats
+                .snapshot(&buckets)
+                .best(|_| true, Duration::from_secs(1)),
             Some(1)
         );
         stats.seed_latency(&buckets[0], 3);
         assert_eq!(
-            stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
+            stats
+                .snapshot(&buckets)
+                .best(|_| true, Duration::from_secs(1)),
             Some(0)
         );
     }
@@ -1163,7 +1215,11 @@ mod tests {
         for (bucket, millis) in buckets.iter().zip([3, 4, 5]) {
             stats.seed_latency(bucket, millis);
         }
-        let best = || stats.snapshot(&buckets).best(&[], Duration::from_secs(1));
+        let best = || {
+            stats
+                .snapshot(&buckets)
+                .best(|_| true, Duration::from_secs(1))
+        };
         assert_eq!(best(), Some(0));
         let stall = stats.begin(&buckets[0], None);
         advance(Duration::from_millis(100)).await;
@@ -1186,12 +1242,16 @@ mod tests {
             .collect::<Vec<_>>();
         advance(Duration::from_millis(300)).await;
         assert_eq!(
-            stats.snapshot(&buckets).best(&[], Duration::from_secs(10)),
+            stats
+                .snapshot(&buckets)
+                .best(|_| true, Duration::from_secs(10)),
             Some(0)
         );
         advance(Duration::from_millis(600)).await;
         assert_eq!(
-            stats.snapshot(&buckets).best(&[], Duration::from_secs(10)),
+            stats
+                .snapshot(&buckets)
+                .best(|_| true, Duration::from_secs(10)),
             Some(1)
         );
     }
@@ -1221,5 +1281,21 @@ mod tests {
             assert!(probe.is_none());
             assert!(!stats.entry(&buckets[0]).lock().deprioritized);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_median_headers_still_hedge_observed_stalls() {
+        let stats = BucketedStats::default();
+        let bucket = BucketName::new("local").unwrap();
+        for _ in 0..50 {
+            stats.seed(&bucket, Sample::from_millis(0, 4096, 1));
+        }
+        stats.seed(&bucket, Sample::from_millis(1000, 4096, 1));
+        let model = stats.model(&bucket);
+        assert_eq!(model.first_byte_tail(), Some(Duration::from_secs(1)));
+        assert_eq!(
+            model.first_byte_hedge_delay(),
+            Some(Duration::from_micros(1500))
+        );
     }
 }

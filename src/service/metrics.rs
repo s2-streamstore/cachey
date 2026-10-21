@@ -18,7 +18,7 @@ fn seconds(duration: Option<Duration>) -> Option<f64> {
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     type BucketGauge = (GaugeVec, fn(&BucketMetrics) -> Option<f64>);
 
-    static GAUGES: LazyLock<[BucketGauge; 8]> = LazyLock::new(|| {
+    static GAUGES: LazyLock<[BucketGauge; 9]> = LazyLock::new(|| {
         let gauge = |name: &str, help: &str| register_gauge_vec!(name, help, &["bucket"]).unwrap();
         [
             (
@@ -58,8 +58,15 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
             ),
             (
                 gauge(
+                    "cachey_bucket_body_model_bytes",
+                    "Largest observed response-size band used for the exported body transfer estimate",
+                ),
+                |metrics| metrics.body_model_bytes.map(|bytes| bytes as f64),
+            ),
+            (
+                gauge(
                     "cachey_bucket_body_seconds_per_byte",
-                    "Uncapped byte-weighted p99 transfer time per byte, measured beyond a 1 ms scheduling allowance",
+                    "Uncapped p99 body time per byte beyond 1 ms, at cachey_bucket_body_model_bytes",
                 ),
                 |metrics| metrics.body_seconds_per_byte,
             ),
