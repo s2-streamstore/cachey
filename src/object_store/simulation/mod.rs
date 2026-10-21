@@ -374,16 +374,14 @@ async fn simulation_reads_finishing_at_their_tail_are_not_hedged() {
 /// Checks that at least `min_rescued` reads were hedged, that each finished within `bound_ms` of
 /// the fixture and its length, and that at most 1% of reads took longer unhedged.
 async fn assert_stalls_are_rescued(
-    name: &str,
+    scenario: Scenario,
     min_rescued: usize,
     bound_ms: impl Fn(&model::Scenario, usize) -> u64,
 ) -> Vec<Report> {
     let mut reports = Vec::new();
     for seed in [7, 42, 2026] {
-        let scenario = scenario_named(name);
-        let shape = scenario.clone();
-        let late = |read: &Read| read.latency_us() > bound_ms(&shape, read.body_bytes) * 1000;
-        let report = simulate(scenario, seed, false, true).await;
+        let late = |read: &Read| read.latency_us() > bound_ms(&scenario, read.body_bytes) * 1000;
+        let report = simulate(scenario.clone(), seed, false, true).await;
         assert_eq!(report.completed, report.arrivals, "seed {seed}");
         let (rescued, unhedged): (Vec<_>, Vec<_>) =
             report.reads.iter().flatten().partition(|read| read.hedged);
@@ -414,32 +412,44 @@ async fn assert_stalls_are_rescued(
 /// not set hedge delays; only reads the budget leaves unhedged may take longer.
 #[tokio::test(start_paused = true)]
 async fn simulation_s3_shaped_stalls_are_hedged_at_size_aware_tails() {
-    assert_stalls_are_rescued("s3_standard_stalls", 10, |scenario, bytes| {
-        scenario.replicas[0].read_ms(bytes) * 5 / 2 + 30
-    })
+    assert_stalls_are_rescued(
+        scenario_named("s3_standard_stalls"),
+        10,
+        |scenario, bytes| scenario.replicas[0].read_ms(bytes) * 5 / 2 + 30,
+    )
     .await;
 }
 
 /// As on Capacitor, the server reads and verifies the whole chunk before sending headers, so time
 /// to first byte grows with chunk length, and the body follows from memory. A stalled read of any
 /// length waits for the first-byte p99 of full chunks, then a hedge to another zone, and finishes
-/// within three nominal full-chunk reads from the local zone. A stall the startup budget leaves
-/// unhedged raises the local zone's routing latency, and the rise must decay rather than keep
-/// reads in other zones, so the local zone serves at least half of them.
+/// within three nominal full-chunk reads from the local zone. Sparse startup history can send
+/// reads to peers, but must not keep them there: after a minute, at least 90% use the local zone.
 #[tokio::test(start_paused = true)]
 async fn simulation_capacitor_shaped_stalls_are_hedged_to_another_zone() {
-    let reports = assert_stalls_are_rescued("capacitor_stalls", 5, |scenario, _| {
-        scenario.replicas[0].read_ms(scenario.body_bytes) * 3
-    })
-    .await;
-    for report in reports {
-        let local_wins = report
+    let mut scenario = scenario_named("capacitor_stalls");
+    let bound_ms = |scenario: &Scenario, _| scenario.replicas[0].read_ms(scenario.body_bytes) * 3;
+    assert_stalls_are_rescued(scenario.clone(), 5, bound_ms).await;
+    scenario.duration_ms = 120_000;
+    for fault in &mut scenario.faults {
+        fault.end_ms = scenario.duration_ms;
+    }
+    for report in assert_stalls_are_rescued(scenario, 5, bound_ms).await {
+        let settled_reads: Vec<_> = report
             .reads
             .iter()
             .flatten()
+            .filter(|read| read.arrival_us >= 60_000_000)
+            .collect();
+        let local_wins = settled_reads
+            .iter()
             .filter(|read| read.winner == Some(0))
             .count();
-        assert!(local_wins * 2 >= report.arrivals, "{local_wins}");
+        assert!(
+            local_wins * 10 >= settled_reads.len() * 9,
+            "{local_wins}/{}",
+            settled_reads.len()
+        );
     }
 }
 

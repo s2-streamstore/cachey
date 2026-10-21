@@ -19,8 +19,9 @@ use crate::{
 
 const ERROR_ALPHA: f64 = 0.015;
 const LATENCY_ALPHA: f64 = 0.1;
-/// Latency estimates decay with a 5-second half-life.
-const LATENCY_DECAY: f64 = std::f64::consts::LN_2 / 5.0;
+/// Retain observations across bursts while letting temporary routing penalties fade sooner.
+const LATENCY_DECAY: f64 = std::f64::consts::LN_2 / 15.0;
+const ROUTING_DECAY: f64 = std::f64::consts::LN_2 / 5.0;
 const LATENCY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const RECOVERY_SUCCESSES: u32 = 20;
@@ -348,7 +349,7 @@ impl BucketStats {
         self.routing_updated_at = now;
     }
 
-    /// Routing latency above the bucket's measured mean decays toward it with the latency
+    /// Routing latency above the bucket's measured mean decays toward it with a 5-second
     /// half-life, so a rise fades even while the bucket receives no copies to lower it. A bucket
     /// without measurements keeps its rise.
     fn current_routing_latency(&self, now: Instant) -> Duration {
@@ -360,7 +361,7 @@ impl BucketStats {
             return self.routing_latency;
         }
         mean + excess.mul_f64(decay(
-            LATENCY_DECAY,
+            ROUTING_DECAY,
             now.saturating_duration_since(self.routing_updated_at),
         ))
     }

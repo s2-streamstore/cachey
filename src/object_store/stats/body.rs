@@ -161,33 +161,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn byte_weights_share_a_five_second_half_life() {
+    async fn byte_weights_share_a_fifteen_second_half_life() {
         let start = Instant::now();
         let mut histogram = BodyHistogram::new(start);
         histogram.update(start, &Sample::from_millis(10, MIB, 101));
-        advance(Duration::from_millis(2500)).await;
+        advance(Duration::from_secs(15)).await;
         histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
         advance(Duration::from_millis(250)).await;
         histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
         advance(Duration::from_millis(250)).await;
         histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
         let weights: Vec<_> = histogram.bins.values().map(|bin| bin.weight).collect();
-        let slow = MIB as f64 * 0.5_f64.powf(0.5);
-        let fast = MIB as f64 * (1.0 + 2.0_f64.powf(0.05) + 2.0_f64.powf(0.1));
+        let slow = MIB as f64 / 2.0;
+        let fast = MIB as f64 * (1.0 + 2.0_f64.powf(0.25 / 15.0) + 2.0_f64.powf(0.5 / 15.0));
         assert!((weights[0] - fast).abs() < 1e-6);
         assert!((weights[1] - slow).abs() < 1e-6);
         let model = histogram.summary(true).unwrap();
         assert!((model.p99_seconds_per_byte * MIB as f64 - 0.1).abs() < 1e-9);
         assert_eq!(model.tail(MIB), Some(Duration::from_micros(16_500)));
 
-        advance(Duration::from_secs(40)).await;
+        advance(Duration::from_secs(120)).await;
         histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
         assert_eq!(
             histogram.summary(true).unwrap().tail(MIB),
             Some(Duration::from_millis(11))
         );
 
-        advance(Duration::from_secs(10_000)).await;
+        advance(Duration::from_mins(1000)).await;
         histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 21));
         assert_eq!(histogram.bins.len(), 1);
         assert_eq!(

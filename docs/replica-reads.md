@@ -9,9 +9,9 @@ bucket remains eligible for fallback.
 
 A bucket's request latency for selection averages its measured requests, and copies
 left unmeasured, such as stalls or canceled reads, can raise it. A rise above the
-bucket's measured mean decays with the latency model's 5-second half-life, so a bucket
-that lost preference to one outlier regains it without first receiving reads. A bucket
-never measured keeps its rise.
+bucket's measured mean decays with a 5-second half-life, so a bucket that lost
+preference to one outlier regains it without first receiving reads. A bucket never
+measured keeps its rise.
 
 ## Latency model
 
@@ -21,6 +21,8 @@ phases: time to first byte, from starting the request to successful response hea
 including SDK retries, and body time after headers. Decisions made before headers
 arrive—selection, rescue reservations, and stall detection—use complete request latency
 across the lengths a bucket actually served. Hedges and timeouts use the phases.
+Request, first-byte, and body observations decay with a 15-second half-life, retaining
+evidence across bursts independently of the faster routing-penalty decay.
 
 Body time uses one continuous model per bucket:
 
@@ -31,7 +33,7 @@ body_tail(bytes) = min(predicted_time(p99, bytes), 1.5 × predicted_time(p50, by
 
 The 1 ms allowance covers timer granularity and scheduling after headers. Bodies
 long enough to time teach `(body_time − 1 ms) / body_bytes`, weighted by their bytes
-and decayed with a 5-second half-life. All sizes share the same histogram; there is no
+and decayed with a 15-second half-life. All sizes share the same histogram; there is no
 size boundary. The median bound limits isolated stalls without discarding their
 measurements. Sustained changes move both quantiles. First-byte timing stays at p99,
 since it includes server work that can legitimately vary with response length.
