@@ -2421,4 +2421,40 @@ mod tests {
         let observed = metrics(&downloader, "bucket").await;
         assert_eq!(observed.consecutive_failures, 0, "{observed:?}");
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_overloaded_peer_does_not_block_a_same_bucket_hedge() {
+        let (downloader, script) =
+            scripted_downloader([("local", 1000, 0, false), ("local", 10, 0, false)]);
+        seed_latency(&downloader, "local", 10);
+        seed_latency(&downloader, "peer", 10);
+        record_outcome(&downloader, "peer", Outcome::Overload);
+
+        let output = fetch(&downloader, &["local", "peer"]).await;
+        assert_eq!(output.latency, Duration::from_millis(20));
+        assert_eq!(output.used_bucket_idx, 0);
+        assert!(output.hedged);
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hedging_prefers_an_eligible_untried_peer_to_the_primary() {
+        let (downloader, script) =
+            scripted_downloader([("local", 1000, 0, false), ("other", 10, 0, false)]);
+        for bucket in ["local", "peer", "other"] {
+            seed_latency(&downloader, bucket, 10);
+        }
+        record_outcome(&downloader, "peer", Outcome::Overload);
+        for _ in 0..2 {
+            record_outcome(&downloader, "other", Outcome::Failure);
+        }
+
+        let output = fetch(&downloader, &["local", "peer", "other"]).await;
+        assert_eq!(output.latency, Duration::from_millis(20));
+        assert_eq!(output.used_bucket_idx, 2);
+        assert!(output.hedged);
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
 }

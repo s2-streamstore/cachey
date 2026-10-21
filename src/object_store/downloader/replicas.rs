@@ -319,7 +319,10 @@ impl Followups<'_> {
         let index = match trigger {
             Trigger::Rescue(index) => index,
             Trigger::Hedge => routing
-                .best(untried, remaining)
+                .best(
+                    |index| untried(index) && !routing.overloaded(index),
+                    remaining,
+                )
                 .unwrap_or(self.request.primary),
             Trigger::Fallback => routing.best(untried, remaining).or_else(|| {
                 if self.retried || self.awaiting() {

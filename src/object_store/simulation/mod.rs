@@ -39,6 +39,11 @@ struct ControlState {
 
 tokio::task_local! { static CONTROLS: Arc<Controls>; }
 
+pub(super) fn inline_body_fits() -> bool {
+    // Keep wall-clock worker scheduling out of the paused-time simulation.
+    CONTROLS.try_with(|_| ()).is_ok()
+}
+
 pub(super) fn histogram_capacity() -> Option<usize> {
     CONTROLS
         .try_with(|controls| controls.capacity)

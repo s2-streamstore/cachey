@@ -45,6 +45,10 @@ Seeds control faults, jitter, and recovery probes. SDK retries use deterministic
 backoff. By default, histograms retain all observations. Production sampling is
 unseeded, so repeat runs when comparing small differences.
 
+Body model fits run inline in the simulation so wall-clock worker scheduling does
+not affect paused-time results. Separate concurrency tests cover production's
+background refreshes; the simulation does not measure their CPU cost or delay.
+
 ## Fixtures
 
 The S3 model streams bodies after headers. The Capacitor model reads the range

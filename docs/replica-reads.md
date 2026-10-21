@@ -33,6 +33,12 @@ Both coefficients are nonnegative. Predictions have a 1 ms floor, and p99 stays 
 or above the median. Samples from all objects and response sizes train the same
 model. Sampling by size preserves rare large transfers.
 
+Models refresh at most once per second, or sooner when the sample count doubles.
+Fits with more than 64 retained samples run on Tokio's blocking pool, with one
+pending fit per bucket. Requests keep using the previous model while it runs;
+recovery discards any pending result along with the old history. Collecting the
+retained samples still briefly holds the bucket's statistics lock.
+
 One observed size cannot separate fixed cost from transfer cost, so the model starts
 with a 1 ms fixed allowance. Flat or buffered-only history leaves larger transfer
 times unknown; deadline rescue remains available.
