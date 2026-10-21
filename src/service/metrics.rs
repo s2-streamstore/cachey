@@ -59,14 +59,14 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
             (
                 gauge(
                     "cachey_bucket_body_model_bytes",
-                    "Representative response size of the largest pooled body estimate",
+                    "Largest response size retained by the body model",
                 ),
                 |metrics| metrics.body_model_bytes.map(|bytes| bytes as f64),
             ),
             (
                 gauge(
                     "cachey_bucket_body_seconds_per_byte",
-                    "Uncapped p99 body time per byte beyond 1 ms, at cachey_bucket_body_model_bytes",
+                    "Transfer slope of the uncapped p99 body-time model, excluding fixed cost",
                 ),
                 |metrics| metrics.body_seconds_per_byte,
             ),

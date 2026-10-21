@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 use exponential_decay_histogram::ExponentialDecayHistogram;
 use tokio::time::Instant;
@@ -9,92 +9,53 @@ const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MICROS: f64 = TIMER_RESOLUTION.as_micros() as f64;
 
 #[derive(Debug, Clone, Copy)]
-struct Estimate {
-    bytes: u64,
-    quantiles: Quantiles,
+struct Line {
+    fixed: f64,
+    per_byte: f64,
 }
 
-#[derive(Debug, Clone, Default)]
-pub(super) struct BodyModel {
-    estimates: Arc<[Estimate]>,
-    fixed: Duration,
+impl Line {
+    fn micros(self, bytes: u64) -> f64 {
+        (self.fixed + self.per_byte * bytes as f64).max(TIMER_MICROS)
+    }
 }
+
+#[derive(Debug, Clone, Copy)]
+struct Estimate {
+    median: Line,
+    p99: Line,
+    largest_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct BodyModel(Option<Estimate>);
 
 impl BodyModel {
     pub fn predict(&self, bytes: u64) -> Option<Quantiles> {
-        let upper = self
-            .estimates
-            .partition_point(|estimate| estimate.bytes < bytes);
-        let first = self.estimates.first()?;
-        let last = self.estimates.last()?;
-        if bytes > last.bytes && last.quantiles.median <= self.fixed {
+        let estimate = self.0?;
+        if bytes > estimate.largest_bytes
+            && estimate.median.per_byte * estimate.largest_bytes as f64 <= TIMER_MICROS
+        {
             return None;
         }
-        // Share transfer-rate evidence without scaling away the learned fixed overhead.
-        let transfer = scale(last.quantiles, bytes as f64 / last.bytes as f64, self.fixed);
-        let quantiles = if upper == 0 {
-            scale(
-                first.quantiles,
-                bytes as f64 / first.bytes as f64,
-                self.fixed,
-            )
-        } else if upper == self.estimates.len() {
-            transfer
-        } else {
-            let left = self.estimates[upper - 1];
-            let right = self.estimates[upper];
-            let fraction = (bytes - left.bytes) as f64 / (right.bytes - left.bytes) as f64;
-            Quantiles {
-                median: interpolate(left.quantiles.median, right.quantiles.median, fraction),
-                p99: interpolate(left.quantiles.p99, right.quantiles.p99, fraction),
-            }
+        let duration = |micros: f64| {
+            Duration::try_from_secs_f64(micros.round() / 1_000_000.0).unwrap_or(Duration::MAX)
         };
+        let median = duration(estimate.median.micros(bytes));
         Some(Quantiles {
-            median: quantiles.median.max(transfer.median),
-            p99: quantiles.p99.max(transfer.p99),
+            median,
+            p99: duration(estimate.p99.micros(bytes)).max(median),
         })
     }
 
     pub fn largest_bytes(&self) -> Option<u64> {
-        self.estimates.last().map(|estimate| estimate.bytes)
+        self.0.map(|estimate| estimate.largest_bytes)
     }
 
     pub fn seconds_per_byte(&self) -> Option<f64> {
-        self.estimates.last().map(|estimate| {
-            estimate
-                .quantiles
-                .p99
-                .saturating_sub(TIMER_RESOLUTION)
-                .as_secs_f64()
-                / estimate.bytes as f64
-        })
+        self.0.map(|estimate| estimate.p99.per_byte / 1_000_000.0)
     }
 }
-
-fn scale(quantiles: Quantiles, factor: f64, fixed: Duration) -> Quantiles {
-    let duration = |value: Duration| {
-        fixed.saturating_add(
-            Duration::try_from_secs_f64(value.saturating_sub(fixed).as_secs_f64() * factor)
-                .unwrap_or(Duration::MAX),
-        )
-    };
-    Quantiles {
-        median: duration(quantiles.median),
-        p99: duration(quantiles.p99),
-    }
-}
-
-fn interpolate(left: Duration, right: Duration, fraction: f64) -> Duration {
-    if right >= left {
-        left.saturating_add(right.saturating_sub(left).mul_f64(fraction))
-    } else {
-        left.saturating_sub(left.saturating_sub(right).mul_f64(fraction))
-    }
-}
-
-// Adjacent sizes share observations until they can support their own median and tail.
-const MIN_GROUP_WEIGHT: f64 = 3.0;
-const MAX_GROUPS: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct Measurement {
@@ -122,109 +83,102 @@ fn quantile(values: &mut [(f64, f64)], q: f64) -> f64 {
     values.last().map_or(0.0, |value| value.0)
 }
 
-fn estimate(observations: &[Observation], fixed: f64) -> Estimate {
-    let mut sizes = observations
-        .iter()
-        .map(|sample| (sample.bytes as f64, sample.weight))
-        .collect::<Vec<_>>();
-    let bytes = quantile(&mut sizes, 0.5) as u64;
-    let mut durations = observations
+/// Fit a nonnegative intercept and slope with iteratively reweighted quantile regression.
+/// Sizes are normalized for numerical stability. The one-microsecond residual floor matches
+/// stored timing precision; the iteration limit bounds work on each cached model refresh.
+fn fit(observations: &[Observation], largest_bytes: u64, q: f64, previous: Option<Line>) -> Line {
+    let scale = largest_bytes as f64;
+    let initial = || {
+        let mut rates = observations
+            .iter()
+            .map(|sample| {
+                let size = sample.bytes as f64 / scale;
+                (
+                    (sample.micros - TIMER_MICROS).max(0.0) / size,
+                    sample.weight * size,
+                )
+            })
+            .collect::<Vec<_>>();
+        Line {
+            fixed: TIMER_MICROS,
+            per_byte: quantile(&mut rates, q) / scale,
+        }
+    };
+    let start = previous.unwrap_or_else(initial);
+    let mut fixed = start.fixed;
+    let mut transfer = start.per_byte * scale;
+    for _ in 0..32 {
+        let (mut weight, mut size, mut time, mut square, mut product) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for sample in observations {
+            let x = sample.bytes as f64 / scale;
+            let y = sample.micros.max(TIMER_MICROS);
+            let residual = y - fixed - transfer * x;
+            let w =
+                sample.weight * if residual >= 0.0 { q } else { 1.0 - q } / residual.abs().max(1.0);
+            weight += w;
+            size += w * x;
+            time += w * y;
+            square += w * x * x;
+            product += w * x * y;
+        }
+        let variance = square - size * size / weight;
+        if variance <= square * 1e-12 {
+            return initial();
+        }
+        let mut next_transfer = ((product - size * time / weight) / variance).max(0.0);
+        let mut next_fixed = (time - next_transfer * size) / weight;
+        if next_fixed < 0.0 {
+            next_fixed = 0.0;
+            next_transfer = (product / square).max(0.0);
+        }
+        let change = (next_fixed - fixed)
+            .abs()
+            .max((next_fixed + next_transfer - fixed - transfer).abs());
+        fixed = next_fixed;
+        transfer = next_transfer;
+        if change < 1.0 {
+            break;
+        }
+    }
+    // Finish the intercept exactly: bounded iterations must not leave the tail below its
+    // observed residual quantile and spend hedge credits on ordinary timing variation.
+    let mut residuals = observations
         .iter()
         .map(|sample| {
-            let factor = bytes as f64 / sample.bytes as f64;
             (
-                fixed + (sample.micros - fixed).max(0.0) * factor,
-                sample.weight / factor.max(1.0),
+                sample.micros.max(TIMER_MICROS) - transfer * (sample.bytes as f64 / scale),
+                sample.weight,
             )
         })
         .collect::<Vec<_>>();
-    let duration =
-        |micros| Duration::try_from_secs_f64(micros / 1_000_000.0).unwrap_or(Duration::MAX);
-    Estimate {
-        bytes,
-        quantiles: Quantiles {
-            median: duration(quantile(&mut durations, 0.5)),
-            p99: duration(quantile(&mut durations, 0.99)),
-        },
+    Line {
+        fixed: quantile(&mut residuals, q).max(0.0),
+        per_byte: transfer / scale,
     }
 }
 
-fn groups(observations: &[Observation]) -> Vec<std::ops::Range<usize>> {
-    let (total, largest_size_weight) = observations
-        .chunk_by(|left, right| left.bytes == right.bytes)
-        .map(|samples| samples.iter().map(|sample| sample.weight).sum::<f64>())
-        .fold((0.0, 0.0_f64), |(total, largest), weight| {
-            (total + weight, largest.max(weight))
-        });
-    // A dominant page size takes one group without raising the evidence required of rare sizes.
-    let minimum_weight =
-        ((total - largest_size_weight) / (MAX_GROUPS - 1) as f64).max(MIN_GROUP_WEIGHT);
-    let mut groups = Vec::new();
-    let mut start = 0;
-    let mut weight = 0.0;
-    for index in 0..observations.len() {
-        weight += observations[index].weight;
-        if weight >= minimum_weight
-            && observations
-                .get(index + 1)
-                .is_some_and(|next| next.bytes != observations[index].bytes)
-        {
-            groups.push(start..index + 1);
-            start = index + 1;
-            weight = 0.0;
-        }
-    }
-    if start < observations.len() {
-        if weight < minimum_weight
-            && let Some(last) = groups.last_mut()
-        {
-            last.end = observations.len();
-        } else {
-            groups.push(start..observations.len());
-        }
-    }
-    groups
-}
-
-fn fixed_cost(observations: &[Observation], groups: &[std::ops::Range<usize>]) -> f64 {
-    let center = |range: std::ops::Range<usize>| {
-        let samples = &observations[range];
-        let mut sizes = samples
+fn model(observations: &[Observation], previous: BodyModel) -> BodyModel {
+    BodyModel(
+        observations
             .iter()
-            .map(|sample| (sample.bytes as f64, sample.weight))
-            .collect::<Vec<_>>();
-        let mut times = samples
-            .iter()
-            .map(|sample| (sample.micros, sample.weight))
-            .collect::<Vec<_>>();
-        (quantile(&mut sizes, 0.5), quantile(&mut times, 0.5))
-    };
-    let centers = groups.iter().cloned().map(center).collect::<Vec<_>>();
-    match (centers.first(), centers.last()) {
-        (Some(left), Some(right)) if left.0 < right.0 => {
-            let rate = ((right.1 - left.1) / (right.0 - left.0)).max(0.0);
-            // Keep the shared fixed cost below every center after accounting for transfer time.
-            centers
-                .iter()
-                .map(|(bytes, micros)| micros - rate * bytes)
-                .fold(f64::INFINITY, f64::min)
-                .max(TIMER_MICROS)
-        }
-        _ => TIMER_MICROS,
-    }
-}
-
-fn model(mut observations: Vec<Observation>) -> BodyModel {
-    observations.sort_unstable_by_key(|sample| sample.bytes);
-    let groups = groups(&observations);
-    let fixed = fixed_cost(&observations, &groups);
-    BodyModel {
-        fixed: Duration::from_secs_f64(fixed / 1_000_000.0),
-        estimates: groups
-            .into_iter()
-            .map(|range| estimate(&observations[range], fixed))
-            .collect(),
-    }
+            .map(|sample| sample.bytes)
+            .max()
+            .map(|largest_bytes| Estimate {
+                median: fit(
+                    observations,
+                    largest_bytes,
+                    0.5,
+                    previous.0.map(|model| model.median),
+                ),
+                p99: fit(
+                    observations,
+                    largest_bytes,
+                    0.99,
+                    previous.0.map(|model| model.p99),
+                ),
+                largest_bytes,
+            }),
+    )
 }
 
 #[derive(Debug)]
@@ -244,8 +198,7 @@ impl Band {
     }
 }
 
-/// Size-stratified sampling preserves rare transfers; adjacent sizes pool their evidence when
-/// building the model, rather than treating every populated reservoir as an independent estimate.
+/// Size-stratified retention keeps rare transfers available to one continuous model.
 #[derive(Debug, Default)]
 pub(super) struct BodyHistogram {
     bands: BTreeMap<u64, Band>,
@@ -306,7 +259,7 @@ impl BodyHistogram {
                 if retained_weight == 0.0 {
                     continue;
                 }
-                // Sampling must not give busy and infrequent size bands equal influence.
+                // Restore each stratum's observation mass after reservoir sampling.
                 let correction = band.weight_at(now) / retained_weight;
                 observations.extend(snapshot.exemplars().map(|(micros, sample)| Observation {
                     bytes: sample.bytes,
@@ -314,9 +267,9 @@ impl BodyHistogram {
                     weight: weight(sample.at) * correction,
                 }));
             }
-            self.model = model(observations);
+            self.model = model(&observations, self.model);
         }
-        self.model.clone()
+        self.model
     }
 }
 #[cfg(test)]
@@ -330,12 +283,10 @@ mod tests {
     use crate::object_store::stats::Sample;
 
     #[tokio::test(start_paused = true)]
-    async fn interpolation_retains_fixed_overhead_and_is_continuous() {
+    async fn two_sizes_identify_fixed_overhead_and_transfer_cost() {
         let mut histogram = BodyHistogram::default();
-        for (bytes, body_ms) in [(MIB, 30), (4 * MIB, 60), (16 * MIB, 180)] {
-            for _ in 0..4 {
-                histogram.update(Instant::now(), &Sample::from_millis(10, bytes, body_ms));
-            }
+        for (bytes, body_ms) in [(MIB, 30), (16 * MIB, 180)] {
+            histogram.update(Instant::now(), &Sample::from_millis(10, bytes, body_ms));
         }
         let model = histogram.summary(false);
         for bytes in [
@@ -348,12 +299,14 @@ mod tests {
             16 * MIB,
         ] {
             let expected = Duration::from_secs_f64(0.020 + 0.010 * bytes as f64 / MIB as f64);
-            assert_eq!(model.predict(bytes).unwrap().p99, expected);
+            let quantiles = model.predict(bytes).unwrap();
+            assert!(quantiles.median.abs_diff(expected) <= Duration::from_micros(1));
+            assert!(quantiles.p99.abs_diff(expected) <= Duration::from_micros(1));
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn buffered_history_does_not_invent_throughput_after_timed_samples_are_outnumbered() {
+    async fn tiny_buffered_reads_do_not_erase_a_measured_transfer() {
         let mut histogram = BodyHistogram::default();
         histogram.update(Instant::now(), &Sample::from_millis(10, 4 * MIB, 41));
         for _ in 0..5000 {
@@ -361,14 +314,11 @@ mod tests {
         }
         let model = histogram.summary(true);
         assert_eq!(model.predict(1024).unwrap().p99, TIMER_RESOLUTION);
-        assert!(model.predict(4 * MIB).is_none());
-        for _ in 0..4 {
-            histogram.update(Instant::now(), &Sample::from_millis(10, 4 * MIB, 41));
-        }
         assert_eq!(
-            histogram.summary(true).predict(4 * MIB).unwrap().median,
+            model.predict(4 * MIB).unwrap().median,
             Duration::from_millis(41)
         );
+        assert!(model.predict(16 * MIB).unwrap().p99 <= Duration::from_millis(162));
     }
 
     #[tokio::test(start_paused = true)]
@@ -478,8 +428,9 @@ mod tests {
             Duration::from_millis(11)
         );
         assert!(model.predict(MIB).unwrap().hedge_delay() <= Duration::from_micros(16_500));
-        assert!(model.predict(16 * MIB).unwrap().hedge_delay() <= Duration::from_micros(241_500));
-        advance(Duration::from_secs(120)).await;
+        // With a nonnegative intercept, extrapolation grows no faster than response size.
+        assert!(model.predict(16 * MIB).unwrap().hedge_delay() <= Duration::from_millis(265));
+        advance(Duration::from_secs(180)).await;
         for _ in 0..4 {
             histogram.update(Instant::now(), &Sample::from_millis(10, MIB, 11));
         }

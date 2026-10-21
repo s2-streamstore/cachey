@@ -29,28 +29,31 @@ completed stalls do not set future hedge delays. Health classification and retry
 feasibility use uncapped predictions; changing the hedge policy does not change
 those decisions.
 
-Latency history is shared across objects and callers within each bucket. Body
-observations are retained in power-of-two size bands so tiny reads cannot evict
-rare transfers. Estimation pools neighboring sizes, using their decayed observation
-counts rather than giving every populated band independent authority. Each group
-needs the weight of three recent observations; a sparse remainder joins its
-neighbor. The whole model starts with one pooled group when history is shorter.
+Latency history is shared across objects and callers within each bucket. Body time
+uses two continuous lines, one for the median and one for p99:
 
-Up to 16 groups describe the curve. Supported groups teach a shared fixed body
-cost, with a 1 ms timer allowance until that cost can be distinguished from transfer
-time. Their median and p99 transfer estimates interpolate with response size. The
-largest group also supplies transfer-rate evidence for smaller sizes. Tiny
-observations receive less weight when scaled up within a group, preventing their
-timer noise from dominating large-transfer estimates.
+```text
+body time = fixed cost + response bytes × transfer cost per byte
+```
 
-Snapshots refresh once per second and when the observation count doubles. This
-lets early reads improve the model without rebuilding it on every completion.
+Both coefficients are nonnegative. Quantile regression fits the lines directly to
+recent body durations, so fixed overhead is learned rather than assumed to scale
+with bytes. A small read's delay does not become a multiplier on every larger read.
+Predictions have a 1 ms timing floor, and the tail never falls below the median.
 
-Outside the curve, predictions scale transfer time while preserving fixed overhead.
-A flat or buffered-only history cannot establish throughput beyond the largest
-representative size. Sparse history can still cause startup hedges; deadline rescue
-remains available when an early hedge has no estimate. Three observations prevent
-an isolated size from controlling the curve; they do not establish a precise p99.
+Power-of-two sampling strata preserve rare transfers when tiny reads are frequent.
+Their observations train the same two lines; there are no independent size-band
+estimates or adaptive groups. Decayed observation counts restore each stratum's
+weight after reservoir sampling. Snapshot refreshes run once per second and when
+the observation count doubles, with at most 32 fitting iterations per line. Each
+reader keeps a constant-size snapshot.
+
+With only one observed size, fixed overhead and transfer cost cannot be separated;
+the fit starts with a 1 ms allowance and learns time per byte. Diverse sizes let it
+learn the fixed cost too. A flat or buffered-only median cannot establish throughput
+beyond the largest retained size. Deadline rescue remains available when an early
+hedge has no estimate. Sparse samples do not establish a precise p99, and the model
+assumes body time is approximately affine in size within each bucket.
 
 ## Deadlines and hedging
 
@@ -102,8 +105,8 @@ contacting a backend.
 |-------------|---------|
 | `cachey_bucket_latency_{mean,p99}_seconds` | Request start through validated body, including SDK retries |
 | `cachey_bucket_first_byte_{mean,p99}_seconds` | Request start through successful headers |
-| `cachey_bucket_body_model_bytes` | Representative response size of the largest pooled body estimate |
-| `cachey_bucket_body_seconds_per_byte` | Uncapped p99 body time per byte beyond 1 ms at that size; smaller sizes have separate estimates |
+| `cachey_bucket_body_model_bytes` | Largest response size retained by the body model |
+| `cachey_bucket_body_seconds_per_byte` | Transfer slope of the uncapped p99 body-time model, excluding its learned fixed cost |
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |

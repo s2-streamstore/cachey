@@ -41,10 +41,9 @@ pub struct BucketMetrics {
     /// retries.
     pub first_byte_mean: Option<Duration>,
     pub first_byte_p99: Option<Duration>,
-    /// Representative response size of the largest pooled body estimate.
+    /// Largest response size retained by the body model.
     pub body_model_bytes: Option<u64>,
-    /// Uncapped p99 body time per byte beyond a 1 ms timer allowance at `body_model_bytes`.
-    /// Smaller responses have their own estimates, including their fixed transfer overhead.
+    /// Transfer slope of the uncapped p99 body-time model, excluding its learned fixed cost.
     pub body_seconds_per_byte: Option<f64>,
 }
 
@@ -1038,8 +1037,8 @@ mod tests {
         }
         let model = stats.model(&bucket);
         assert_eq!(model.body_tail(16 * MIB), Some(Duration::from_millis(161)));
-        assert!(model.body_tail(3 * MIB / 2).unwrap() <= Duration::from_millis(20));
-        assert!(model.body_tail(4096).unwrap() <= Duration::from_millis(5));
+        assert!(model.body_tail(3 * MIB / 2).unwrap() <= Duration::from_millis(33));
+        assert!(model.body_tail(4096).unwrap() <= Duration::from_millis(20));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1172,7 +1171,13 @@ mod tests {
         }
         advance(LATENCY_SNAPSHOT_INTERVAL).await;
         let model = stats.model(&bucket);
-        assert_eq!(model.body_tail(16 * MIB), Some(Duration::from_millis(1001)));
+        assert!(
+            model
+                .body_tail(16 * MIB)
+                .unwrap()
+                .abs_diff(Duration::from_millis(1001))
+                <= Duration::from_millis(1)
+        );
         assert_eq!(model.tail(), Some(Duration::from_millis(271)));
     }
 
