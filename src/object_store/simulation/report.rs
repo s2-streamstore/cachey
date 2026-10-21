@@ -21,8 +21,7 @@ pub struct Copy {
 pub struct Estimates {
     latency_p99_us: Option<u64>,
     first_byte_p99_us: Option<u64>,
-    small_body_p99_us: Option<u64>,
-    large_body_throughput_p1_bytes_per_second: Option<u64>,
+    body_seconds_per_byte: Option<f64>,
 }
 
 impl From<&BucketMetrics> for Estimates {
@@ -32,10 +31,7 @@ impl From<&BucketMetrics> for Estimates {
         Self {
             latency_p99_us: micros(metrics.latency_p99),
             first_byte_p99_us: micros(metrics.first_byte_p99),
-            small_body_p99_us: micros(metrics.small_body_p99),
-            large_body_throughput_p1_bytes_per_second: metrics
-                .large_body_throughput_p1
-                .map(|throughput| throughput as u64),
+            body_seconds_per_byte: metrics.body_seconds_per_byte,
         }
     }
 }
@@ -45,12 +41,11 @@ impl Estimates {
         Self {
             latency_p99_us: self.latency_p99_us.max(other.latency_p99_us),
             first_byte_p99_us: self.first_byte_p99_us.max(other.first_byte_p99_us),
-            small_body_p99_us: self.small_body_p99_us.max(other.small_body_p99_us),
-            large_body_throughput_p1_bytes_per_second: self
-                .large_body_throughput_p1_bytes_per_second
+            body_seconds_per_byte: self
+                .body_seconds_per_byte
                 .into_iter()
-                .chain(other.large_body_throughput_p1_bytes_per_second)
-                .min(),
+                .chain(other.body_seconds_per_byte)
+                .max_by(f64::total_cmp),
         }
     }
 }
@@ -161,8 +156,8 @@ pub struct Report {
     wins_by_replica: Vec<usize>,
     /// Each bucket's estimates after the last read completed.
     final_estimates: Vec<Estimates>,
-    /// Each bucket's slowest estimates observed after any read: highest durations, lowest
-    /// throughput.
+    /// Each bucket's slowest estimates observed after any read: highest durations and transfer
+    /// slope.
     slowest_estimates: Vec<Estimates>,
     pub recoveries: Vec<Recovery>,
     #[serde(skip_serializing_if = "Option::is_none")]

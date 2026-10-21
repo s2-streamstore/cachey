@@ -25,7 +25,7 @@ CACHEY_SIM_OUTPUT=/tmp/cachey-simulation.json \
 | `CACHEY_SIM_SEEDS` | Comma-separated seeds; default `7,42,2026` |
 | `CACHEY_SIM_RATE_MULTIPLIERS` | Comma-separated positive integers; default `1`. Divides arrival spacing, truncated to milliseconds; spacing must remain positive. |
 | `CACHEY_SIM_REQUEST_LIMIT` | Override global active-copy limit |
-| `CACHEY_SIM_NATIVE_RESERVOIR` | `1` uses the production 1,028-sample reservoir |
+| `CACHEY_SIM_NATIVE_RESERVOIR` | `1` uses production 1,028-sample request and first-byte reservoirs |
 | `CACHEY_SIM_TRACE` | `1` includes every read, admitted copy, and wire attempt |
 
 [Fixtures](../../tests/scenarios/replica_reads.json) inherit omitted fields from
@@ -51,9 +51,12 @@ of varied sizes do. A replica's `body_ms_per_mib` adds body time in proportion t
 response length, so mixed lengths exercise the size-aware body tails.
 
 Seeds control faults, latency jitter, and recovery probes. SDK retries use the real
-classifier and quota with deterministic backoff. The default histogram reservoir
-retains all observations, but its priorities remain unseeded. Production-reservoir
-comparisons are statistical; repeat runs when investigating small differences.
+classifier and quota with deterministic backoff. By default the request and first-byte
+histogram reservoirs retain all observations, but their priorities remain unseeded.
+The retention counts in reports cover these two reservoirs. The byte-weighted body
+histogram always uses production aggregation and decay; it has no reservoir.
+Production-reservoir comparisons are statistical; repeat runs when investigating small
+differences.
 
 ## Fixtures
 
@@ -98,7 +101,8 @@ occupied slot time; post-read work is the portion after the originating read fin
 Recovery timestamps are sampled when reads complete. Fixtures with short bodies also
 report successful latency for full and short responses. Each bucket's exported latency
 estimates are sampled after every read; reports give the final values and the slowest
-seen (highest p99 durations, lowest throughput), which show how far stalls moved them.
+seen (highest p99 durations and body transfer slope), which show how far stalls moved
+them.
 
 The model omits connection setup, network contention, and interactions among cachey
 instances. Millisecond timing and prescribed service distributions limit conclusions

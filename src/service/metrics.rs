@@ -18,7 +18,7 @@ fn seconds(duration: Option<Duration>) -> Option<f64> {
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     type BucketGauge = (GaugeVec, fn(&BucketMetrics) -> Option<f64>);
 
-    static GAUGES: LazyLock<[BucketGauge; 9]> = LazyLock::new(|| {
+    static GAUGES: LazyLock<[BucketGauge; 8]> = LazyLock::new(|| {
         let gauge = |name: &str, help: &str| register_gauge_vec!(name, help, &["bucket"]).unwrap();
         [
             (
@@ -58,17 +58,10 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
             ),
             (
                 gauge(
-                    "cachey_bucket_small_body_p99_seconds",
-                    "p99 time to read a response body under 1 MiB after its headers",
+                    "cachey_bucket_body_seconds_per_byte",
+                    "Uncapped byte-weighted p99 transfer time per byte, measured beyond a 1 ms scheduling allowance",
                 ),
-                |metrics| seconds(metrics.small_body_p99),
-            ),
-            (
-                gauge(
-                    "cachey_bucket_large_body_throughput_p1_bytes_per_second",
-                    "Throughput after headers that 99% of response bodies of at least 1 MiB exceed",
-                ),
-                |metrics| metrics.large_body_throughput_p1,
+                |metrics| metrics.body_seconds_per_byte,
             ),
             (
                 gauge(

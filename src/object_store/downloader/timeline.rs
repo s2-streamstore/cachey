@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::OnceLock, time::Duration};
 
 use tokio::{
     select,
@@ -20,15 +14,11 @@ struct Headers {
     body_bytes: u64,
 }
 
-/// When a backend request started, when response headers with a validated range arrived with the
-/// announced body length, and when an early hedge against it first came due and whether one
-/// started.
+/// A backend request's start and validated response headers, including the announced body length.
 #[derive(Debug, Default)]
 pub(super) struct RequestTimeline {
     started: OnceLock<Instant>,
     headers: OnceLock<Headers>,
-    hedge_due: OnceLock<Instant>,
-    hedge_started: AtomicBool,
     changed: Notify,
 }
 
@@ -55,24 +45,10 @@ impl RequestTimeline {
         self.headers.get().map(|headers| headers.body_bytes)
     }
 
-    /// Measurements of a request whose body has just been read in full. A request whose hedge came
-    /// due but never started is left unmeasured, like one a hedge superseded, if it outlasted the
-    /// time such a hedge would have taken at the bucket's tails, so stalls left unhedged cannot
-    /// raise the tails and delay later hedges.
-    pub fn sample(&self, model: &LatencyModel) -> Option<Sample> {
+    pub fn sample(&self) -> Option<Sample> {
         let started = *self.started.get()?;
         let headers = self.headers.get()?;
         let now = Instant::now();
-        if let Some(due) = self.hedge_due.get()
-            && !self.hedge_started.load(Ordering::Relaxed)
-            && model
-                .first_byte_tail()
-                .zip(model.body_tail(headers.body_bytes))
-                .and_then(|(first_byte, body)| due.checked_add(first_byte.saturating_add(body)))
-                .is_some_and(|hedge_finish| now > hedge_finish)
-        {
-            return None;
-        }
         Some(Sample {
             first_byte: headers.at.saturating_duration_since(started),
             body_bytes: headers.body_bytes,
@@ -118,12 +94,11 @@ enum Phase {
     Body,
 }
 
-/// Times a page's early hedge against its primary request in two phases: the p99 time to first
-/// byte after the request starts, then, once headers announce the body length, when the body has
-/// taken longer than both its p99 time and the p99 time to first byte. Each phase is due at most
-/// once, so a hedge that cannot start before headers may still start during the body. A phase whose
-/// tail is zero, or a body in a size class the bucket has not served, is not hedged early. No hedge
-/// is due once the primary's bucket deadline or the page deadline has passed.
+/// Times a page's early hedge against its primary request in two phases: the first-byte hedge
+/// delay after the request starts, then the body hedge delay predicted for its announced length.
+/// Each phase is due at most once, so a hedge that cannot start before headers may still start
+/// during the body. An unmeasured phase or a zero first-byte tail is not hedged early. No hedge is
+/// due once the primary's bucket deadline or the page deadline has passed.
 pub(super) struct HedgeTimer<'a> {
     model: LatencyModel,
     primary: &'a RequestTimeline,
@@ -150,22 +125,11 @@ impl<'a> HedgeTimer<'a> {
         self.next = None;
     }
 
-    /// Records that a hedge started against the primary, which ends hedging.
-    pub fn start_hedge(&mut self) {
-        self.primary.hedge_started.store(true, Ordering::Relaxed);
-        self.disarm();
-    }
-
     fn due_at(&self, headers: Option<&Headers>) -> Option<Instant> {
         let next = self.next?;
         let first_byte_tail = self.model.first_byte_tail()?;
         let (since, tail) = match (next, headers) {
-            (_, Some(headers)) => (
-                headers.at,
-                self.model
-                    .body_tail(headers.body_bytes)?
-                    .max(first_byte_tail),
-            ),
+            (_, Some(headers)) => (headers.at, self.model.body_tail(headers.body_bytes)?),
             (Phase::FirstByte, None) => (*self.primary.started.get()?, first_byte_tail),
             (Phase::Body, None) => return None,
         };
@@ -176,7 +140,7 @@ impl<'a> HedgeTimer<'a> {
         (at < self.deadline.current()).then_some(at)
     }
 
-    /// Completes when a hedge is due, recording the first time one is, or never if none can be.
+    /// Completes when a hedge is due, or never if none can be.
     /// The primary's timeline stops changing once its headers arrive, so from then on only the
     /// timer is polled. Timers fire on the next tick, so one that fires at or past the deadline
     /// ends hedging.
@@ -205,7 +169,6 @@ impl<'a> HedgeTimer<'a> {
                         self.next = None;
                         return std::future::pending().await;
                     }
-                    _ = primary.hedge_due.set(now);
                     self.next = (!settled).then_some(Phase::Body);
                     return;
                 }
@@ -283,7 +246,7 @@ mod tests {
         assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
         sleep(Duration::from_millis(10)).await;
         timeline.receive_headers(4096);
-        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(20)));
+        assert_eq!(due_after(&mut timer).await, Some(Duration::from_millis(3)));
         assert_eq!(due_after(&mut timer).await, None);
     }
 
@@ -332,12 +295,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn bodies_are_hedged_by_their_announced_size_class() {
+    async fn body_hedging_waits_for_transfer_evidence_then_scales_with_length() {
         for (large_body_ms, expected) in
-            [(None, None), (Some(250), Some(Duration::from_millis(1000)))]
+            [(None, None), (Some(251), Some(Duration::from_millis(1001)))]
         {
             let model = match large_body_ms {
-                None => model(20, 4096, 3),
+                None => model(20, 4096, 1),
                 Some(body_ms) => model(20, 4 * MIB, body_ms),
             };
             let timeline = RequestTimeline::default();

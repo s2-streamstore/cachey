@@ -130,6 +130,12 @@ impl Drop for InFlightCopy<'_> {
     }
 }
 
+#[derive(Default)]
+struct BucketProgress {
+    deadline: OnceLock<Instant>,
+    first_copy: RequestTimeline,
+}
+
 struct ReplicaRequest<'a> {
     downloader: &'a Downloader,
     buckets: &'a BucketNameSet,
@@ -137,57 +143,54 @@ struct ReplicaRequest<'a> {
     range: &'a Range<u64>,
     config: &'a RequestConfig,
     page_deadline: Instant,
-    /// Each bucket's deadline, shared by its copies once the first is admitted.
-    bucket_deadlines: Vec<OnceLock<Instant>>,
+    primary: usize,
+    progress: Vec<BucketProgress>,
     copies_in_flight: AtomicUsize,
     /// Whether a copy started while another was in flight.
     hedged: AtomicBool,
 }
 
-struct CopyAttempt<'a> {
+struct CopyAttempt {
     index: usize,
     model: LatencyModel,
-    /// The primary's timeline, which the hedge timer follows; other copies keep their own.
-    primary_timeline: Option<&'a RequestTimeline>,
+    first_for_bucket: bool,
     probe: Option<ProbePermit>,
     permits: Option<AttemptPermits>,
 }
 
 impl ReplicaRequest<'_> {
     fn bucket_deadline(&self, index: usize) -> BucketDeadline<'_> {
-        BucketDeadline::new(self.page_deadline, &self.bucket_deadlines[index])
+        BucketDeadline::new(self.page_deadline, &self.progress[index].deadline)
     }
 
     fn unknown_latency(&self) -> Duration {
         self.downloader.limits.page_timeout / u32::try_from(self.buckets.len()).unwrap_or(u32::MAX)
     }
 
-    fn output(
-        &self,
-        piece: ObjectPiece,
-        primary: usize,
-        used: usize,
-        start: Instant,
-    ) -> DownloadOutput {
+    fn output(&self, piece: ObjectPiece, used: usize, start: Instant) -> DownloadOutput {
         DownloadOutput {
             piece,
-            primary_bucket_idx: primary,
+            primary_bucket_idx: self.primary,
             used_bucket_idx: used,
             latency: start.elapsed(),
             hedged: self.hedged.load(Ordering::Relaxed),
         }
     }
 
-    async fn attempt(&self, copy: CopyAttempt<'_>) -> Completion {
+    async fn attempt(&self, copy: CopyAttempt) -> Completion {
         let CopyAttempt {
             index,
             model,
-            primary_timeline,
+            first_for_bucket,
             probe,
             permits,
         } = copy;
         let own_timeline = RequestTimeline::default();
-        let timeline = primary_timeline.unwrap_or(&own_timeline);
+        let timeline = if first_for_bucket {
+            &self.progress[index].first_copy
+        } else {
+            &own_timeline
+        };
         let (hedge, admission) = match permits {
             Some(permits) => (permits.hedge, Some(permits.admission)),
             None => (None, None),
@@ -219,7 +222,7 @@ impl ReplicaRequest<'_> {
         .await;
         Completion {
             index,
-            is_primary: primary_timeline.is_some(),
+            is_primary: first_for_bucket && index == self.primary,
             result,
         }
     }
@@ -251,7 +254,6 @@ enum Trigger {
 struct Followups<'a> {
     request: &'a ReplicaRequest<'a>,
     bytes: u64,
-    primary: usize,
     /// Buckets given a copy.
     tried: Vec<bool>,
     in_flight: Vec<usize>,
@@ -264,7 +266,7 @@ struct Followups<'a> {
     backup_admission: Option<DownloadPermit>,
 }
 
-impl<'a> Followups<'a> {
+impl Followups<'_> {
     /// Whether a copy to an unsettled bucket is in flight.
     fn awaiting(&self) -> bool {
         self.in_flight
@@ -290,25 +292,25 @@ impl<'a> Followups<'a> {
         self.errors.into_error(self.retry_budget_exhausted)
     }
 
-    /// Whether a later copy to the bucket would have more than its p99 request latency before
-    /// the bucket's deadline. A bucket without an admitted copy has no deadline yet.
+    /// Later copies need time for a fresh request, using the first copy's announced length once
+    /// known. A bucket without an admitted copy has no deadline yet.
     fn has_time(&self, routing: &RoutingSnapshot, index: usize, now: Instant) -> bool {
-        self.request
-            .bucket_deadline(index)
-            .admitted()
-            .is_none_or(|deadline| {
-                deadline.saturating_duration_since(now)
-                    > routing.model(index).tail().unwrap_or_default()
-            })
+        let progress = &self.request.progress[index];
+        progress.deadline.get().is_none_or(|deadline| {
+            let expected = routing
+                .model(index)
+                .request_tail(progress.first_copy.announced_body_bytes())
+                .unwrap_or_default();
+            deadline.saturating_duration_since(now) > expected
+        })
     }
 
     /// The copy to start for `trigger`, if any. A fallback goes to an untried bucket, or else
     /// retries a failed body once per read when no copy is awaited, against the best bucket
     /// whose body failed that still has time; the retry, like any copy while every bucket
     /// reports overload, draws on the retry budget. An early hedge skips a bucket reporting
-    /// overload. A later copy to a bucket starts only while more than the bucket's p99 request
-    /// latency remains before its deadline.
-    fn next(&mut self, trigger: Trigger, hedge: &mut HedgeTimer<'_>) -> Option<CopyAttempt<'a>> {
+    /// overload. Later copies must have time to finish before their bucket's deadline.
+    fn next(&mut self, trigger: Trigger, hedge: &mut HedgeTimer<'_>) -> Option<CopyAttempt> {
         if let Trigger::Rescue(index) = trigger
             && self.tried[index]
         {
@@ -324,7 +326,9 @@ impl<'a> Followups<'a> {
         let routing = downloader.bucketed_stats.snapshot(self.request.buckets);
         let index = match trigger {
             Trigger::Rescue(index) => index,
-            Trigger::Hedge => routing.best(&self.tried, remaining).unwrap_or(self.primary),
+            Trigger::Hedge => routing
+                .best(&self.tried, remaining)
+                .unwrap_or(self.request.primary),
             Trigger::Fallback => routing.best(&self.tried, remaining).or_else(|| {
                 if self.retried || self.awaiting() {
                     return None;
@@ -355,7 +359,7 @@ impl<'a> Followups<'a> {
             let budget = downloader
                 .attempt_budget
                 .try_hedge(&self.request.buckets[index])?;
-            hedge.start_hedge();
+            hedge.disarm();
             Some(AttemptPermits {
                 hedge: Some(budget),
                 admission,
@@ -368,11 +372,12 @@ impl<'a> Followups<'a> {
                     admission,
                 })
         };
+        let first_for_bucket = !self.tried[index];
         self.started(index);
         Some(CopyAttempt {
             index,
             model,
-            primary_timeline: None,
+            first_for_bucket,
             probe: None,
             permits,
         })
@@ -395,18 +400,6 @@ impl Downloader {
         deadline: Instant,
     ) -> Result<DownloadOutput, DownloadError> {
         let bytes = range.end - range.start;
-        let request = ReplicaRequest {
-            downloader: self,
-            buckets,
-            object,
-            range,
-            config,
-            page_deadline: deadline,
-            bucket_deadlines: vec![OnceLock::new(); buckets.len()],
-            copies_in_flight: AtomicUsize::new(0),
-            hedged: AtomicBool::new(false),
-        };
-        let primary_timeline = RequestTimeline::default();
         let routing = self.bucketed_stats.snapshot(buckets);
         let PrimaryAttempt {
             index: primary,
@@ -418,12 +411,25 @@ impl Downloader {
             deadline.saturating_duration_since(Instant::now()),
             &routing,
         );
+        let request = ReplicaRequest {
+            downloader: self,
+            buckets,
+            object,
+            range,
+            config,
+            page_deadline: deadline,
+            primary,
+            progress: (0..buckets.len())
+                .map(|_| BucketProgress::default())
+                .collect(),
+            copies_in_flight: AtomicUsize::new(0),
+            hedged: AtomicBool::new(false),
+        };
         let primary_model = routing.model(primary);
         let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
         let mut followups = Followups {
             request: &request,
             bytes,
-            primary,
             tried: vec![false; buckets.len()],
             in_flight: vec![0; buckets.len()],
             errors: FallbackErrors::default(),
@@ -435,7 +441,7 @@ impl Downloader {
         followups.started(primary);
         let mut hedge = HedgeTimer::new(
             primary_model,
-            &primary_timeline,
+            &request.progress[primary].first_copy,
             request.bucket_deadline(primary),
             self.limits.hedge_budget_percent > 0 && probe.is_none(),
         );
@@ -443,7 +449,7 @@ impl Downloader {
         active.push(request.attempt(CopyAttempt {
             index: primary,
             model: primary_model,
-            primary_timeline: Some(&primary_timeline),
+            first_for_bucket: true,
             probe,
             permits: primary_permits,
         }));
@@ -452,7 +458,7 @@ impl Downloader {
                 biased;
                 Some(Completion { index, is_primary, result }) = active.next() => {
                     let error = match result {
-                        Ok(piece) => return Ok(request.output(piece, primary, index, start)),
+                        Ok(piece) => return Ok(request.output(piece, index, start)),
                         Err(error) => error,
                     };
                     if !error.should_attempt_fallback_bucket() {

@@ -22,23 +22,39 @@ including SDK retries, and body time after headers. Decisions made before header
 arrive—selection, rescue reservations, and stall detection—use complete request latency
 across the lengths a bucket actually served. Hedges and timeouts use the phases.
 
-Body time is modeled in two size classes. Bodies under 1 MiB are modeled by their
-duration, which per-request overhead and stalls can dominate, and longer bodies by their
-time per MiB, since transfer time dominates them. The body tail for an announced length
-is the p99 duration of small bodies, or the p99 time per MiB of large bodies scaled to
-that length, so a stall in a small body never scales up a large transfer. A bucket has no
-body tail for a size class it has not served. A fixed delay after headers raises the
-time per MiB of the shortest large bodies most, so it makes the tail of longer ones
-conservative.
+Body time uses one continuous model per bucket:
 
-Tails are nearest-rank p99s of samples decayed with a 5-second half-life, so a
-long-decayed sample cannot set them. Copies a hedge superseded are left out, and so are
-primaries whose hedge came due but did not start, for any reason, that outlasted the
-time such a hedge would have taken at the bucket's tails. Stalls therefore keep being
-hedged instead of raising the hedge delay to their own duration. A bucket that slows as
-a whole still teaches its tails through primaries that finish within that time and
-races they win against their hedges. A successful recovery probe starts the bucket's
-latency model over from its measurements, as for a bucket never measured.
+```
+predicted_time(q, bytes) = 1 ms + bytes × transfer_slope(q)
+body_tail(bytes) = min(predicted_time(p99, bytes), 1.5 × predicted_time(p50, bytes))
+```
+
+The 1 ms allowance covers timer granularity and scheduling after headers. Bodies
+long enough to time teach `(body_time − 1 ms) / body_bytes`, weighted by their bytes
+and decayed with a 5-second half-life. All sizes share the same histogram; there is no
+size boundary. The median bound limits isolated stalls without discarding their
+measurements. Sustained changes move both quantiles. First-byte timing stays at p99,
+since it includes server work that can legitimately vary with response length.
+
+Bodies completed within the allowance cannot establish a transfer rate. They contribute
+`1 ms / body_bytes` as a conservative upper bound to the median, but do not enter the
+p99 transfer-rate distribution. Thus many tiny buffered reads cannot drown a rare
+measurable transfer or imply infinite throughput. Until any transfer is measured,
+only lengths up to the largest buffered body observed get the 1 ms allowance; larger
+bodies remain unmeasured. Empty bodies teach neither a rate nor a bound.
+
+A sparse histogram combines nearby rates, preserving byte weights instead of sampling
+requests. Each bin uses its slowest rate, so aggregation can raise a quantile by less
+than 0.8%. Storage is bounded by rate range and precision, not request count. Estimates
+refresh at most once per second after the first measurement. Bytes determine influence,
+not a count of independent samples or a guarantee about request completion percentiles.
+
+Every validated completion teaches the model, including a slow primary whose hedge
+was denied by the budget, admission, or overload. Cancellation leaves no complete
+sample. This lets a sustained slowdown change the estimates even without spare
+capacity. A successful recovery probe starts the bucket's history over from its
+measurements. Sparse histories remain conservative: a lone measurable slow transfer
+can set the prediction until there is more evidence.
 
 A backend `InvalidRange` (HTTP 416) response also permits fallback: an empty or
 shorter copy in one bucket does not establish the object size in another. If no
@@ -48,12 +64,13 @@ Empty or reversed request ranges are rejected before contacting any bucket.
 A single backend failure immediately deprioritizes a bucket, favoring prompt failover
 at the cost of extra cross-zone reads after isolated errors. Missing objects, invalid
 or unsatisfied ranges, cancellation, and admission failures do not affect health.
-Timeouts count against health only when the copy had at least the bucket's complete
-request tail and the tails of the phases it reached: response headers, then a body of
-the announced length. The complete request tail keeps a caller timeout shorter than a
-typical request from counting against the bucket. A phase the bucket has not measured,
-including a body in a size class it has not served, is allowed half the copy's share of
-the page deadline, capped at half the bucket deadline. The error fraction decays, but
+Timeouts count against health only after the copy had time for a normal request.
+Before headers, the complete request p99 is the floor, since the response length is
+unknown. Once headers announce a measured body length, the allowance is the first-byte
+p99 plus the bounded body prediction for that length. Large historical reads therefore
+do not prevent a small stalled body from counting as a timeout. An unmeasured phase gets
+half the copy's share of the page deadline, capped at half the bucket deadline, and
+keeps the complete request p99 as a floor. The error fraction decays, but
 restoring normal preference requires 20 successful operations started after the latest
 failure. After 24–36 seconds, a previously competitive bucket—or one that failed before
 its first successful read—can receive an exclusive recovery probe, with admission
@@ -69,19 +86,21 @@ errors and rescue timers start untried replicas; timers reserve execution time f
 alternatives, including unmeasured buckets. Reads try each bucket at most once at the
 downloader layer, apart from an early hedge against the primary's bucket once every
 other bucket has a copy and one retry of a failed body, with up to three copies active
-per page. Such a later copy to a bucket starts only while more than the bucket's p99
-request latency remains before its deadline. The first validated result wins and
-cancels the others.
+per page. A later copy to a bucket needs enough time for a fresh request before its
+shared deadline: first-byte p99 plus body prediction at that bucket's announced length,
+or complete request p99 while that prediction is unknown. Each bucket keeps its own
+length, since replicas can disagree. The first validated result wins and cancels the
+others.
 
 Early hedges use one SDK attempt, against another bucket when available or the
 primary's bucket otherwise, and never against a bucket that recently reported overload.
 They start only before the primary's bucket deadline. A hedge is timed in two phases.
 Before headers arrive, it starts at the p99 time to first byte after the primary
 request starts, excluding admission wait. Once headers announce the body length, it
-starts when the body has taken longer than both its body tail and the p99 time to first
-byte. A phase whose tail is zero, or a body in a size class the bucket has not served,
-is not hedged early. Each phase is one opportunity, so a hedge that cannot start before
-headers may still start during the body.
+starts at the bounded body prediction after headers. The first-byte delay is not paid
+again. A zero first-byte tail or an unmeasured body is not hedged early. Each phase is one
+opportunity, so a hedge that cannot start before headers may still start during the
+body.
 
 A single-bucket read hedges against its own bucket under the same rules. Each copy
 records its own health outcome, so throttling or a failure in one copy counts even when
@@ -143,16 +162,16 @@ an authoritative size or replica agreement.
 |-------------|---------|
 | `cachey_bucket_latency_{mean,p99}_seconds` | Time from starting a request to its validated body, including SDK retries; absent until measured |
 | `cachey_bucket_first_byte_{mean,p99}_seconds` | Time from starting a request to successful response headers, including SDK retries; absent until measured |
-| `cachey_bucket_small_body_p99_seconds` | Time to read a body under 1 MiB after its headers; absent until measured |
-| `cachey_bucket_large_body_throughput_p1_bytes_per_second` | Throughput after headers that 99% of bodies of at least 1 MiB exceed; absent until measured or while those bodies arrive too fast to time |
+| `cachey_bucket_body_seconds_per_byte` | Uncapped byte-weighted p99 transfer slope of timed bodies after subtracting the 1 ms allowance; absent until a nonempty body is measured; zero does not establish throughput for larger bodies |
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |
 | `cachey_first_chunk_latency_seconds` | Handler time to first available chunk, including cache lookup and coalescing |
 
 Bucket latency gauges describe the [latency model](#latency-model): samples come from
-each validated backend request, including hedges, except the copies it leaves out.
-Those copies, in-flight stalls, and canceled reads can still raise routing latency.
+each validated backend request, including hedges. The body gauge reports the uncapped
+p99 rate of measurable transfers; buffered-only history reports zero. In-flight stalls
+and canceled reads can also raise routing latency.
 Page latency counts every successful page, and for a hedge win is timed from the
 original primary start. Latency histograms exclude client
 body transmission.

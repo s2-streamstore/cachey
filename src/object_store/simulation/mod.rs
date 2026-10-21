@@ -409,9 +409,9 @@ async fn assert_stalls_are_rescued(
 }
 
 /// As on S3, fixed latency comes before the first byte and bodies stream at a steady rate. A hedge
-/// started at the first-byte tail, or at the body tail for the announced length, finishes within
+/// started at the first-byte p99, or at the bounded body prediction for its length, finishes within
 /// about two and a half nominal reads of that length. Stalls outnumber 1% of reads, so they must
-/// not set the tails; only reads the budget leaves unhedged may take longer.
+/// not set hedge delays; only reads the budget leaves unhedged may take longer.
 #[tokio::test(start_paused = true)]
 async fn simulation_s3_shaped_stalls_are_hedged_at_size_aware_tails() {
     assert_stalls_are_rescued("s3_standard_stalls", 10, |scenario, bytes| {
@@ -422,7 +422,7 @@ async fn simulation_s3_shaped_stalls_are_hedged_at_size_aware_tails() {
 
 /// As on Capacitor, the server reads and verifies the whole chunk before sending headers, so time
 /// to first byte grows with chunk length, and the body follows from memory. A stalled read of any
-/// length waits for the first-byte tail of full chunks, then a hedge to another zone, and finishes
+/// length waits for the first-byte p99 of full chunks, then a hedge to another zone, and finishes
 /// within three nominal full-chunk reads from the local zone. A stall the startup budget leaves
 /// unhedged raises the local zone's routing latency, and the rise must decay rather than keep
 /// reads in other zones, so the local zone serves at least half of them.

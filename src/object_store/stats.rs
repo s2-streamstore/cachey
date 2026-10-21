@@ -1,15 +1,17 @@
+mod body;
+
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
 
-use bytesize::MIB;
 use dashmap::DashMap;
 use exponential_decay_histogram::{ExponentialDecayHistogram, Snapshot};
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
+use self::body::{BodyHistogram, BodyModel};
 use crate::{
     object_store::DownloadLimits,
     types::{BucketName, BucketNameSet},
@@ -23,10 +25,6 @@ const LATENCY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const RECOVERY_SUCCESSES: u32 = 20;
 const OVERLOAD_INTERVAL: Duration = Duration::from_secs(1);
-/// Bodies at least this long are modeled by their time per MiB, since transfer time dominates them.
-/// Shorter bodies are modeled by their duration, which per-request overhead and stalls can
-/// dominate, so they never scale up the tail of large transfers.
-const LARGE_BODY_BYTES: u64 = MIB;
 
 #[derive(Debug, Clone)]
 pub struct BucketMetrics {
@@ -42,12 +40,9 @@ pub struct BucketMetrics {
     /// retries.
     pub first_byte_mean: Option<Duration>,
     pub first_byte_p99: Option<Duration>,
-    /// p99 time to read a body smaller than `LARGE_BODY_BYTES` after its headers.
-    pub small_body_p99: Option<Duration>,
-    /// Bytes per second that 99% of bodies of at least `LARGE_BODY_BYTES` exceed after their
-    /// headers, or `None` while those bodies arrive too fast to time, as when already buffered
-    /// with their headers.
-    pub large_body_throughput_p1: Option<f64>,
+    /// Uncapped byte-weighted p99 transfer time per byte, measured beyond a 1 ms allowance.
+    /// Zero means buffered-only history; it does not establish throughput for larger responses.
+    pub body_seconds_per_byte: Option<f64>,
 }
 
 /// A histogram's mean and nearest-rank p99, in its units.
@@ -102,10 +97,7 @@ impl Sample {
 pub(super) struct LatencyModel {
     latency: Option<Summary>,
     first_byte: Option<Summary>,
-    /// Body time for bodies smaller than `LARGE_BODY_BYTES`.
-    small_body: Option<Summary>,
-    /// Body time per MiB for the rest.
-    large_body: Option<Summary>,
+    body: Option<BodyModel>,
 }
 
 impl LatencyModel {
@@ -118,27 +110,28 @@ impl LatencyModel {
         self.first_byte.map(Summary::p99_duration)
     }
 
-    /// Body time after headers announce `bytes`: the p99 body time if smaller than
-    /// `LARGE_BODY_BYTES`, and otherwise the p99 time per MiB scaled to `bytes`. `None` before the
-    /// bucket has served a body in the same size class.
+    /// The continuous body prediction, capped at 1.5 times its median to limit isolated stalls.
+    /// Buffered bodies alone cannot predict transfer time for larger responses.
     pub fn body_tail(&self, bytes: u64) -> Option<Duration> {
-        if bytes < LARGE_BODY_BYTES {
-            return self.small_body.map(Summary::p99_duration);
-        }
-        let micros =
-            self.large_body?.p99_duration().as_micros() * u128::from(bytes) / u128::from(MIB);
-        Some(Duration::from_micros(
-            u64::try_from(micros).unwrap_or(u64::MAX),
-        ))
+        self.body?.tail(bytes)
     }
 
-    /// Time a request must have had before its timeout counts against the bucket: the complete
-    /// request tail, or the summed tails of the phases it reached if longer. Those phases are
-    /// response headers, then any body whose length they announced. The complete request tail
-    /// keeps a caller timeout shorter than a typical request, which the tail of an early phase
-    /// alone would allow, from counting against the bucket. A phase the bucket has not
-    /// measured, including a body in a size class it has not served, is allowed `unmeasured`,
-    /// so reaching a later phase never shortens the allowance.
+    /// A fresh copy's tail for the known body length, or the observed request tail while its
+    /// length or transfer time is unknown.
+    pub fn request_tail(&self, body_bytes: Option<u64>) -> Option<Duration> {
+        body_bytes
+            .and_then(|bytes| {
+                Some(
+                    self.first_byte_tail()?
+                        .saturating_add(self.body_tail(bytes)?),
+                )
+            })
+            .or_else(|| self.tail())
+    }
+
+    /// A timeout counts against health only after the request had time for the phases it reached.
+    /// Known body lengths use their predicted transfer time; unmeasured phases get `unmeasured`
+    /// and retain the observed request tail as a floor.
     pub fn timeout_allowance(
         &self,
         announced_body_bytes: Option<u64>,
@@ -148,7 +141,8 @@ impl LatencyModel {
         let reached = announced_body_bytes.map_or(first_byte, |bytes| {
             first_byte.saturating_add(self.body_tail(bytes).unwrap_or(unmeasured))
         });
-        self.tail().map_or(reached, |tail| tail.max(reached))
+        self.request_tail(announced_body_bytes)
+            .map_or(reached, |tail| tail.max(reached))
     }
 }
 
@@ -229,8 +223,7 @@ impl PhaseHistogram {
 struct LatencyEstimates {
     latency: PhaseHistogram,
     first_byte: PhaseHistogram,
-    small_body: PhaseHistogram,
-    large_body: PhaseHistogram,
+    body: BodyHistogram,
 }
 
 impl LatencyEstimates {
@@ -238,43 +231,29 @@ impl LatencyEstimates {
         Self {
             latency: PhaseHistogram::new(now),
             first_byte: PhaseHistogram::new(now),
-            small_body: PhaseHistogram::new(now),
-            large_body: PhaseHistogram::new(now),
+            body: BodyHistogram::new(now),
         }
     }
 
     fn record(&mut self, now: Instant, sample: &Sample) {
-        let now = now.into_std();
-        self.latency.update(now, histogram_micros(sample.latency()));
+        self.latency
+            .update(now.into_std(), histogram_micros(sample.latency()));
         self.first_byte
-            .update(now, histogram_micros(sample.first_byte));
-        if sample.body_bytes < LARGE_BODY_BYTES {
-            self.small_body.update(now, histogram_micros(sample.body));
-        } else {
-            let per_mib = sample.body.as_micros() * u128::from(MIB) / u128::from(sample.body_bytes);
-            self.large_body
-                .update(now, i64::try_from(per_mib).unwrap_or(i64::MAX));
-        }
+            .update(now.into_std(), histogram_micros(sample.first_byte));
+        self.body.update(now, sample);
     }
 
     fn model(&mut self, due: bool) -> LatencyModel {
         LatencyModel {
             latency: self.latency.summary(due),
             first_byte: self.first_byte.summary(due),
-            small_body: self.small_body.summary(due),
-            large_body: self.large_body.summary(due),
+            body: self.body.summary(due),
         }
     }
 
     #[cfg(test)]
-    fn retention(&self) -> [(u64, usize); 4] {
-        [
-            &self.latency,
-            &self.first_byte,
-            &self.small_body,
-            &self.large_body,
-        ]
-        .map(|phase| {
+    fn retention(&self) -> [(u64, usize); 2] {
+        [&self.latency, &self.first_byte].map(|phase| {
             let snapshot = phase.histogram.snapshot();
             (snapshot.count(), snapshot.exemplars().count())
         })
@@ -362,8 +341,7 @@ impl BucketStats {
         self.estimates.record(now, sample);
     }
 
-    /// A copy left unmeasured, whether unfinished or validated without a sample, can raise the
-    /// routing latency toward its duration but never lower it.
+    /// An unfinished copy can raise routing latency toward its elapsed time but never lower it.
     fn raise_routing_latency(&mut self, now: Instant, elapsed: Duration) {
         let current = self.current_routing_latency(now);
         self.routing_latency = current + elapsed.saturating_sub(current).mul_f64(LATENCY_ALPHA);
@@ -406,8 +384,7 @@ impl BucketStats {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Outcome {
-    /// With the validated request's measurements, unless it was left unmeasured.
-    Success(Option<Sample>),
+    Success(Sample),
     Failure,
     Overload,
     Neutral,
@@ -455,10 +432,7 @@ impl Drop for BucketObservation {
         let error_rate = stats.error_rate(now);
         match outcome {
             Outcome::Success(sample) => {
-                match &sample {
-                    Some(sample) => stats.record(now, sample, self.probe.is_some()),
-                    None => stats.raise_routing_latency(now, elapsed),
-                }
+                stats.record(now, &sample, self.probe.is_some());
                 if self.generation == stats.generation {
                     stats.error_rate = error_rate * (1.0 - ERROR_ALPHA);
                     stats.consecutive_failures = 0;
@@ -733,8 +707,7 @@ impl BucketedStats {
 
     #[cfg(test)]
     pub(super) fn seed(&self, bucket: &BucketName, sample: Sample) {
-        self.begin(bucket, None)
-            .complete(Outcome::Success(Some(sample)));
+        self.begin(bucket, None).complete(Outcome::Success(sample));
     }
 
     /// Seeds a request for the 4-byte objects tests read, whose latency is all time to first byte.
@@ -773,12 +746,7 @@ impl BucketedStats {
                     latency_p99: model.tail(),
                     first_byte_mean: model.first_byte.map(Summary::mean_duration),
                     first_byte_p99: model.first_byte_tail(),
-                    small_body_p99: model.small_body.map(Summary::p99_duration),
-                    large_body_throughput_p1: model
-                        .large_body
-                        .map(Summary::p99_duration)
-                        .filter(|per_mib| !per_mib.is_zero())
-                        .map(|per_mib| MIB as f64 / per_mib.as_secs_f64()),
+                    body_seconds_per_byte: model.body.map(|body| body.p99_seconds_per_byte),
                 };
                 (entry.key().clone(), metrics)
             })
@@ -805,8 +773,8 @@ mod tests {
     use tokio::time::{Instant, advance};
 
     use super::{
-        BucketMetrics, BucketedStats, LARGE_BODY_BYTES, LATENCY_SNAPSHOT_INTERVAL, Outcome,
-        ProbePermit, RECOVERY_SUCCESSES, Sample, histogram, quantile,
+        BucketMetrics, BucketedStats, LATENCY_SNAPSHOT_INTERVAL, Outcome, ProbePermit,
+        RECOVERY_SUCCESSES, Sample, histogram, quantile,
     };
     use crate::types::{BucketName, BucketNameSet};
 
@@ -853,10 +821,7 @@ mod tests {
             stats.seed(&buckets[0], Sample::from_millis(5, 4096, 2));
             stats.seed(&buckets[1], Sample::from_millis(20, 4096, 2));
         }
-        stats.seed(
-            &buckets[0],
-            Sample::from_millis(5, 2 * LARGE_BODY_BYTES, 100),
-        );
+        stats.seed(&buckets[0], Sample::from_millis(5, 2 * MIB, 100));
         assert_eq!(
             stats.snapshot(&buckets).best(&[], Duration::from_secs(10)),
             Some(0)
@@ -872,7 +837,7 @@ mod tests {
             .collect::<Vec<_>>();
         stats.begin(bucket, None).complete(Outcome::Failure);
         for observation in old {
-            observation.complete(Outcome::Success(None));
+            observation.complete(Outcome::Success(Sample::from_millis(3, 4, 0)));
         }
         advance(Duration::from_secs(300)).await;
         assert!(stats.entry(bucket).lock().deprioritized);
@@ -906,7 +871,7 @@ mod tests {
             );
             let observation = stats.begin(&buckets[0], probe);
             advance(Duration::from_millis(3)).await;
-            observation.complete(Outcome::Success(Some(Sample::from_millis(3, 4, 0))));
+            observation.complete(Outcome::Success(Sample::from_millis(3, 4, 0)));
             assert_eq!(
                 stats.snapshot(&buckets).best(&[], Duration::from_secs(1)),
                 Some(1)
@@ -935,7 +900,7 @@ mod tests {
             let observation = stats.begin(&buckets[0], probe);
             advance(Duration::from_millis(3)).await;
             if probe_succeeds {
-                observation.complete(Outcome::Success(Some(Sample::from_millis(3, 4, 0))));
+                observation.complete(Outcome::Success(Sample::from_millis(3, 4, 0)));
             } else {
                 observation.complete(Outcome::Failure);
             }
@@ -975,12 +940,12 @@ mod tests {
         Sample {
             first_byte: Duration::from_millis(10),
             body_bytes: bytes,
-            body: Duration::from_micros(10_000 * bytes / MIB),
+            body: Duration::from_millis(1) + Duration::from_micros(10_000 * bytes / MIB),
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn exports_body_tails_by_size_class() {
+    async fn exports_the_shared_body_transfer_slope() {
         let stats = BucketedStats::default();
         let bucket = BucketName::new("local").unwrap();
         for bytes in [MIB / 2, MIB, 4 * MIB, 16 * MIB] {
@@ -989,10 +954,29 @@ mod tests {
         advance(Duration::from_secs(1)).await;
 
         let metrics = exported(&stats);
-        assert_eq!(metrics.latency_p99, Some(Duration::from_millis(170)));
+        assert_eq!(metrics.latency_p99, Some(Duration::from_millis(171)));
         assert_eq!(metrics.first_byte_p99, Some(Duration::from_millis(10)));
-        assert_eq!(metrics.small_body_p99, Some(Duration::from_millis(5)));
-        assert!((metrics.large_body_throughput_p1.unwrap() - 100.0 * MIB as f64).abs() < 1e-3);
+        assert!((metrics.body_seconds_per_byte.unwrap() * MIB as f64 - 0.01).abs() < 1e-9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn infrequent_body_stalls_remain_visible_without_setting_the_body_delay() {
+        let stats = BucketedStats::default();
+        let bucket = BucketName::new("local").unwrap();
+        for _ in 0..50 {
+            stats.seed(&bucket, Sample::from_millis(10, 4 * MIB, 41));
+        }
+        stats.seed(&bucket, Sample::from_millis(10, 4 * MIB, 401));
+        let model = stats.model(&bucket);
+        assert_eq!(model.first_byte_tail(), Some(Duration::from_millis(10)));
+        assert_eq!(
+            model.body_tail(4 * MIB),
+            Some(Duration::from_micros(61_500))
+        );
+        assert!(
+            (exported(&stats).body_seconds_per_byte.unwrap() * (4 * MIB) as f64 - 0.4).abs() < 1e-9
+        );
+        assert_eq!(model.tail(), Some(Duration::from_millis(411)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1007,10 +991,10 @@ mod tests {
             stats.seed(&bucket, Sample::from_millis(10, MIB / 16, 20));
         }
         let model = stats.model(&bucket);
-        for (bytes, millis) in [(16 * MIB, 160), (3 * MIB / 2, 15), (4096, 20)] {
+        for (bytes, micros) in [(16 * MIB, 161_000), (3 * MIB / 2, 16_000), (4096, 1039)] {
             assert_eq!(
-                model.body_tail(bytes),
-                Some(Duration::from_millis(millis)),
+                model.body_tail(bytes).map(|tail| tail.as_micros()),
+                Some(micros),
                 "{bytes}"
             );
         }
@@ -1059,12 +1043,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn bodies_too_fast_to_time_report_no_throughput() {
+    async fn buffered_bodies_report_a_zero_transfer_slope() {
         let stats = BucketedStats::default();
         let bucket = BucketName::new("local").unwrap();
         stats.seed(&bucket, Sample::from_millis(10, 16 * MIB, 0));
         advance(Duration::from_secs(1)).await;
-        assert_eq!(exported(&stats).large_body_throughput_p1, None);
+        assert_eq!(exported(&stats).body_seconds_per_byte, Some(0.0));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1079,8 +1063,12 @@ mod tests {
         stats.seed(&bucket, Sample::from_millis(30, 4 * MIB, 40));
         let model = stats.model(&bucket);
         assert_eq!(model.first_byte_tail(), Some(Duration::from_millis(10)));
-        assert_eq!(model.body_tail(4 * MIB), Some(Duration::from_millis(40)));
+        assert_eq!(model.body_tail(4 * MIB), Some(Duration::from_millis(1025)));
         advance(LATENCY_SNAPSHOT_INTERVAL).await;
+        assert_eq!(
+            stats.model(&bucket).body_tail(4 * MIB),
+            Some(Duration::from_millis(40))
+        );
         assert_eq!(
             stats.model(&bucket).first_byte_tail(),
             Some(Duration::from_millis(30))
@@ -1096,34 +1084,34 @@ mod tests {
             stats: stats.entry(&bucket),
         };
         let observation = stats.begin(&bucket, Some(probe));
-        observation.complete(Outcome::Success(Some(Sample::from_millis(9, 4096, 1))));
+        observation.complete(Outcome::Success(Sample::from_millis(9, 4096, 1)));
         let model = stats.model(&bucket);
         assert_eq!(model.first_byte_tail(), Some(Duration::from_millis(9)));
         assert_eq!(model.body_tail(4096), Some(Duration::from_millis(1)));
         assert_eq!(model.body_tail(16 * MIB), None);
         assert_eq!(model.tail(), Some(Duration::from_millis(10)));
-        assert_eq!(exported(&stats).large_body_throughput_p1, None);
+        assert_eq!(exported(&stats).body_seconds_per_byte, Some(0.0));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn body_tails_require_a_measurement_in_the_same_size_class() {
+    async fn unmeasured_transfers_receive_the_cold_timeout_allowance() {
         let stats = BucketedStats::default();
         let bucket = BucketName::new("local").unwrap();
-        stats.seed(&bucket, Sample::from_millis(20, 4096, 3));
+        stats.seed(&bucket, Sample::from_millis(20, 4096, 1));
         let model = stats.model(&bucket);
-        assert_eq!(model.body_tail(4096), Some(Duration::from_millis(3)));
-        assert_eq!(model.body_tail(16 * LARGE_BODY_BYTES), None);
         let unmeasured = Duration::from_millis(100);
+        assert_eq!(model.body_tail(4096), Some(Duration::from_millis(1)));
+        assert_eq!(model.body_tail(16 * MIB), None);
         assert_eq!(
             model.timeout_allowance(None, unmeasured),
-            Duration::from_millis(23)
+            Duration::from_millis(21)
         );
         assert_eq!(
             model.timeout_allowance(Some(4096), unmeasured),
-            Duration::from_millis(23)
+            Duration::from_millis(21)
         );
         assert_eq!(
-            model.timeout_allowance(Some(16 * LARGE_BODY_BYTES), unmeasured),
+            model.timeout_allowance(Some(16 * MIB), unmeasured),
             Duration::from_millis(120)
         );
         let cold = BucketedStats::default().model(&bucket);
@@ -1133,18 +1121,11 @@ mod tests {
             Duration::from_millis(200)
         );
 
-        stats.seed(&bucket, Sample::from_millis(20, 4 * LARGE_BODY_BYTES, 250));
-        let model = stats.model(&bucket);
-        assert_eq!(
-            model.body_tail(16 * LARGE_BODY_BYTES),
-            Some(Duration::from_secs(1))
-        );
-        assert_eq!(model.tail(), Some(Duration::from_millis(23)));
+        stats.seed(&bucket, Sample::from_millis(20, 4 * MIB, 251));
         advance(LATENCY_SNAPSHOT_INTERVAL).await;
-        assert_eq!(
-            stats.model(&bucket).tail(),
-            Some(Duration::from_millis(270))
-        );
+        let model = stats.model(&bucket);
+        assert_eq!(model.body_tail(16 * MIB), Some(Duration::from_millis(1001)));
+        assert_eq!(model.tail(), Some(Duration::from_millis(271)));
     }
 
     #[tokio::test(start_paused = true)]
