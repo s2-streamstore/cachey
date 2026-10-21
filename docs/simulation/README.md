@@ -1,7 +1,7 @@
 # Replica read simulation
 
 The harness tests the downloader and AWS SDK against a simulated backend using
-paused Tokio time. It makes no external requests.
+paused Tokio time.
 
 ## Running
 
@@ -48,7 +48,7 @@ unseeded, so repeat runs when comparing small differences.
 ## Fixtures
 
 The S3 model streams bodies after headers. The Capacitor model reads the range
-before headers, then serves it from memory. These profiles are illustrative:
+before headers, then serves it from memory.
 
 | Profile | Replicas | Before headers | After headers |
 |---------|----------|----------------|---------------|
@@ -58,8 +58,7 @@ before headers, then serves it from memory. These profiles are illustrative:
 | Capacitor | a deployment per AZ, the first local, chunks up to 4 MiB | 1, 2, 2 ms plus 1 ms per MiB | 1 ms per MiB |
 
 Synthetic fixtures test fixed body overhead and mixed response sizes. Exact-range
-fixtures add small reads and cold starts. These test cases are not traffic
-measurements.
+fixtures add small reads and cold starts.
 
 ## Interpreting results
 
@@ -70,8 +69,6 @@ then latency and extra backend work:
 - Compare successful-read latency and all-arrival latency, including size breakdowns.
 - Check wire attempts and service time, including work after a read ends.
 
-The model omits connection setup, network contention, and interactions among cachey
-instances. Millisecond timers favor responses over hedges on the same tick. Results
-do not establish production latency.
+Millisecond timers favor responses over hedges on the same tick.
 
-See the [reference results](REFERENCE.md) for pinned comparisons and measured limits.
+See the [reference results](REFERENCE.md) for pinned comparisons.

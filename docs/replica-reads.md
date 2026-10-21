@@ -35,8 +35,7 @@ model. Sampling by size preserves rare large transfers.
 
 One observed size cannot separate fixed cost from transfer cost, so the model starts
 with a 1 ms fixed allowance. Flat or buffered-only history leaves larger transfer
-times unknown; deadline rescue remains available. Sparse history gives an imprecise
-p99, and the model assumes body time grows roughly linearly with size.
+times unknown; deadline rescue remains available.
 
 ## Deadlines and hedging
 
