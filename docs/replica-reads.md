@@ -10,12 +10,18 @@ Backend failures reduce preference; successful reads and recovery probes restore
 it. Missing objects, invalid ranges, cancellation, and admission failures do not
 affect health.
 
+Buckets are ranked by routing latency at the read's size: the request model's
+median, scaled by a moving average of successful reads relative to it, plus a
+penalty. The moving average follows a shift in latency sooner than the model does.
+Sizes the model cannot predict use the median at its largest retained size.
+Canceled copies raise the penalty toward how far they outlasted their routing
+latency. The penalty decays with a 5-second half-life once the bucket has a median,
+and stays until then. A bucket's first measurement and recovery probes reset both.
+
 Feasibility, rescue timing, and stall detection use the request model at each
-read's size. A copy is overdue after four times its expected p99, or never if its
-size cannot yet be predicted; three overdue copies raise routing latency to their
-elapsed time. Canceled copies also raise it.
-The excess above the moving average of successful reads decays with a 5-second
-half-life. Without a successful read, it stays until one arrives.
+read's size. A copy is overdue after four times its timeout allowance, which is
+refined when headers announce the body length. Three overdue copies raise routing
+latency to the elapsed time of the third.
 
 ## Latency model
 
@@ -77,11 +83,13 @@ rescue, and retry decisions use uncapped estimates.
 Early hedges use one SDK attempt, skip overloaded buckets, and never wait for
 admission. They prefer an untried bucket expected to finish before the page
 deadline, or else use the primary's bucket. A failed body can be retried once when
-no other copy or untried bucket remains, without waiting for admission. A later copy to a bucket needs as much of
-its deadline as a timeout would be allowed: the p99 of each interval, or half the
-bucket's share of the page timeout for each unmeasured interval. A missing object,
-unsatisfied range, or invalid object state cancels all remaining copies to that
-bucket immediately, releasing their admission capacity.
+no other copy or untried bucket remains, without waiting for admission.
+
+A copy's timeout allowance is the p99 of each interval, or half the bucket's share
+of the page timeout for each unmeasured interval. A later copy to a bucket needs
+that much of the bucket's deadline left. A missing object, unsatisfied range, or
+invalid object state cancels all remaining copies to that bucket immediately,
+releasing their admission capacity.
 
 Hedges and body retries have separate budgets funded by successful reads. The
 default allows one startup hedge and one per 20 successful pages. A zero hedge

@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{ops::Range, pin::pin, sync::Arc, time::Duration};
 
 use aws_sdk_s3::{
     error::{ProvideErrorMetadata, SdkError},
@@ -241,20 +241,32 @@ impl BucketOperation<'_> {
                 timeout: budget,
             });
         }
-        let observation = self.downloader.bucketed_stats.begin(
+        let mut observation = self.downloader.bucketed_stats.begin(
             self.request.bucket,
             self.probe.take(),
             self.timeline,
             self.request.bytes(),
-            self.model.request.tail(self.request.bytes()),
+            self.timeout_allowance(),
         );
+        let mut fetch = pin!(fetch());
         let mut expired = false;
-        let result = select! {
-            biased;
-            result = fetch() => result,
-            () = sleep_until(bucket_deadline) => {
-                expired = true;
-                Err(DownloadError::Timeout { bucket: self.request.bucket.clone(), timeout: budget })
+        let mut announced = false;
+        let result = loop {
+            select! {
+                biased;
+                result = &mut fetch => break result,
+                () = sleep_until(bucket_deadline) => {
+                    expired = true;
+                    break Err(DownloadError::Timeout {
+                        bucket: self.request.bucket.clone(),
+                        timeout: budget,
+                    });
+                }
+                // The announced length refines how long the copy should take.
+                () = self.timeline.headers_received(), if !announced => {
+                    announced = true;
+                    observation.expect(self.timeout_allowance());
+                }
             }
         };
         let outcome = match &result {
@@ -648,7 +660,7 @@ mod tests {
                 None,
                 &RequestTimeline::default(),
                 4,
-                None,
+                Duration::ZERO,
             )
             .complete(outcome);
     }

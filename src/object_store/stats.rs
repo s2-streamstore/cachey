@@ -89,6 +89,10 @@ impl RequestTimeline {
         self.headers().map(|headers| headers.body_bytes)
     }
 
+    pub async fn headers_received(&self) {
+        self.headers.wait().await;
+    }
+
     /// Resolves once the request starts, or once headers arrive if it has started.
     pub async fn changed(&self) {
         if self.started().is_none() {
@@ -240,12 +244,12 @@ struct BucketStats {
     overload_until: Instant,
     active: usize,
     timed: BTreeMap<TimedCopy, usize>,
-    /// Moving average of successful request latency.
-    success_latency: Option<Duration>,
-    /// Routing penalty above `success_latency` from stalled and canceled copies.
-    routing_excess: Duration,
+    /// Moving average of request latency over the request model's median, which tracks a
+    /// shift in latency faster than the model.
+    routing_factor: f64,
+    /// Routing latency above the scaled median, from stalled and canceled copies.
+    routing_penalty: Duration,
     routing_updated_at: Instant,
-    best_latency: Option<Duration>,
     estimates: LatencyEstimates,
     summarized_at: Instant,
 }
@@ -265,10 +269,9 @@ impl Default for BucketStats {
             overload_until: now,
             active: 0,
             timed: BTreeMap::new(),
-            success_latency: None,
-            routing_excess: Duration::ZERO,
+            routing_factor: 1.0,
+            routing_penalty: Duration::ZERO,
             routing_updated_at: now,
-            best_latency: None,
             estimates: LatencyEstimates::default(),
             summarized_at: now,
         }
@@ -284,26 +287,35 @@ impl BucketStats {
             )
     }
 
-    /// A recovery probe replaces routing history; latency estimates keep theirs.
+    /// Successes move the routing factor and ease the penalty. The first measurement and
+    /// recovery probes replace both.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
-        let latency = sample.latency();
-        match self.success_latency {
-            Some(mean) if !probe => {
-                self.routing_excess = self
-                    .current_routing_latency(now)
-                    .saturating_sub(mean)
-                    .mul_f64(1.0 - LATENCY_ALPHA);
-                self.success_latency =
-                    Some(mean.mul_f64(1.0 - LATENCY_ALPHA) + latency.mul_f64(LATENCY_ALPHA));
-            }
-            _ => {
-                self.routing_excess = Duration::ZERO;
-                self.success_latency = Some(latency);
-            }
+        let median = self
+            .estimates
+            .model()
+            .request
+            .median_bounded(sample.requested_bytes);
+        let ratio = median.map_or(1.0, |median| {
+            sample.latency().as_secs_f64() / median.as_secs_f64()
+        });
+        if median.is_some() && !probe {
+            self.routing_factor =
+                self.routing_factor * (1.0 - LATENCY_ALPHA) + ratio * LATENCY_ALPHA;
+            self.routing_penalty = self.routing_penalty(now, true).mul_f64(1.0 - LATENCY_ALPHA);
+        } else {
+            self.routing_factor = ratio;
+            self.routing_penalty = Duration::ZERO;
         }
         self.routing_updated_at = now;
-        self.best_latency = Some(self.best_latency.map_or(latency, |best| best.min(latency)));
         self.estimates.record(now, sample);
+    }
+
+    /// Routing latency at a size, or the penalty alone while unmeasured.
+    fn routing_latency(&self, now: Instant, median: Option<Duration>) -> Duration {
+        let penalty = self.routing_penalty(now, median.is_some());
+        median.map_or(penalty, |median| {
+            median.mul_f64(self.routing_factor) + penalty
+        })
     }
 
     fn succeed(&mut self, now: Instant, generation: u64, probe: bool) {
@@ -339,28 +351,33 @@ impl BucketStats {
         }
     }
 
-    /// An unfinished copy can raise routing latency toward its elapsed time but never lower it.
-    fn raise_routing_latency(&mut self, now: Instant, elapsed: Duration) {
-        let current = self.current_routing_latency(now);
-        let raised = current + elapsed.saturating_sub(current).mul_f64(LATENCY_ALPHA);
-        self.routing_excess = raised.saturating_sub(self.success_latency.unwrap_or_default());
+    /// An unfinished copy raises the penalty toward how far it outlasted its routing
+    /// latency, and never lowers it.
+    fn raise_routing_penalty(&mut self, now: Instant, elapsed: Duration, requested_bytes: u64) {
+        let median = self
+            .estimates
+            .model()
+            .request
+            .median_bounded(requested_bytes);
+        let penalty = self.routing_penalty(now, median.is_some());
+        let overrun = elapsed.saturating_sub(self.routing_latency(now, median));
+        self.routing_penalty = penalty + overrun.mul_f64(LATENCY_ALPHA);
         self.routing_updated_at = now;
     }
 
-    /// Excess routing latency decays toward the success mean, even while the bucket is idle.
-    /// Without a success, keep the penalty.
-    fn current_routing_latency(&self, now: Instant) -> Duration {
-        let Some(mean) = self.success_latency else {
-            return self.routing_excess;
-        };
-        mean + self.routing_excess.mul_f64(decay(
+    /// The penalty decays even while the bucket is idle, once it has a measured latency.
+    fn routing_penalty(&self, now: Instant, measured: bool) -> Duration {
+        if !measured {
+            return self.routing_penalty;
+        }
+        self.routing_penalty.mul_f64(decay(
             ROUTING_DECAY,
             now.saturating_duration_since(self.routing_updated_at),
         ))
     }
 
     /// Three overdue copies count as a stall lasting as long as the third.
-    fn routing_latency(&self, now: Instant, current: Duration) -> Duration {
+    fn stalled_latency(&self, now: Instant, current: Duration) -> Duration {
         let mut count = 0;
         for ((overdue_at, started), active) in &self.timed {
             if *overdue_at > now {
@@ -372,6 +389,23 @@ impl BucketStats {
             }
         }
         current
+    }
+
+    fn track(&mut self, copy: Option<TimedCopy>) {
+        if let Some(copy) = copy {
+            *self.timed.entry(copy).or_default() += 1;
+        }
+    }
+
+    fn untrack(&mut self, copy: Option<TimedCopy>) {
+        if let Some(copy) = copy
+            && let Some(count) = self.timed.get_mut(&copy)
+        {
+            *count -= 1;
+            if *count == 0 {
+                self.timed.remove(&copy);
+            }
+        }
     }
 }
 
@@ -432,9 +466,23 @@ pub(super) struct BucketObservation<'a> {
 }
 
 impl BucketObservation<'_> {
+    /// Moves the copy's stall threshold to four times a new expectation.
+    pub fn expect(&mut self, expected: Duration) {
+        let mut stats = self.stats.lock();
+        stats.untrack(self.timed);
+        self.timed = timed(self.started, expected);
+        stats.track(self.timed);
+    }
+
     pub fn complete(mut self, outcome: Outcome) {
         self.outcome = Some(outcome);
     }
+}
+
+/// A copy becomes overdue after four times its expected latency.
+fn timed(started: Instant, expected: Duration) -> Option<TimedCopy> {
+    let overdue = expected.saturating_mul(4).max(Duration::from_millis(1));
+    Some((started.checked_add(overdue)?, started))
 }
 
 impl Drop for BucketObservation<'_> {
@@ -442,14 +490,7 @@ impl Drop for BucketObservation<'_> {
         let mut stats = self.stats.lock();
         let now = Instant::now();
         stats.active -= 1;
-        if let Some(timed) = self.timed
-            && let Some(count) = stats.timed.get_mut(&timed)
-        {
-            *count -= 1;
-            if *count == 0 {
-                stats.timed.remove(&timed);
-            }
-        }
+        stats.untrack(self.timed);
         let probe = self.probe.is_some();
         match self.outcome {
             Some(Outcome::Success) => {
@@ -469,7 +510,11 @@ impl Drop for BucketObservation<'_> {
             }
         }
         match self.outcome {
-            None => stats.raise_routing_latency(now, now.duration_since(self.started)),
+            None => stats.raise_routing_penalty(
+                now,
+                now.duration_since(self.started),
+                self.requested_bytes,
+            ),
             Some(Outcome::Failure) => stats.fail(now, false),
             Some(Outcome::Overload) => stats.fail(now, true),
             Some(Outcome::Success | Outcome::Neutral) => {}
@@ -496,6 +541,8 @@ pub struct BucketedStats {
 struct BucketSnapshot {
     stats: Arc<Mutex<BucketStats>>,
     model: LatencyModel,
+    /// Median latency of a request for the routed size.
+    median: Option<Duration>,
     /// p99 of a request for the routed size.
     tail: Option<Duration>,
     latency: Duration,
@@ -615,13 +662,13 @@ impl RoutingSnapshot {
                 continue;
             }
             let mut stats = snapshot.stats.lock();
-            let stale = stats.best_latency.is_some()
+            let stale = snapshot.median.is_some()
                 && now.duration_since(stats.last_outcome) >= RECOVERY_INTERVAL;
             if (stats.deprioritized || stale)
                 && !stats.probing
                 && stats.active == 0
                 && now >= stats.probe_after
-                && locality_adjusted(stats.best_latency.unwrap_or_default(), index) < best.latency
+                && locality_adjusted(snapshot.median.unwrap_or_default(), index) < best.latency
             {
                 stats.probing = true;
                 return (
@@ -660,31 +707,24 @@ impl BucketedStats {
         self.by_bucket.entry(bucket.clone()).or_default().clone()
     }
 
-    /// A copy becomes overdue after four times its expected request tail; without an
-    /// expectation for its size, it never does.
     pub(super) fn begin<'a>(
         &self,
         bucket: &BucketName,
         probe: Option<ProbePermit>,
         timeline: &'a RequestTimeline,
         requested_bytes: u64,
-        expected_tail: Option<Duration>,
+        expected: Duration,
     ) -> BucketObservation<'a> {
         let stats = self.entry(bucket);
         let started = Instant::now();
-        let timed = expected_tail.map(|tail| {
-            let overdue = tail.saturating_mul(4).max(Duration::from_millis(1));
-            (started + overdue, started)
-        });
+        let timed = timed(started, expected);
         let generation = {
             let mut stats = stats.lock();
             if probe.is_some() {
                 stats.probe_after = started + recovery_delay();
             }
             stats.active += 1;
-            if let Some(timed) = timed {
-                *stats.timed.entry(timed).or_default() += 1;
-            }
+            stats.track(timed);
             stats.generation
         };
         BucketObservation {
@@ -722,17 +762,19 @@ impl BucketedStats {
                     let mut stats = state.lock();
                     refit(&mut stats, now, Some(index) == oldest);
                     let model = stats.estimates.model();
-                    let current = stats.current_routing_latency(now);
+                    let median = model.request.median_bounded(requested_bytes);
+                    let current = stats.routing_latency(now, median);
                     if index == 0 {
                         preferred_latency = current;
                     }
-                    let mut latency = stats.routing_latency(now, current);
-                    if index > 0 && stats.success_latency.is_none() {
+                    let mut latency = stats.stalled_latency(now, current);
+                    if index > 0 && median.is_none() {
                         latency = latency.max(preferred_latency);
                     }
                     BucketSnapshot {
                         stats: state.clone(),
                         model,
+                        median,
                         tail: model.request.tail(requested_bytes),
                         latency: locality_adjusted(latency, index),
                         deprioritized: stats.deprioritized,
@@ -856,7 +898,9 @@ mod tests {
         timeline: &'a RequestTimeline,
         bytes: u64,
     ) -> BucketObservation<'a> {
-        let expected = stats.model(bucket).request.tail(bytes);
+        let expected = stats
+            .model(bucket)
+            .timeout_allowance(bytes, None, Duration::from_secs(1));
         stats.begin(bucket, probe, timeline, bytes, expected)
     }
 
@@ -1033,7 +1077,7 @@ mod tests {
             }
             let latency = snapshot(&stats, &buckets).0[0].latency;
             assert_eq!(
-                latency == Duration::from_millis(3),
+                latency.abs_diff(Duration::from_millis(3)) < Duration::from_micros(1),
                 probe_succeeds,
                 "{latency:?}"
             );
@@ -1042,6 +1086,60 @@ mod tests {
                 Some(Duration::from_millis(250))
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slowdown_moves_routing_before_the_model_refits() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for (bucket, millis) in buckets.iter().zip([3, 5, 6]) {
+            for _ in 0..16 {
+                stats.seed_latency(bucket, millis);
+            }
+        }
+        assert_eq!(best(&stats, &buckets, Duration::from_secs(1)), Some(0));
+        for _ in 0..5 {
+            stats.seed_latency(&buckets[0], 30);
+        }
+        assert_eq!(best(&stats, &buckets, Duration::from_secs(1)), Some(1));
+    }
+
+    /// A run of large reads on the local bucket does not send its small reads elsewhere.
+    #[tokio::test(start_paused = true)]
+    async fn routing_compares_latency_at_the_read_size() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for _ in 0..4 {
+            stats.seed(&buckets[0], Sample::from_millis(5, 4096, 1));
+            stats.seed(&buckets[0], Sample::from_millis(5, 8 * MIB, 95));
+        }
+        for bucket in buckets.iter().skip(1) {
+            stats.seed(bucket, Sample::from_millis(19, 4096, 1));
+        }
+        assert_eq!(
+            stats
+                .snapshot(&buckets, 4096)
+                .best(|_| true, Duration::from_secs(1)),
+            Some(0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_copys_stall_threshold_follows_its_announced_length() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for (bucket, millis) in buckets.iter().zip([3, 5, 6]) {
+            stats.seed_latency(bucket, millis);
+        }
+        let timeline = RequestTimeline::default();
+        let mut active = (0..3)
+            .map(|_| begin(&stats, &buckets[0], None, &timeline))
+            .collect::<Vec<_>>();
+        for observation in &mut active {
+            observation.expect(Duration::from_millis(100));
+        }
+        advance(Duration::from_millis(20)).await;
+        assert_eq!(best(&stats, &buckets, Duration::from_secs(1)), Some(0));
     }
 
     #[tokio::test(start_paused = true)]
