@@ -11,8 +11,9 @@ it. Missing objects, invalid ranges, cancellation, and admission failures do not
 affect health.
 
 Feasibility, rescue timing, and stall detection use the request model at each
-read's size. A copy is overdue after four times its expected p99; three overdue
-copies raise routing latency to their elapsed time. Canceled copies also raise it.
+read's size. A copy is overdue after four times its expected p99, or never if its
+size cannot yet be predicted; three overdue copies raise routing latency to their
+elapsed time. Canceled copies also raise it.
 The excess above the moving average of successful reads decays with a 5-second
 half-life. Without a successful read, it stays until one arrives.
 
@@ -73,7 +74,7 @@ rescue, and retry decisions use uncapped estimates.
 Early hedges use one SDK attempt, skip overloaded buckets, and never wait for
 admission. They prefer an untried bucket expected to finish before the page
 deadline, or else use the primary's bucket. A failed body can be retried once when
-no other copy or untried bucket remains. A later copy to a bucket needs as much of
+no other copy or untried bucket remains, without waiting for admission. A later copy to a bucket needs as much of
 its deadline as a timeout would be allowed: the p99 of each interval, or half the
 bucket's share of the page timeout for each unmeasured interval. A missing object,
 unsatisfied range, or invalid object state cancels all remaining copies to that
@@ -94,7 +95,7 @@ budget still permits fallback and deadline rescue.
 
 Server reads reserve 16 MiB each, admitting 64 copies by default. This limit is
 separate from cache capacity and total process memory. Copies other than early
-hedges can wait for admission within the page deadline.
+hedges and body retries can wait for admission within the page deadline.
 
 Rust callers use `DownloadLimits`; the default active-copy limit is 1,024. Downloader
 clones share limits.

@@ -71,7 +71,14 @@ impl<T: Copy> Reservoir<T> {
         let priority = (LATENCY_DECAY * at - uniform.ln()).to_bits();
         let measurement = Measurement { value, at };
         if self.samples.len() < self.capacity {
-            self.samples.insert((priority, self.count), measurement);
+            // Space freed by pruning admits only priorities a full reservoir would keep,
+            // so the threshold remains each sample's inclusion bound.
+            if self
+                .discarded_priority
+                .is_none_or(|threshold| priority > threshold)
+            {
+                self.samples.insert((priority, self.count), measurement);
+            }
         } else if let Some(lowest) = self.samples.first_entry() {
             let discarded = if priority > lowest.key().0 {
                 let ((discarded, _), _) = lowest.remove_entry();
@@ -90,6 +97,9 @@ impl<T: Copy> Reservoir<T> {
         let retained = self.samples.len();
         self.samples.retain(|_, sample| sample.at >= horizon);
         self.pruned += (retained - self.samples.len()) as u64;
+        if self.samples.is_empty() {
+            self.discarded_priority = None;
+        }
         // Priority sampling estimates each retained weight as the larger of its own and
         // the highest discarded priority: https://arxiv.org/abs/cs/0509026.
         let minimum_weight = self.discarded_priority.map_or(0.0, |priority| {
@@ -124,7 +134,7 @@ pub(super) fn quantile(mut values: &mut [(f64, f64)], q: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CAPACITY, Reservoir, quantile};
+    use super::{CAPACITY, LATENCY_DECAY, Reservoir, quantile};
 
     #[test]
     fn sampling_estimates_decayed_mass_and_prunes_negligible_weight() {
@@ -156,6 +166,38 @@ mod tests {
             assert_eq!(reservoir.retention().1, 0);
             reservoir.retain(at, 21.0, 0.5);
             assert_eq!(reservoir.weighted(at).next(), Some((21.0, 1.0)));
+        }
+    }
+
+    /// Once pruning frees space, new samples keep unbiased weights whether or not older
+    /// samples selected under the sampling threshold remain.
+    #[test]
+    fn refilled_samples_keep_unbiased_weights() {
+        let half_life = std::f64::consts::LN_2 / LATENCY_DECAY;
+        for survivor in [false, true] {
+            let mut reservoir = Reservoir::default();
+            let count = 1000 * CAPACITY;
+            for index in 0..count {
+                let uniform = (index as f64 + 0.5) / count as f64;
+                reservoir.retain(0.0, 1, uniform);
+            }
+            if survivor {
+                reservoir.retain(2.0 * half_life, 1, 1e-9);
+            }
+            let at = 8.5 * half_life;
+            assert_eq!(reservoir.weighted(at).count(), usize::from(survivor));
+            for index in 0..100 {
+                reservoir.retain(at, 2, (f64::from(index) + 0.5) / 100.0);
+            }
+            let refilled: f64 = reservoir
+                .weighted(at)
+                .filter(|(value, _)| *value == 2)
+                .map(|(_, weight)| weight)
+                .sum();
+            assert!(
+                (refilled / 100.0 - 1.0).abs() < 0.05,
+                "{survivor}: {refilled}"
+            );
         }
     }
 

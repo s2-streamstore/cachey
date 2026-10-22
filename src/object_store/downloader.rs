@@ -991,6 +991,38 @@ mod tests {
         }
     }
 
+    /// Another read queued for the only admission slot takes it when the body fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_retry_never_queues_for_admission() {
+        let (downloader, script) = scripted_downloader([("bucket", 5, 5, true)]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                max_inflight_requests: 1,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        let config = RequestConfig::default();
+        let start = tokio::time::Instant::now();
+        let (result, _queued) = tokio::join!(
+            fetch_with_config(&downloader, &["bucket"], &config),
+            async {
+                sleep(Duration::from_millis(1)).await;
+                downloader
+                    .admission
+                    .acquire(4, start + Duration::from_secs(60))
+                    .await
+                    .unwrap()
+            },
+        );
+        assert!(
+            matches!(result, Err(DownloadError::BodyStreaming(_))),
+            "{result:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(10));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 1);
+        assert!(downloader.attempt_budget.try_retry());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_primary_failure_survives_its_hedges_timeout() {
         let (downloader, script) =
@@ -2335,18 +2367,19 @@ mod tests {
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
+    /// A fallback waits for admission; a body retry against the same bucket does not.
     #[tokio::test(start_paused = true)]
     async fn fallback_admission_timeout_preserves_backend_failure_but_overrides_missing() {
-        for (buckets, missing) in [
-            (&["local", "peer"][..], false),
-            (&["local", "peer"], true),
-            (&["local"], false),
+        let page_timeout = Duration::from_millis(100);
+        for (buckets, missing, elapsed) in [
+            (&["local", "peer"][..], false, page_timeout),
+            (&["local", "peer"], true, page_timeout),
+            (&["local"], false, Duration::from_millis(2)),
         ] {
             let (downloader, script) = scripted_downloader([("local", 2, 0, true)]);
             if missing {
                 script.service_errors.lock().insert(0, 404);
             }
-            let page_timeout = Duration::from_millis(100);
             let downloader = downloader
                 .with_test_limits(DownloadLimits {
                     page_timeout,
@@ -2362,7 +2395,7 @@ mod tests {
             let read = async {
                 let result =
                     fetch_with_config(&downloader, buckets, &RequestConfig::default()).await;
-                assert_eq!(start.elapsed(), page_timeout);
+                assert_eq!(start.elapsed(), elapsed);
                 result
             };
             let competing_read = async {

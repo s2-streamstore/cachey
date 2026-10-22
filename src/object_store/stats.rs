@@ -260,8 +260,8 @@ impl LatencyEstimates {
     }
 }
 
-/// An active copy, ordered by when it becomes overdue.
-type ActiveCopy = (Instant, Instant);
+/// An active copy with a predicted tail, ordered by when it becomes overdue.
+type TimedCopy = (Instant, Instant);
 
 #[derive(Debug)]
 struct BucketStats {
@@ -274,7 +274,8 @@ struct BucketStats {
     probe_after: Instant,
     probing: bool,
     overload_until: Instant,
-    active: BTreeMap<ActiveCopy, usize>,
+    active: usize,
+    timed: BTreeMap<TimedCopy, usize>,
     /// Moving average of successful request latency.
     success_latency: Option<Duration>,
     /// Routing penalty above `success_latency` from stalled and canceled copies.
@@ -298,7 +299,8 @@ impl Default for BucketStats {
             probe_after: now,
             probing: false,
             overload_until: now,
-            active: BTreeMap::new(),
+            active: 0,
+            timed: BTreeMap::new(),
             success_latency: None,
             routing_excess: Duration::ZERO,
             routing_updated_at: now,
@@ -393,7 +395,7 @@ impl BucketStats {
     /// Three overdue copies count as a stall lasting as long as the third.
     fn routing_latency(&self, now: Instant, current: Duration) -> Duration {
         let mut count = 0;
-        for ((overdue_at, started), active) in &self.active {
+        for ((overdue_at, started), active) in &self.timed {
             if *overdue_at > now {
                 break;
             }
@@ -455,7 +457,8 @@ impl Drop for ProbePermit {
 /// Records a copy's outcome when dropped; a copy dropped without one was canceled.
 pub(super) struct BucketObservation<'a> {
     stats: Arc<Mutex<BucketStats>>,
-    active: ActiveCopy,
+    started: Instant,
+    timed: Option<TimedCopy>,
     timeline: &'a RequestTimeline,
     requested_bytes: u64,
     generation: u64,
@@ -473,10 +476,13 @@ impl Drop for BucketObservation<'_> {
     fn drop(&mut self) {
         let mut stats = self.stats.lock();
         let now = Instant::now();
-        if let Some(count) = stats.active.get_mut(&self.active) {
+        stats.active -= 1;
+        if let Some(timed) = self.timed
+            && let Some(count) = stats.timed.get_mut(&timed)
+        {
             *count -= 1;
             if *count == 0 {
-                stats.active.remove(&self.active);
+                stats.timed.remove(&timed);
             }
         }
         match self.outcome {
@@ -490,10 +496,7 @@ impl Drop for BucketObservation<'_> {
                 .record_headers(now, self.requested_bytes, self.timeline),
         }
         match self.outcome {
-            None => {
-                let (_, started) = self.active;
-                stats.raise_routing_latency(now, now.duration_since(started));
-            }
+            None => stats.raise_routing_latency(now, now.duration_since(self.started)),
             Some(Outcome::Failure) => stats.fail(now, false),
             Some(Outcome::Overload) => stats.fail(now, true),
             Some(Outcome::Success | Outcome::Neutral) => {}
@@ -643,7 +646,7 @@ impl RoutingSnapshot {
                 && now.duration_since(stats.last_outcome) >= RECOVERY_INTERVAL;
             if (stats.deprioritized || stale)
                 && !stats.probing
-                && stats.active.is_empty()
+                && stats.active == 0
                 && now >= stats.probe_after
                 && locality_adjusted(stats.best_latency.unwrap_or_default(), index) < best.latency
             {
@@ -684,7 +687,8 @@ impl BucketedStats {
         self.by_bucket.entry(bucket.clone()).or_default().clone()
     }
 
-    /// A copy becomes overdue after four times its expected request tail.
+    /// A copy becomes overdue after four times its predicted request tail; without a
+    /// prediction for its size, it never does.
     pub(super) fn begin<'a>(
         &self,
         bucket: &BucketName,
@@ -693,24 +697,28 @@ impl BucketedStats {
         requested_bytes: u64,
     ) -> BucketObservation<'a> {
         let stats = self.entry(bucket);
-        let (active, generation) = {
+        let started = Instant::now();
+        let (timed, generation) = {
             let mut stats = stats.lock();
-            let started = Instant::now();
             if probe.is_some() {
                 stats.probe_after = started + recovery_delay();
             }
-            let overdue = latency_model(&mut stats, started)
+            let timed = latency_model(&mut stats, started)
                 .request_tail(requested_bytes, None)
-                .unwrap_or_default()
-                .saturating_mul(4)
-                .max(Duration::from_millis(1));
-            let active = (started + overdue, started);
-            *stats.active.entry(active).or_default() += 1;
-            (active, stats.generation)
+                .map(|tail| {
+                    let overdue = tail.saturating_mul(4).max(Duration::from_millis(1));
+                    (started + overdue, started)
+                });
+            stats.active += 1;
+            if let Some(timed) = timed {
+                *stats.timed.entry(timed).or_default() += 1;
+            }
+            (timed, stats.generation)
         };
         BucketObservation {
             stats,
-            active,
+            started,
+            timed,
             timeline,
             requested_bytes,
             generation,
@@ -1222,6 +1230,24 @@ mod tests {
             advance(Duration::from_millis(400)).await;
             assert_eq!(best(&stats, &buckets, Duration::from_secs(10)), Some(1));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn copies_of_unpredicted_sizes_are_not_stalls() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for _ in 0..4 {
+            stats.seed(&buckets[0], Sample::from_millis(20, 4096, 1));
+        }
+        for bucket in buckets.iter().skip(1) {
+            stats.seed_latency(bucket, 250);
+        }
+        let timeline = RequestTimeline::default();
+        let _active = (0..3)
+            .map(|_| stats.begin(&buckets[0], None, &timeline, 16 * MIB))
+            .collect::<Vec<_>>();
+        advance(Duration::from_millis(500)).await;
+        assert_eq!(best(&stats, &buckets, Duration::from_secs(10)), Some(0));
     }
 
     #[tokio::test(start_paused = true)]

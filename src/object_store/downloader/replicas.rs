@@ -378,6 +378,13 @@ impl Followups<'_> {
         let model = routing.model(index);
         let overloaded = routing.all_overloaded();
         let retrying = !early && self.states.buckets[index].tried;
+        // A retry never queues for admission, so it cannot spend a credit and then run
+        // out of time before it starts.
+        let retry_admission = if retrying {
+            Some(downloader.admission.try_acquire(self.request.bytes())?)
+        } else {
+            None
+        };
         if (overloaded || retrying) && !downloader.attempt_budget.try_retry() {
             self.retry_budget_exhausted |= overloaded;
             return None;
@@ -394,8 +401,8 @@ impl Followups<'_> {
                 admission,
             })
         } else {
-            self.backup_admission
-                .take()
+            retry_admission
+                .or_else(|| self.backup_admission.take())
                 .map(|admission| AttemptPermits {
                     hedge: None,
                     admission,
