@@ -1,18 +1,16 @@
-use std::{
-    collections::BTreeMap,
-    hash::{BuildHasher, RandomState},
-    time::Duration,
-};
+use std::{collections::BTreeMap, time::Duration};
 
 use tokio::{runtime::Handle, sync::oneshot, time::Instant};
 
-use super::{LATENCY_DECAY, Quantiles, Sample, decay, histogram_micros};
+use super::{
+    Quantiles, Sample, histogram_micros,
+    reservoir::{Reservoir, Snapshot, quantile},
+};
 
 const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MICROS: f64 = TIMER_RESOLUTION.as_micros() as f64;
 const FIT_PRECISION_MICROS: f64 = 0.25;
 const INLINE_FIT_SAMPLES: usize = 64;
-const SAMPLES_PER_BAND: usize = 1028;
 
 #[derive(Debug, Clone, Copy)]
 struct Line {
@@ -67,7 +65,6 @@ impl BodyModel {
 struct Measurement {
     bytes: u64,
     micros: f64,
-    at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,25 +72,6 @@ struct Observation {
     bytes: u64,
     micros: f64,
     weight: f64,
-}
-
-fn quantile(mut values: &mut [(f64, f64)], q: f64) -> f64 {
-    let mut target = values.iter().map(|(_, weight)| weight).sum::<f64>() * (q - 1e-9);
-    while !values.is_empty() {
-        let middle = (values.len() - 1) / 2;
-        let (below, pivot, above) =
-            values.select_nth_unstable_by(middle, |left, right| left.0.total_cmp(&right.0));
-        let weight_below: f64 = below.iter().map(|(_, weight)| weight).sum();
-        if target <= weight_below && !below.is_empty() {
-            values = below;
-        } else if target <= weight_below + pivot.1 || above.is_empty() {
-            return pivot.0;
-        } else {
-            target -= weight_below + pivot.1;
-            values = above;
-        }
-    }
-    0.0
 }
 
 struct Fit {
@@ -232,127 +210,22 @@ fn model(observations: &[Observation]) -> BodyModel {
     )
 }
 
-struct BandSnapshot {
-    samples: Vec<Measurement>,
-    weight: f64,
-    minimum_weight: f64,
-}
-
-fn summarize(bands: Vec<BandSnapshot>, now: Instant) -> BodyModel {
-    let mut observations = Vec::new();
+fn summarize(bands: &[Snapshot<Measurement>]) -> BodyModel {
+    let mut observations = Vec::with_capacity(bands.iter().map(Snapshot::len).sum());
     for snapshot in bands {
-        let weight = |at| {
-            decay(LATENCY_DECAY, now.saturating_duration_since(at)).max(snapshot.minimum_weight)
-        };
-        let retained_weight: f64 = snapshot
-            .samples
-            .iter()
-            .map(|sample| weight(sample.at))
-            .sum();
-        if retained_weight == 0.0 {
-            continue;
-        }
-        // Restore each stratum's observation mass after reservoir sampling.
-        let correction = snapshot.weight / retained_weight;
-        observations.extend(snapshot.samples.iter().map(|sample| Observation {
+        observations.extend(snapshot.weighted().map(|(sample, weight)| Observation {
             bytes: sample.bytes,
             micros: sample.micros,
-            weight: weight(sample.at) * correction,
+            weight,
         }));
     }
     model(&observations)
 }
 
-#[derive(Debug)]
-struct Band {
-    samples: BTreeMap<(u64, u64), Measurement>,
-    capacity: usize,
-    count: u64,
-    random: RandomState,
-    started: Instant,
-    discarded_priority: Option<u64>,
-    weight: f64,
-    updated_at: Instant,
-}
-
-impl Band {
-    fn new(now: Instant) -> Self {
-        let capacity = SAMPLES_PER_BAND;
-        #[cfg(test)]
-        let capacity = crate::object_store::simulation::histogram_capacity().unwrap_or(capacity);
-        Self {
-            samples: BTreeMap::new(),
-            capacity,
-            count: 0,
-            random: RandomState::new(),
-            started: now,
-            discarded_priority: None,
-            weight: 0.0,
-            updated_at: now,
-        }
-    }
-
-    fn update(&mut self, now: Instant, sample: &Sample) {
-        let uniform = ((self.random.hash_one(self.count) >> 11) + 1) as f64 / (1_u64 << 53) as f64;
-        self.retain(now, sample, uniform);
-    }
-
-    fn retain(&mut self, now: Instant, sample: &Sample, uniform: f64) {
-        self.weight = self.weight_at(now) + 1.0;
-        self.updated_at = now;
-        self.count += 1;
-        // Log priorities avoid rescaling. Positive float bits preserve numeric order;
-        // the observation count distinguishes equal priorities.
-        let priority = (LATENCY_DECAY * now.duration_since(self.started).as_secs_f64()
-            - uniform.ln())
-        .to_bits();
-        let measurement = Measurement {
-            bytes: sample.body_bytes,
-            micros: histogram_micros(sample.body) as f64,
-            at: now,
-        };
-        if self.samples.len() < self.capacity {
-            self.samples.insert((priority, self.count), measurement);
-        } else if let Some(lowest) = self.samples.first_entry() {
-            let discarded = if priority > lowest.key().0 {
-                let ((discarded, _), _) = lowest.remove_entry();
-                self.samples.insert((priority, self.count), measurement);
-                discarded
-            } else {
-                priority
-            };
-            self.discarded_priority = self.discarded_priority.max(Some(discarded));
-        }
-    }
-
-    fn snapshot(&self, now: Instant) -> BandSnapshot {
-        // Priority sampling assigns max(weight, highest discarded priority), correcting
-        // for age-biased inclusion: https://arxiv.org/abs/cs/0509026.
-        let minimum_weight = self.discarded_priority.map_or(0.0, |priority| {
-            (f64::from_bits(priority)
-                - LATENCY_DECAY * now.duration_since(self.started).as_secs_f64())
-            .exp()
-        });
-        BandSnapshot {
-            samples: self.samples.values().copied().collect(),
-            weight: self.weight_at(now),
-            minimum_weight,
-        }
-    }
-
-    fn weight_at(&self, now: Instant) -> f64 {
-        self.weight
-            * decay(
-                LATENCY_DECAY,
-                now.saturating_duration_since(self.updated_at),
-            )
-    }
-}
-
 /// Size-stratified retention keeps rare transfers available to one continuous model.
 #[derive(Debug, Default)]
 pub(super) struct BodyHistogram {
-    bands: BTreeMap<u64, Band>,
+    bands: BTreeMap<u64, Reservoir<Measurement>>,
     model: BodyModel,
     updates: u64,
     summarized_updates: u64,
@@ -370,16 +243,20 @@ impl BodyHistogram {
             .unwrap_or(u64::MAX);
         self.bands
             .entry(bytes)
-            .or_insert_with(|| Band::new(now))
-            .update(now, sample);
+            .or_insert_with(|| Reservoir::new(now))
+            .update(
+                now,
+                Measurement {
+                    bytes: sample.body_bytes,
+                    micros: histogram_micros(sample.body) as f64,
+                },
+            );
         self.updates = self.updates.saturating_add(1);
     }
 
     #[cfg(test)]
     pub fn retention(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
-        self.bands
-            .values()
-            .map(|band| (band.count, band.samples.len()))
+        self.bands.values().map(Reservoir::retention)
     }
 
     pub fn summary(&mut self, due: bool) -> BodyModel {
@@ -405,8 +282,8 @@ impl BodyHistogram {
             self.summarized_updates = self.updates;
             let now = Instant::now();
             let bands: Vec<_> = self.bands.values().map(|band| band.snapshot(now)).collect();
-            let samples = bands.iter().map(|snapshot| snapshot.samples.len()).sum();
-            self.refresh(samples, move || summarize(bands, now));
+            let samples = bands.iter().map(Snapshot::len).sum();
+            self.refresh(samples, move || summarize(&bands));
         }
         self.model
     }
@@ -441,8 +318,8 @@ mod tests {
     use tokio::time::{Instant, advance};
 
     use super::{
-        Band, BodyHistogram, BodyModel, INLINE_FIT_SAMPLES, Line, Observation, SAMPLES_PER_BAND,
-        TIMER_MICROS, TIMER_RESOLUTION, fit, summarize,
+        BodyHistogram, BodyModel, INLINE_FIT_SAMPLES, Line, Observation, TIMER_MICROS,
+        TIMER_RESOLUTION, fit,
     };
     use crate::object_store::stats::Sample;
 
@@ -453,43 +330,6 @@ mod tests {
             histogram.summary(false);
         }
         histogram.model
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sampled_and_full_history_apply_the_same_decay() {
-        let mut sampled = Band::new(Instant::now());
-        let mut full = Band::new(Instant::now());
-        full.capacity = 20_000;
-        for (count, millis) in [(10_000, 11), (4_000, 41)] {
-            let sample = Sample::from_millis(10, MIB, millis);
-            for index in 0..count {
-                // Evenly spaced draws make the retained proportions reproducible.
-                let uniform = (f64::from(index) + 0.5) / f64::from(count);
-                for band in [&mut sampled, &mut full] {
-                    band.retain(Instant::now(), &sample, uniform);
-                }
-            }
-            advance(Duration::from_secs(15)).await;
-        }
-        assert_eq!(sampled.samples.len(), SAMPLES_PER_BAND);
-        assert_eq!(full.samples.len(), 14_000);
-        for band in [&sampled, &full] {
-            let quantiles = summarize(vec![band.snapshot(Instant::now())], Instant::now())
-                .predict(MIB)
-                .unwrap();
-            assert_eq!(quantiles.median, Duration::from_millis(11));
-            assert_eq!(quantiles.p99, Duration::from_millis(41));
-            assert_eq!(quantiles.hedge_delay(), Duration::from_micros(16_500));
-        }
-        advance(Duration::from_hours(168)).await;
-        for band in [&mut sampled, &mut full] {
-            band.retain(Instant::now(), &Sample::from_millis(10, MIB, 21), 0.5);
-            let quantiles = summarize(vec![band.snapshot(Instant::now())], Instant::now())
-                .predict(MIB)
-                .unwrap();
-            assert_eq!(quantiles.median, Duration::from_millis(21));
-            assert_eq!(quantiles.p99, Duration::from_millis(21));
-        }
     }
 
     #[tokio::test(start_paused = true)]

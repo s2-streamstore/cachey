@@ -32,8 +32,9 @@ body time = fixed cost + response bytes × transfer cost per byte
 Both coefficients are nonnegative. Predictions have a 1 ms floor, and p99 stays at
 or above the median. Samples from all objects and response sizes train the same
 model. Sampling by size preserves rare large transfers.
-Retained body samples use inclusion-corrected weights so sampling does not apply
-age decay a second time.
+Header, complete-request, and body measurements share one priority-sampling
+implementation. Retained samples use inclusion-corrected weights so sampling does
+not apply age decay a second time.
 
 Models refresh at most once per second, or sooner when the sample count doubles.
 Fits with more than 64 retained samples run on Tokio's blocking pool, with one

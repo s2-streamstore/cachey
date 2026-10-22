@@ -1,4 +1,5 @@
 mod body;
+mod reservoir;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -7,11 +8,13 @@ use std::{
 };
 
 use dashmap::DashMap;
-use exponential_decay_histogram::{ExponentialDecayHistogram, Snapshot};
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
-use self::body::{BodyHistogram, BodyModel};
+use self::{
+    body::{BodyHistogram, BodyModel},
+    reservoir::{Reservoir, Snapshot, quantile},
+};
 use crate::{
     object_store::DownloadLimits,
     types::{BucketName, BucketNameSet},
@@ -176,45 +179,30 @@ fn histogram_micros(duration: Duration) -> i64 {
     duration.as_micros().min(i64::MAX as u128) as i64
 }
 
-fn histogram<T>(now: Instant) -> ExponentialDecayHistogram<T> {
-    let mut builder = ExponentialDecayHistogram::builder();
-    builder.at(now.into_std()).alpha(LATENCY_DECAY);
-    #[cfg(test)]
-    if let Some(capacity) = super::simulation::histogram_capacity() {
-        builder.size(capacity);
-    }
-    builder.build()
-}
-
-/// Include the current sample's weight. `Snapshot::value` uses only preceding weight,
-/// which can select an old outlier after recent samples dominate.
-fn quantile(snapshot: &Snapshot, q: f64) -> i64 {
-    const TOLERANCE: f64 = 1e-9;
-    let mut cumulative = 0.0;
-    let mut last = 0;
-    for (value, weight) in snapshot.values() {
-        cumulative += weight;
-        if cumulative >= q - TOLERANCE {
-            return value;
-        }
-        last = value;
-    }
-    last
-}
-
-fn summarize(histogram: &ExponentialDecayHistogram) -> Option<Summary> {
-    let snapshot = histogram.snapshot();
-    (snapshot.count() > 0).then(|| Summary {
-        mean: snapshot.mean(),
-        median: quantile(&snapshot, 0.5),
-        p99: quantile(&snapshot, 0.99),
+fn summarize(snapshot: &Snapshot<i64>) -> Option<Summary> {
+    let mut values = Vec::with_capacity(snapshot.len());
+    values.extend(
+        snapshot
+            .weighted()
+            .map(|(micros, weight)| (micros as f64, weight)),
+    );
+    let weight: f64 = values.iter().map(|(_, weight)| weight).sum();
+    (weight > 0.0).then(|| Summary {
+        mean: values
+            .iter()
+            .map(|(micros, weight)| micros * weight)
+            .sum::<f64>()
+            / weight,
+        median: quantile(&mut values, 0.5) as i64,
+        p99: quantile(&mut values, 0.99) as i64,
     })
 }
 
 /// One histogram, summarized again only after it changes.
 #[derive(Debug)]
 struct PhaseHistogram {
-    histogram: ExponentialDecayHistogram,
+    histogram: Reservoir<i64>,
+    epoch: Instant,
     summary: Option<Summary>,
     changed: bool,
 }
@@ -222,28 +210,30 @@ struct PhaseHistogram {
 impl PhaseHistogram {
     fn new(now: Instant) -> Self {
         Self {
-            histogram: histogram(now),
+            histogram: Reservoir::new(now),
+            epoch: now,
             summary: None,
             changed: false,
         }
     }
 
-    fn update(&mut self, now: std::time::Instant, value: i64) {
-        self.histogram.update_at(now, value);
+    fn update(&mut self, now: Instant, value: i64) {
+        // Keep phase weights stable within a second so subsecond timing cannot flip ties.
+        let at = self.epoch + Duration::from_secs(now.duration_since(self.epoch).as_secs());
+        self.histogram.update(at, value);
         self.changed = true;
     }
 
     #[cfg(test)]
     fn retention(&self) -> (u64, usize) {
-        let snapshot = self.histogram.snapshot();
-        (snapshot.count(), snapshot.exemplars().count())
+        self.histogram.retention()
     }
 
     /// Summarizes a changed histogram once `due`, or as soon as it holds its first samples.
     fn summary(&mut self, due: bool) -> Option<Summary> {
         if self.changed && (due || self.summary.is_none()) {
             self.changed = false;
-            self.summary = summarize(&self.histogram);
+            self.summary = summarize(&self.histogram.snapshot(Instant::now()));
         }
         self.summary
     }
@@ -266,10 +256,9 @@ impl LatencyEstimates {
     }
 
     fn record(&mut self, now: Instant, sample: &Sample) {
-        self.latency
-            .update(now.into_std(), histogram_micros(sample.latency()));
+        self.latency.update(now, histogram_micros(sample.latency()));
         self.first_byte
-            .update(now.into_std(), histogram_micros(sample.first_byte));
+            .update(now, histogram_micros(sample.first_byte));
         self.body.update(now, sample);
     }
 
@@ -801,8 +790,8 @@ mod tests {
     use tokio::time::{Instant, advance};
 
     use super::{
-        BucketedStats, LATENCY_SNAPSHOT_INTERVAL, Outcome, RECOVERY_SUCCESSES, Sample, histogram,
-        quantile,
+        BucketedStats, LATENCY_SNAPSHOT_INTERVAL, LatencyModel, Outcome, PhaseHistogram,
+        RECOVERY_SUCCESSES, Sample, body::BodyModel, reservoir::Reservoir,
     };
     use crate::types::{BucketName, BucketNameSet};
 
@@ -998,45 +987,51 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn quantiles_take_the_nearest_rank_of_samples_recorded_together() {
-        let now = Instant::now();
-        let mut samples = histogram::<()>(now);
-        for value in [5, 1, 3, 3, 3, 9, 7, 7, 2, 8] {
-            samples.update_at(now.into_std(), value);
-        }
-        let snapshot = samples.snapshot();
-        for (q, expected) in [
-            (0.0, 1),
-            (0.1, 1),
-            (0.15, 2),
-            (0.25, 3),
-            (0.5, 3),
-            (0.55, 5),
-            (0.6, 5),
-            (0.65, 7),
-            (0.8, 7),
-            (0.85, 8),
-            (0.9, 8),
-            (0.95, 9),
-            (0.99, 9),
-            (1.0, 9),
-        ] {
-            assert_eq!(quantile(&snapshot, q), expected, "{q}");
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_decayed_outlier_does_not_become_the_tail_above_recent_samples() {
         let start = Instant::now();
-        let mut samples = histogram::<()>(start);
+        let mut samples = PhaseHistogram::new(start);
         for value in (50..80).chain([1000]) {
-            samples.update_at(start.into_std(), value);
+            samples.update(start, value);
         }
         advance(Duration::from_secs(300)).await;
         for value in [90, 91, 92, 93] {
-            samples.update_at(Instant::now().into_std(), value);
+            samples.update(Instant::now(), value);
         }
-        assert_eq!(quantile(&samples.snapshot(), 0.99), 93);
+        assert_eq!(samples.summary(true).unwrap().p99, 93);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sampled_headers_preserve_the_hedge_delay_across_a_latency_change() {
+        let mut sampled = PhaseHistogram::new(Instant::now());
+        let mut full = PhaseHistogram::new(Instant::now());
+        full.histogram = Reservoir::with_capacity(Instant::now(), 20_000);
+        for (count, micros) in [(10_000, 41_000), (4_000, 11_000)] {
+            for index in 0..count {
+                // Evenly spaced draws keep the oversubscribed reservoirs reproducible.
+                let uniform = (f64::from(index) + 0.5) / f64::from(count);
+                for histogram in [&mut sampled, &mut full] {
+                    histogram.histogram.retain(Instant::now(), micros, uniform);
+                    histogram.changed = true;
+                }
+            }
+            advance(Duration::from_secs(15)).await;
+        }
+        for histogram in [&mut sampled, &mut full] {
+            let summary = histogram.summary(true).unwrap();
+            assert_eq!(summary.median, 41_000);
+            assert_eq!(summary.p99, 41_000);
+            assert!((summary.mean - 27_666.666_667).abs() < 100.0);
+            let model = LatencyModel {
+                latency: Some(summary),
+                first_byte: Some(summary),
+                body: BodyModel::default(),
+            };
+            assert_eq!(model.tail(), Some(Duration::from_millis(41)));
+            assert_eq!(
+                model.first_byte_hedge_delay(),
+                Some(Duration::from_millis(41))
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

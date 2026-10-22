@@ -504,7 +504,7 @@ async fn simulation_repeatability_and_cancellation() {
 async fn simulation_rescue_preserves_availability_and_work_under_overload() {
     for (name, completed, attempts) in [
         ("capacitor_overload", 1807, 3100),
-        ("s3_express_overload_sdk_retries", 1806, 3620),
+        ("s3_express_overload_sdk_retries", 1808, 3620),
     ] {
         let scenario = scenario_named(name);
         let report = simulate(scenario, 7, false, false).await;
