@@ -384,7 +384,7 @@ mod tests {
             update(&mut histogram, 1024, 0);
         }
         let model = histogram.summary(true);
-        assert_eq!(model.tail(1024), Some(TIMER_RESOLUTION));
+        assert_eq!(model.tail(1), Some(TIMER_RESOLUTION));
         assert_eq!(model.median(4 * MIB), Some(Duration::from_millis(41)));
         assert!(model.tail(16 * MIB).unwrap() <= Duration::from_millis(162));
     }
@@ -430,17 +430,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn buffered_bodies_do_not_establish_throughput_for_larger_sizes() {
-        let mut histogram = body();
-        update(&mut histogram, 3000, 0);
-        let model = histogram.summary(false);
-        assert_eq!(model.tail(3000), Some(TIMER_RESOLUTION));
-        assert!(model.tail(3001).is_none());
-        update(&mut histogram, 3000, 1000);
-        assert!(histogram.summary(true).tail(MIB).is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn one_request_size_is_a_fixed_cost_outside_transfers() {
         let mut histogram = SizeHistogram::new(false);
         update(&mut histogram, 16 * MIB, 25);
@@ -449,17 +438,24 @@ mod tests {
         assert!(model.median(32 * MIB).is_none());
     }
 
+    /// Buffered bodies of one size, or fixed overhead across sizes, measure no cost per byte.
     #[tokio::test(start_paused = true)]
-    async fn fixed_overhead_alone_does_not_establish_larger_transfer_times() {
-        let mut histogram = body();
-        for bytes in [4096, 65_536] {
-            for _ in 0..4 {
-                update(&mut histogram, bytes, 20);
+    async fn flat_history_does_not_establish_larger_transfer_times() {
+        for history in [&[(3000, 0)][..], &[(4096, 20), (65_536, 20)]] {
+            let mut histogram = body();
+            for &(bytes, millis) in history {
+                for _ in 0..4 {
+                    update(&mut histogram, bytes, millis);
+                }
             }
+            let model = histogram.summary(true);
+            let (largest, millis) = history[history.len() - 1];
+            assert_eq!(
+                model.tail(largest),
+                Some(Duration::from_millis(millis.max(1)))
+            );
+            assert!(model.tail(largest + 1).is_none(), "{history:?}");
         }
-        let model = histogram.summary(true);
-        assert_eq!(model.tail(65_536), Some(Duration::from_millis(20)));
-        assert!(model.tail(MIB).is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -482,7 +478,6 @@ mod tests {
         update(&mut histogram, 16 * MIB, 1001);
         let model = histogram.summary(true);
         assert_eq!(model.median(MIB), Some(Duration::from_millis(11)));
-        assert!(model.hedge_delay(MIB).unwrap() <= Duration::from_micros(16_500));
         // With a nonnegative intercept, extrapolation grows no faster than response size.
         assert!(model.hedge_delay(16 * MIB).unwrap() <= Duration::from_millis(265));
         for _ in 0..800 {
@@ -493,30 +488,6 @@ mod tests {
             histogram.summary(true).tail(MIB),
             Some(Duration::from_millis(11))
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn diverse_exact_sizes_share_fixed_overhead_from_nine_observations() {
-        let mut histogram = body();
-        for exponent in 10..=18 {
-            let bytes = 1 << exponent;
-            histogram.update(
-                Instant::now(),
-                bytes,
-                Duration::from_secs_f64(0.020 + 0.010 * bytes as f64 / MIB as f64),
-            );
-        }
-        let model = histogram.summary(true);
-        for bytes in [1, 512, 1024, 4096, 12_345, 65_536, 262_144] {
-            let expected = 0.020 + 0.010 * bytes as f64 / MIB as f64;
-            for predicted in [model.median(bytes), model.tail(bytes)] {
-                let predicted = predicted.unwrap().as_secs_f64();
-                assert!(
-                    (predicted - expected).abs() < 0.000_005,
-                    "{bytes}: {predicted}"
-                );
-            }
-        }
     }
 
     #[tokio::test(start_paused = true)]

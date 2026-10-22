@@ -83,11 +83,7 @@ impl<'a> HedgeTimer<'a> {
             ),
             (Phase::Body, None) => return None,
         };
-        if delay.is_zero() {
-            return None;
-        }
-        let at = since.checked_add(delay)?;
-        (at < self.deadline.current()).then_some(at)
+        since.checked_add(delay)
     }
 
     /// Waits until a hedge is due; stays pending once hedging is no longer possible.

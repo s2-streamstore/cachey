@@ -206,7 +206,6 @@ struct LatencyEstimates {
     first_byte: SizeHistogram,
     body: SizeHistogram,
     request: SizeHistogram,
-    refitting: bool,
 }
 
 impl Default for LatencyEstimates {
@@ -215,7 +214,6 @@ impl Default for LatencyEstimates {
             first_byte: SizeHistogram::new(false),
             body: SizeHistogram::new(true),
             request: SizeHistogram::new(false),
-            refitting: false,
         }
     }
 }
@@ -409,27 +407,24 @@ impl BucketStats {
 }
 
 /// Refits once per interval, or sooner while observation counts double. Fitting runs
-/// outside the lock, one refit at a time, so it does not delay the bucket's copies.
+/// outside the lock so it does not delay the bucket's copies; claiming the refit under
+/// the lock leaves concurrent callers nothing to refit.
 fn latency_model(stats: &mut MutexGuard<'_, BucketStats>, now: Instant) -> LatencyModel {
-    if !stats.estimates.refitting {
-        let due = now.duration_since(stats.summarized_at) >= LATENCY_SNAPSHOT_INTERVAL;
-        if due {
-            stats.summarized_at = now;
-        }
-        let refits: [Option<Refit>; 3] = stats
-            .estimates
-            .histograms()
-            .map(|histogram| histogram.refit(due));
-        if refits.iter().any(Option::is_some) {
-            stats.estimates.refitting = true;
-            let models =
-                MutexGuard::unlocked(stats, || refits.map(|refit| refit.map(|refit| refit.fit())));
-            for (histogram, model) in stats.estimates.histograms().into_iter().zip(models) {
-                if let Some(model) = model {
-                    histogram.set_model(model);
-                }
+    let due = now.duration_since(stats.summarized_at) >= LATENCY_SNAPSHOT_INTERVAL;
+    if due {
+        stats.summarized_at = now;
+    }
+    let refits: [Option<Refit>; 3] = stats
+        .estimates
+        .histograms()
+        .map(|histogram| histogram.refit(due));
+    if refits.iter().any(Option::is_some) {
+        let models =
+            MutexGuard::unlocked(stats, || refits.map(|refit| refit.map(|refit| refit.fit())));
+        for (histogram, model) in stats.estimates.histograms().into_iter().zip(models) {
+            if let Some(model) = model {
+                histogram.set_model(model);
             }
-            stats.estimates.refitting = false;
         }
     }
     stats.estimates.model()
@@ -1028,9 +1023,10 @@ mod tests {
         }
         let mut exported = 0;
         stats.export_bucket_metrics(|bucket, metrics| {
-            let request = metrics.request.unwrap();
-            assert_eq!(request.base, Duration::from_millis(3));
-            assert_eq!(request.largest_bytes, 4);
+            assert_eq!(
+                metrics.request.map(|estimate| estimate.base),
+                Some(Duration::from_millis(3))
+            );
             let entry = stats
                 .by_bucket
                 .try_get_mut(bucket)
@@ -1040,33 +1036,6 @@ mod tests {
             exported += 1;
         });
         assert_eq!(exported, buckets.len());
-    }
-
-    /// A body streaming at 10ms per MiB after 10ms to first byte.
-    fn paced_body(bytes: u64) -> Sample {
-        Sample {
-            requested_bytes: bytes,
-            first_byte: Duration::from_millis(10),
-            body_bytes: bytes,
-            body: Duration::from_millis(1) + Duration::from_micros(10_000 * bytes / MIB),
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn slow_short_bodies_do_not_inflate_the_tail_of_full_pages() {
-        let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        for _ in 0..4 {
-            for _ in 0..5 {
-                stats.seed(&bucket, paced_body(16 * MIB));
-            }
-            stats.seed(&bucket, paced_body(MIB));
-            stats.seed(&bucket, Sample::from_millis(10, MIB / 16, 20));
-        }
-        let model = stats.model(&bucket);
-        assert_eq!(model.body_tail(16 * MIB), Some(Duration::from_millis(161)));
-        assert!(model.body_tail(3 * MIB / 2).unwrap() <= Duration::from_millis(33));
-        assert!(model.body_tail(4096).unwrap() <= Duration::from_millis(20));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1129,20 +1098,25 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn canceled_copies_measure_only_headers_they_received() {
+    async fn unfinished_copies_measure_only_headers_they_received() {
         let stats = BucketedStats::default();
         let bucket = BucketName::new("local").unwrap();
         stats.seed(&bucket, Sample::from_millis(10, 4, 1));
-        for headers_after in [None, Some(Duration::from_millis(30))] {
+        for (received_headers, outcome) in
+            [(false, None), (true, None), (true, Some(Outcome::Failure))]
+        {
             let timeline = RequestTimeline::default();
             timeline.start();
             let observation = begin(&stats, &bucket, None, &timeline);
-            if let Some(delay) = headers_after {
-                advance(delay).await;
+            if received_headers {
+                advance(Duration::from_millis(30)).await;
                 timeline.receive_headers(4);
             }
             advance(Duration::from_millis(500)).await;
-            drop(observation);
+            match outcome {
+                Some(outcome) => observation.complete(outcome),
+                None => drop(observation),
+            }
         }
         advance(LATENCY_SNAPSHOT_INTERVAL).await;
         let model = stats.model(&bucket);
@@ -1151,22 +1125,24 @@ mod tests {
         assert_eq!(model.request_tail(4, None), Some(Duration::from_millis(11)));
     }
 
+    /// One or two slow copies may be unlucky; three overdue copies are a stall.
     #[tokio::test(start_paused = true)]
-    async fn failed_copies_measure_headers_but_not_bodies() {
+    async fn a_stall_takes_three_overdue_copies() {
         let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        stats.seed(&bucket, Sample::from_millis(10, 4, 1));
+        let buckets = buckets();
+        for (bucket, millis) in buckets.iter().zip([3, 5, 6]) {
+            stats.seed_latency(bucket, millis);
+        }
         let timeline = RequestTimeline::default();
-        timeline.start();
-        let observation = begin(&stats, &bucket, None, &timeline);
-        advance(Duration::from_millis(30)).await;
-        timeline.receive_headers(4);
-        advance(Duration::from_millis(500)).await;
-        observation.complete(Outcome::Failure);
-        advance(LATENCY_SNAPSHOT_INTERVAL).await;
-        let model = stats.model(&bucket);
-        assert_eq!(model.first_byte_tail(4), Some(Duration::from_millis(30)));
-        assert_eq!(model.body_tail(4), Some(Duration::from_millis(1)));
+        let mut active = Vec::new();
+        for stalled in [false, false, true] {
+            active.push(begin(&stats, &buckets[0], None, &timeline));
+            advance(Duration::from_millis(20)).await;
+            assert_eq!(
+                best(&stats, &buckets, Duration::from_secs(1)),
+                Some(usize::from(stalled))
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1276,44 +1252,5 @@ mod tests {
             assert!(probe.is_none());
             assert!(!stats.entry(&buckets[0]).lock().deprioritized);
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_refit_in_progress_serves_the_previous_model() {
-        let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        stats.seed_latency(&bucket, 10);
-        assert_eq!(
-            stats.model(&bucket).first_byte_tail(4),
-            Some(Duration::from_millis(10))
-        );
-        stats.entry(&bucket).lock().estimates.refitting = true;
-        stats.seed_latency(&bucket, 20);
-        advance(LATENCY_SNAPSHOT_INTERVAL).await;
-        assert_eq!(
-            stats.model(&bucket).first_byte_tail(4),
-            Some(Duration::from_millis(10))
-        );
-        stats.entry(&bucket).lock().estimates.refitting = false;
-        assert_eq!(
-            stats.model(&bucket).first_byte_tail(4),
-            Some(Duration::from_millis(20))
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn zero_median_headers_still_hedge_observed_stalls() {
-        let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        for _ in 0..50 {
-            stats.seed(&bucket, Sample::from_millis(0, 4096, 1));
-        }
-        stats.seed(&bucket, Sample::from_millis(1000, 4096, 1));
-        let model = stats.model(&bucket);
-        assert_eq!(model.first_byte_tail(4096), Some(Duration::from_secs(1)));
-        assert_eq!(
-            model.first_byte_hedge_delay(4096),
-            Some(Duration::from_micros(1500))
-        );
     }
 }

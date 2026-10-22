@@ -59,7 +59,7 @@ latency history.
 
 Models refit at most once per second, or sooner while the observation count
 doubles. Samples are copied under the bucket's statistics lock, then fitted outside
-it, one refit per bucket at a time.
+it.
 
 ## Deadlines and hedging
 

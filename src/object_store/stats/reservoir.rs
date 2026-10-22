@@ -189,15 +189,16 @@ mod tests {
             for index in 0..100 {
                 reservoir.retain(at, 2, (f64::from(index) + 0.5) / 100.0);
             }
-            let refilled: f64 = reservoir
+            let refilled: Vec<_> = reservoir
                 .weighted(at)
-                .filter(|(value, _)| *value == 2)
-                .map(|(_, weight)| weight)
-                .sum();
-            assert!(
-                (refilled / 100.0 - 1.0).abs() < 0.05,
-                "{survivor}: {refilled}"
-            );
+                .filter_map(|(value, weight)| (value == 2).then_some(weight))
+                .collect();
+            // An emptied reservoir samples afresh.
+            if !survivor {
+                assert_eq!(refilled.len(), 100);
+            }
+            let mass: f64 = refilled.iter().sum();
+            assert!((mass / 100.0 - 1.0).abs() < 0.05, "{survivor}: {mass}");
         }
     }
 
@@ -220,6 +221,8 @@ mod tests {
             (0.55, 5),
             (0.6, 5),
             (0.65, 7),
+            // 0.7 × 10 rounds above 7 in floating point.
+            (0.7, 7),
             (0.8, 7),
             (0.85, 8),
             (0.9, 8),
