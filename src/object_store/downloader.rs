@@ -1047,6 +1047,67 @@ mod tests {
         assert_eq!(metrics(&downloader, "bucket").await.consecutive_failures, 1);
     }
 
+    /// Once headers announce a small object, a page read is overdue by the standard of
+    /// small objects rather than of the large pages that dominate its request tail.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_read_of_a_small_object_is_judged_by_its_announced_length() {
+        let page = 16 * MIB;
+        let (downloader, _) = scripted_downloader([
+            ("local", 10, 1_000, false),
+            ("local", 10, 1_000, false),
+            ("local", 10, 1_000, false),
+            ("peer", 10, 5, false),
+        ]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        for (bucket, count, first_byte_ms, body_bytes, body_ms) in [
+            ("local", 5, 10, 4, 1),
+            ("local", 3, 10, page, 400),
+            ("peer", 1, 45, 4, 5),
+        ] {
+            for _ in 0..count {
+                seed(
+                    &downloader,
+                    bucket,
+                    Sample {
+                        requested_bytes: page,
+                        first_byte: Duration::from_millis(first_byte_ms),
+                        body_bytes,
+                        body: Duration::from_millis(body_ms),
+                    },
+                );
+            }
+        }
+        let read = async |buckets: &[&str]| {
+            let buckets =
+                BucketNameSet::new(buckets.iter().map(|name| BucketName::new(*name).unwrap()))
+                    .unwrap();
+            downloader
+                .download(
+                    &buckets,
+                    ObjectKey::new("object").unwrap(),
+                    &(0..page),
+                    &RequestConfig::default(),
+                )
+                .await
+                .unwrap()
+        };
+        let (.., output) = tokio::join!(
+            read(&["local"]),
+            read(&["local"]),
+            read(&["local"]),
+            async {
+                sleep(Duration::from_millis(200)).await;
+                read(&["local", "peer"]).await
+            }
+        );
+        assert_eq!(output.used_bucket_idx, 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_primary_failure_survives_its_hedges_timeout() {
         let (downloader, script) =
