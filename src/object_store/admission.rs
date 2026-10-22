@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
+use parking_lot::Mutex;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, timeout_at},
@@ -7,11 +8,52 @@ use tokio::{
 
 use super::{DownloadError, DownloadLimits};
 
+const INTERVAL_ALPHA: f64 = 0.1;
+
 #[derive(Debug)]
 pub(super) struct DownloadAdmission {
     requests: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     max_bytes: u64,
+    queue: Mutex<Queue>,
+}
+
+/// Copies waiting for admission, which depart when admitted, expired, or cancelled.
+#[derive(Debug, Default)]
+struct Queue {
+    waiting: u32,
+    /// Moving average of the time between departures since the queue last emptied.
+    interval: Duration,
+    last_departure: Option<Instant>,
+}
+
+impl Queue {
+    /// Each copy ahead takes one interval to depart.
+    fn predicted_wait(&self) -> Duration {
+        self.interval.saturating_mul(self.waiting)
+    }
+
+    fn depart(&mut self, now: Instant) {
+        self.waiting -= 1;
+        if self.waiting == 0 {
+            *self = Self::default();
+        } else if let Some(last) = self.last_departure.replace(now) {
+            let interval = now.saturating_duration_since(last);
+            self.interval = if self.interval.is_zero() {
+                interval
+            } else {
+                self.interval.mul_f64(1.0 - INTERVAL_ALPHA) + interval.mul_f64(INTERVAL_ALPHA)
+            };
+        }
+    }
+}
+
+struct Waiting<'a>(&'a Mutex<Queue>);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.lock().depart(Instant::now());
+    }
 }
 
 pub(super) struct DownloadPermit {
@@ -25,6 +67,7 @@ impl DownloadAdmission {
             requests: Arc::new(Semaphore::new(limits.max_inflight_requests as usize)),
             bytes: Arc::new(Semaphore::new(limits.max_inflight_bytes as usize)),
             max_bytes: limits.max_inflight_bytes,
+            queue: Mutex::default(),
         }
     }
 
@@ -38,13 +81,26 @@ impl DownloadAdmission {
             })
     }
 
+    /// Queues only while a copy can still start by `latest_start`, failing at once when the
+    /// copies already waiting would take too long to admit.
     pub async fn acquire(
         &self,
         bytes: u64,
-        deadline: Instant,
+        latest_start: Instant,
     ) -> Result<DownloadPermit, DownloadError> {
         let bytes = self.byte_permits(bytes)?;
-        timeout_at(deadline, async {
+        if let Some(permit) = self.try_acquire_permits(bytes) {
+            return Ok(permit);
+        }
+        let _waiting = {
+            let mut queue = self.queue.lock();
+            if Instant::now() + queue.predicted_wait() >= latest_start {
+                return Err(DownloadError::AdmissionTimeout);
+            }
+            queue.waiting += 1;
+            Waiting(&self.queue)
+        };
+        timeout_at(latest_start, async {
             let request = self
                 .requests
                 .clone()
@@ -67,7 +123,10 @@ impl DownloadAdmission {
     }
 
     pub fn try_acquire(&self, bytes: u64) -> Option<DownloadPermit> {
-        let bytes = self.byte_permits(bytes).ok()?;
+        self.try_acquire_permits(self.byte_permits(bytes).ok()?)
+    }
+
+    fn try_acquire_permits(&self, bytes: u32) -> Option<DownloadPermit> {
         let request = self.requests.clone().try_acquire_owned().ok()?;
         let bytes = self.bytes.clone().try_acquire_many_owned(bytes).ok()?;
         Some(DownloadPermit {
@@ -81,10 +140,61 @@ impl DownloadAdmission {
 mod tests {
     use std::time::Duration;
 
-    use tokio::time::Instant;
+    use tokio::time::{Instant, sleep};
 
     use super::DownloadAdmission;
     use crate::object_store::{DownloadError, DownloadLimits};
+
+    /// Copies hold the only slot for 100 ms, so queued copies depart 100 ms apart.
+    #[tokio::test(start_paused = true)]
+    async fn copies_that_would_wait_too_long_fail_without_queueing() {
+        let admission = &DownloadAdmission::new(DownloadLimits {
+            max_inflight_requests: 1,
+            ..DownloadLimits::default()
+        });
+        let hold = |held, latest_start| async move {
+            let permit = admission.acquire(4, latest_start).await?;
+            sleep(Duration::from_millis(held)).await;
+            drop(permit);
+            Ok::<_, DownloadError>(())
+        };
+        let start = Instant::now();
+        let late = start + Duration::from_secs(1);
+        let (first, second, third, fourth, (refused, refused_after, fifth)) = tokio::join!(
+            hold(100, late),
+            hold(100, late),
+            hold(100, late),
+            hold(100, late),
+            async {
+                sleep(Duration::from_millis(250)).await;
+                let arrived = Instant::now();
+                // Behind one waiting copy, the slot frees at 400 ms.
+                let refused = admission
+                    .acquire(4, start + Duration::from_millis(340))
+                    .await;
+                let refused_after = arrived.elapsed();
+                let fifth = hold(100, start + Duration::from_millis(500)).await;
+                (refused, refused_after, fifth)
+            }
+        );
+        assert!(matches!(refused, Err(DownloadError::AdmissionTimeout)));
+        assert_eq!(refused_after, Duration::ZERO);
+        for held in [first, second, third, fourth, fifth] {
+            held.unwrap();
+        }
+
+        // Once the queue empties, its departures no longer predict waits.
+        let start = Instant::now();
+        let late = start + Duration::from_secs(1);
+        let (first, second, third) = tokio::join!(
+            hold(10, late),
+            hold(10, late),
+            hold(10, start + Duration::from_millis(50)),
+        );
+        for held in [first, second, third] {
+            held.unwrap();
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn waiting_and_cancellation_release_request_and_byte_capacity() {

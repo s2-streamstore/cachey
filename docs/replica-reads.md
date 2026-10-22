@@ -105,8 +105,13 @@ budget still permits fallback and deadline rescue.
 | `--hedge-budget-percent` | 5% |
 
 Server reads reserve 16 MiB each, admitting 64 copies by default. This limit is
-separate from cache capacity and total process memory. Copies other than early
-hedges and body retries can wait for admission within the page deadline.
+separate from cache capacity and total process memory.
+
+Copies other than early hedges and body retries wait for admission only until
+their timeout allowance before the deadline. A copy fails at once if the copies
+already waiting would take longer to leave the queue. Each is expected to take the
+average time between departures, admitted or abandoned, since the queue was last
+empty.
 
 Rust callers use `DownloadLimits`; the default active-copy limit is 1,024. Downloader
 clones share limits.

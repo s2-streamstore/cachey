@@ -221,14 +221,17 @@ impl BucketOperation<'_> {
         admission: Option<DownloadPermit>,
         fetch: impl AsyncFnOnce() -> Result<T, DownloadError>,
     ) -> Result<T, DownloadError> {
-        let _admission = match admission {
-            Some(permit) => permit,
-            None => {
-                self.downloader
-                    .admission
-                    .acquire(self.request.bytes(), self.deadline.current())
-                    .await?
-            }
+        let _admission = if let Some(permit) = admission {
+            permit
+        } else {
+            let deadline = self.deadline.current();
+            let latest_start = deadline
+                .checked_sub(self.timeout_allowance())
+                .unwrap_or(deadline);
+            self.downloader
+                .admission
+                .acquire(self.request.bytes(), latest_start)
+                .await?
         };
         let now = Instant::now();
         let (bucket_deadline, first_admitted) = self
@@ -2290,13 +2293,16 @@ mod tests {
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
-    /// A fallback waits for admission; a body retry against the same bucket does not.
+    /// A fallback waits for admission while it could still finish in time; a body retry
+    /// against the same bucket does not wait.
     #[tokio::test(start_paused = true)]
     async fn fallback_admission_timeout_preserves_backend_failure_but_overrides_missing() {
         let page_timeout = Duration::from_millis(100);
+        // The peer's 5 ms reads must start 5 ms before the page deadline.
+        let latest_start = Duration::from_millis(95);
         for (buckets, missing, elapsed) in [
-            (&["local", "peer"][..], false, page_timeout),
-            (&["local", "peer"], true, page_timeout),
+            (&["local", "peer"][..], false, latest_start),
+            (&["local", "peer"], true, latest_start),
             (&["local"], false, Duration::from_millis(2)),
         ] {
             let (downloader, script) = scripted_downloader([("local", 2, 0, true)]);
