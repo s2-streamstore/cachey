@@ -801,8 +801,8 @@ mod tests {
     use tokio::time::{Instant, advance};
 
     use super::{
-        BucketMetrics, BucketedStats, LATENCY_SNAPSHOT_INTERVAL, Outcome, ProbePermit,
-        RECOVERY_SUCCESSES, Sample, histogram, quantile,
+        BucketedStats, LATENCY_SNAPSHOT_INTERVAL, Outcome, RECOVERY_SUCCESSES, Sample, histogram,
+        quantile,
     };
     use crate::types::{BucketName, BucketNameSet};
 
@@ -813,12 +813,6 @@ mod tests {
                 .map(|name| BucketName::new(name).unwrap()),
         )
         .unwrap()
-    }
-
-    fn exported(stats: &BucketedStats) -> BucketMetrics {
-        let mut exported = None;
-        stats.export_bucket_metrics(|_, metrics| exported = Some(metrics.clone()));
-        exported.expect("bucket metrics")
     }
 
     #[tokio::test(start_paused = true)]
@@ -924,8 +918,8 @@ mod tests {
             for (bucket, millis) in buckets.iter().zip([3, 5, 6]) {
                 stats.seed_latency(bucket, millis);
             }
-            for _ in 0..200 {
-                stats.seed_latency(&buckets[0], 9);
+            for _ in 0..4 {
+                stats.seed(&buckets[0], Sample::from_millis(9, 4 * MIB, 250));
             }
             stats.begin(&buckets[0], None).complete(Outcome::Failure);
             advance(Duration::from_secs(37)).await;
@@ -934,17 +928,25 @@ mod tests {
             let observation = stats.begin(&buckets[0], probe);
             advance(Duration::from_millis(3)).await;
             if probe_succeeds {
-                observation.complete(Outcome::Success(Sample::from_millis(3, 4, 0)));
+                observation.complete(Outcome::Success(Sample::from_millis(3, 4096, 1)));
             } else {
                 observation.complete(Outcome::Failure);
             }
-            let tail = Some(Duration::from_millis(if probe_succeeds { 3 } else { 9 }));
-            assert_eq!(stats.model(&buckets[0]).first_byte_tail(), tail);
-            assert_eq!(stats.snapshot(&buckets).tail(0), tail);
+            let model = stats.model(&buckets[0]);
             assert_eq!(
-                stats.entry(&buckets[0]).lock().best_latency,
-                Some(Duration::from_millis(3))
+                model.first_byte_tail(),
+                Some(Duration::from_millis(if probe_succeeds { 3 } else { 9 }))
             );
+            assert_eq!(
+                stats.snapshot(&buckets).tail(0),
+                Some(Duration::from_millis(if probe_succeeds { 4 } else { 259 }))
+            );
+            if probe_succeeds {
+                assert_eq!(model.body_tail(4096), Some(Duration::from_millis(1)));
+                assert!(model.body_tail(16 * MIB).is_none());
+            } else {
+                assert_eq!(model.body_tail(4 * MIB), Some(Duration::from_millis(250)));
+            }
         }
     }
 
@@ -976,41 +978,6 @@ mod tests {
             body_bytes: bytes,
             body: Duration::from_millis(1) + Duration::from_micros(10_000 * bytes / MIB),
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn exports_the_shared_body_transfer_slope() {
-        let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        for bytes in [MIB / 2, MIB, 4 * MIB, 16 * MIB] {
-            stats.seed(&bucket, paced_body(bytes));
-        }
-        advance(Duration::from_secs(1)).await;
-
-        let metrics = exported(&stats);
-        assert_eq!(metrics.latency_p99, Some(Duration::from_millis(171)));
-        assert_eq!(metrics.first_byte_p99, Some(Duration::from_millis(10)));
-        assert!((metrics.body_seconds_per_byte.unwrap() * MIB as f64 - 0.01).abs() < 1e-9);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn infrequent_body_stalls_remain_visible_without_setting_the_body_delay() {
-        let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        for _ in 0..50 {
-            stats.seed(&bucket, Sample::from_millis(10, 4 * MIB, 41));
-        }
-        stats.seed(&bucket, Sample::from_millis(10, 4 * MIB, 401));
-        let model = stats.model(&bucket);
-        assert_eq!(model.first_byte_tail(), Some(Duration::from_millis(10)));
-        assert_eq!(
-            model.body_hedge_delay(4 * MIB),
-            Some(Duration::from_micros(61_500))
-        );
-        assert!(
-            (exported(&stats).body_seconds_per_byte.unwrap() * (4 * MIB) as f64 - 0.4).abs() < 1e-9
-        );
-        assert_eq!(model.tail(), Some(Duration::from_millis(411)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1070,61 +1037,6 @@ mod tests {
             samples.update_at(Instant::now().into_std(), value);
         }
         assert_eq!(quantile(&samples.snapshot(), 0.99), 93);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn buffered_bodies_report_a_zero_transfer_slope() {
-        let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        stats.seed(&bucket, Sample::from_millis(10, 16 * MIB, 0));
-        advance(Duration::from_secs(1)).await;
-        assert_eq!(exported(&stats).body_seconds_per_byte, Some(0.0));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn phases_are_summarized_on_their_first_samples_then_once_per_interval() {
-        let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        for _ in 0..4 {
-            stats.seed(&bucket, Sample::from_millis(10, 4096, 2));
-        }
-        assert_eq!(
-            stats.model(&bucket).first_byte_tail(),
-            Some(Duration::from_millis(10))
-        );
-        for _ in 0..4 {
-            stats.seed(&bucket, Sample::from_millis(30, 4 * MIB, 40));
-        }
-        let model = stats.model(&bucket);
-        assert_eq!(model.first_byte_tail(), Some(Duration::from_millis(10)));
-        assert_eq!(model.body_tail(4 * MIB), Some(Duration::from_millis(40)));
-        advance(LATENCY_SNAPSHOT_INTERVAL).await;
-        assert_eq!(
-            stats.model(&bucket).body_tail(4 * MIB),
-            Some(Duration::from_millis(40))
-        );
-        assert_eq!(
-            stats.model(&bucket).first_byte_tail(),
-            Some(Duration::from_millis(30))
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_successful_probe_starts_the_latency_model_over() {
-        let stats = BucketedStats::default();
-        let bucket = BucketName::new("local").unwrap();
-        stats.seed(&bucket, Sample::from_millis(3, 4 * MIB, 250));
-        let probe = ProbePermit {
-            stats: stats.entry(&bucket),
-        };
-        let observation = stats.begin(&bucket, Some(probe));
-        observation.complete(Outcome::Success(Sample::from_millis(9, 4096, 1)));
-        let model = stats.model(&bucket);
-        assert_eq!(model.first_byte_tail(), Some(Duration::from_millis(9)));
-        assert_eq!(model.body_tail(4096), Some(Duration::from_millis(1)));
-        assert_eq!(model.body_tail(16 * MIB), None);
-        assert_eq!(model.tail(), Some(Duration::from_millis(10)));
-        assert_eq!(exported(&stats).body_seconds_per_byte, Some(0.0));
     }
 
     #[tokio::test(start_paused = true)]

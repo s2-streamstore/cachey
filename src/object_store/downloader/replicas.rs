@@ -1,14 +1,16 @@
 use std::{
     collections::VecDeque,
+    future::poll_fn,
     ops::Range,
+    pin::Pin,
     sync::{
         OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
-use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::{
     select,
     time::{Instant, sleep_until},
@@ -35,6 +37,22 @@ struct Completion {
     result: Result<ObjectPiece, DownloadError>,
 }
 
+async fn next_completion<F: Future<Output = Completion>>(
+    copies: &mut Vec<(usize, Pin<Box<F>>)>,
+) -> Completion {
+    let (position, completion) = poll_fn(|context| {
+        for (position, (_, future)) in copies.iter_mut().enumerate() {
+            if let Poll::Ready(completion) = future.as_mut().poll(context) {
+                return Poll::Ready((position, completion));
+            }
+        }
+        Poll::Pending
+    })
+    .await;
+    drop(copies.remove(position));
+    completion
+}
+
 fn priority(error: &DownloadError) -> u8 {
     match error {
         DownloadError::NoSuchKey => 0,
@@ -53,7 +71,6 @@ fn priority(error: &DownloadError) -> u8 {
 #[derive(Default)]
 struct BucketState {
     tried: bool,
-    in_flight: usize,
     body_failed: bool,
     error: Option<(usize, DownloadError)>,
 }
@@ -262,23 +279,12 @@ struct Followups<'a> {
 }
 
 impl Followups<'_> {
-    /// Whether a copy to an unsettled bucket is in flight.
-    fn awaiting(&self) -> bool {
-        self.states
-            .buckets
-            .iter()
-            .any(|bucket| bucket.in_flight > 0 && !bucket.settled())
-    }
-
     fn started(&mut self, index: usize) {
-        let bucket = &mut self.states.buckets[index];
-        bucket.tried = true;
-        bucket.in_flight += 1;
+        self.states.buckets[index].tried = true;
     }
 
     fn failed(&mut self, index: usize, error: DownloadError) {
         let bucket = &mut self.states.buckets[index];
-        bucket.in_flight -= 1;
         bucket.body_failed |= error.should_retry_same_bucket();
         self.states.record(index, error);
     }
@@ -301,7 +307,12 @@ impl Followups<'_> {
 
     /// Prefer untried buckets. Retry a failed body only after other copies finish,
     /// at most once per page and within the retry budget.
-    fn next(&mut self, trigger: Trigger, hedge: &mut HedgeTimer<'_>) -> Option<CopyAttempt> {
+    fn next(
+        &mut self,
+        trigger: Trigger,
+        hedge: &mut HedgeTimer<'_>,
+        idle: bool,
+    ) -> Option<CopyAttempt> {
         if let Trigger::Rescue(index) = trigger
             && self.states.buckets[index].tried
         {
@@ -325,7 +336,7 @@ impl Followups<'_> {
                 )
                 .unwrap_or(self.request.primary),
             Trigger::Fallback => routing.best(untried, remaining).or_else(|| {
-                if self.retried || self.awaiting() {
+                if self.retried || !idle {
                     return None;
                 }
                 routing.best(
@@ -437,24 +448,30 @@ impl Downloader {
             request.bucket_deadline(primary),
             self.limits.hedge_budget_percent > 0 && probe.is_none(),
         );
-        let mut active = FuturesUnordered::new();
-        active.push(request.attempt(CopyAttempt {
-            index: primary,
-            model: primary_model,
-            first_for_bucket: true,
-            probe,
-            permits: primary_permits,
-        }));
-        while followups.awaiting() {
+        let mut active = Vec::with_capacity(MAX_CONCURRENT_COPIES);
+        active.push((
+            primary,
+            Box::pin(request.attempt(CopyAttempt {
+                index: primary,
+                model: primary_model,
+                first_for_bucket: true,
+                probe,
+                permits: primary_permits,
+            })),
+        ));
+        while !active.is_empty() {
             let trigger = select! {
                 biased;
-                Some(Completion { index, is_primary, result }) = active.next() => {
+                Completion { index, is_primary, result } = next_completion(&mut active) => {
                     let error = match result {
                         Ok(piece) => return Ok(request.output(piece, index, start)),
                         Err(error) => error,
                     };
                     if !error.should_attempt_fallback_bucket() {
                         return Err(error);
+                    }
+                    if error.repeats_within_bucket() {
+                        active.retain(|(bucket, _)| *bucket != index);
                     }
                     if is_primary {
                         hedge.disarm();
@@ -466,9 +483,9 @@ impl Downloader {
                 () = hedge.due() => Trigger::Hedge,
             };
             if active.len() < MAX_CONCURRENT_COPIES
-                && let Some(copy) = followups.next(trigger, &mut hedge)
+                && let Some(copy) = followups.next(trigger, &mut hedge, active.is_empty())
             {
-                active.push(request.attempt(copy));
+                active.push((copy.index, Box::pin(request.attempt(copy))));
             }
         }
         Err(followups.into_error())

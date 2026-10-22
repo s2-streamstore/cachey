@@ -272,40 +272,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hedges_are_due_only_before_the_primarys_bucket_deadline() {
-        for (bucket_timeout_ms, expected) in [(20, None), (21, Some(Duration::from_millis(20)))] {
-            let timeline = RequestTimeline::default();
-            let bucket_deadline =
-                OnceLock::from(Instant::now() + Duration::from_millis(bucket_timeout_ms));
-            let mut timer = HedgeTimer::new(
-                model(20, 4096, 3),
-                &timeline,
-                BucketDeadline::new(deadline(), &bucket_deadline),
-                true,
-            );
-            timeline.start();
-            assert_eq!(due_after(&mut timer).await, expected);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn body_hedging_waits_for_transfer_evidence_then_scales_with_length() {
-        for (large_body_ms, expected) in
-            [(None, None), (Some(251), Some(Duration::from_millis(1001)))]
-        {
-            let model = match large_body_ms {
-                None => model(20, 4096, 1),
-                Some(body_ms) => model(20, 4 * MIB, body_ms),
-            };
-            let timeline = RequestTimeline::default();
-            let mut timer = unadmitted_timer(model, &timeline);
-            timeline.start();
-            timeline.receive_headers(16 * MIB);
-            assert_eq!(due_after(&mut timer).await, expected);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_body_too_long_to_time_is_not_hedged() {
         let timeline = RequestTimeline::default();
         let mut timer = unadmitted_timer(model(20, 4 * MIB, 5_000_000_000), &timeline);

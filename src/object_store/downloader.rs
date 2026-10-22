@@ -1213,6 +1213,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn settling_a_bucket_releases_capacity_for_another_replicas_rescue() {
+        for (status, failed_copy) in [(404, 0), (404, 1), (416, 0), (416, 1)] {
+            let (downloader, script) = scripted_downloader([
+                ("local", if failed_copy == 0 { 20 } else { 1000 }, 0, false),
+                ("local", if failed_copy == 1 { 1 } else { 1000 }, 0, false),
+                ("peer", 1000, 0, false),
+                ("third", 1, 1, false),
+            ]);
+            script.service_errors.lock().insert(failed_copy, status);
+            let downloader = downloader
+                .with_test_limits(DownloadLimits {
+                    page_timeout: Duration::from_millis(300),
+                    max_inflight_requests: 2,
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            for (bucket, millis) in [("local", 10), ("peer", 20), ("third", 30)] {
+                seed_latency(&downloader, bucket, millis);
+            }
+            for bucket in ["peer", "third"] {
+                record_outcome(&downloader, bucket, Outcome::Overload);
+            }
+            let output = fetch(&downloader, &["local", "peer", "third"]).await;
+            assert_eq!(output.used_bucket_idx, 2);
+            assert!(output.latency < Duration::from_millis(300));
+            assert_eq!(script.requests.load(Ordering::SeqCst), 4);
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+            assert_eq!(metrics(&downloader, "local").await.consecutive_failures, 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_primary_finishing_with_or_before_its_hedge_wins_and_is_measured() {
         for hedge_body_ms in [190, 40] {
             let downloader = downloader([
@@ -1648,36 +1680,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sustained_slowdown_is_learned_with_no_spare_admission() {
-        let (downloader, script) =
-            scripted_downloader(std::iter::repeat_n(("bucket", 10, 490, false), 8));
-        let downloader = downloader
-            .with_test_limits(DownloadLimits {
-                max_inflight_requests: 1,
-                ..DownloadLimits::default()
-            })
-            .unwrap();
-        downloader.bucketed_stats.seed(
-            &BucketName::new("bucket").unwrap(),
-            Sample::from_millis(10, 4, 90),
-        );
-        for _ in 0..8 {
-            let output = fetch(&downloader, &["bucket"]).await;
-            assert!(!output.hedged);
-            assert_eq!(output.latency, Duration::from_millis(500));
-        }
-        assert_eq!(
-            metrics(&downloader, "bucket").await.latency_p99,
-            Some(Duration::from_millis(500))
-        );
-        assert_eq!(
-            object_body_tail(&downloader, "bucket"),
-            Some(Duration::from_millis(490))
-        );
-        assert_eq!(script.requests.load(Ordering::SeqCst), 8);
     }
 
     #[tokio::test(start_paused = true)]

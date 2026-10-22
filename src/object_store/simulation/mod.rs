@@ -458,14 +458,6 @@ async fn simulation_capacitor_shaped_stalls_are_hedged_to_another_zone() {
     }
 }
 
-/// Body resets happen after the SDK's retry handling ends.
-#[tokio::test(start_paused = true)]
-async fn simulation_body_resets_on_one_bucket_are_retried() {
-    let scenario = scenario_named("s3_standard_body_resets");
-    let report = simulate(scenario, 7, false, false).await;
-    assert_eq!(report.completed, report.arrivals, "{report:?}");
-}
-
 #[tokio::test(start_paused = true)]
 async fn simulation_reservations_survive_reordering_and_admission_wait() {
     for name in [

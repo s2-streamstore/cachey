@@ -32,6 +32,8 @@ body time = fixed cost + response bytes × transfer cost per byte
 Both coefficients are nonnegative. Predictions have a 1 ms floor, and p99 stays at
 or above the median. Samples from all objects and response sizes train the same
 model. Sampling by size preserves rare large transfers.
+Retained body samples use inclusion-corrected weights so sampling does not apply
+age decay a second time.
 
 Models refresh at most once per second, or sooner when the sample count doubles.
 Fits with more than 64 retained samples run on Tokio's blocking pool, with one
@@ -52,6 +54,8 @@ run per page; the first validated result wins and cancels the others.
 Early hedges use one SDK attempt, skip overloaded buckets, and never wait for
 admission. They prefer an untried bucket but can use the primary's bucket. A failed
 body can be retried once when no other copy or untried bucket remains.
+A missing object, unsatisfied range, or invalid object state cancels all remaining
+copies to that bucket immediately, releasing their admission capacity.
 
 Hedges and body retries have separate budgets funded by successful reads. The
 default allows one startup hedge and one per 20 successful pages. A zero hedge
