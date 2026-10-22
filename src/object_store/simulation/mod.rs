@@ -410,16 +410,28 @@ async fn assert_stalls_are_rescued(
     reports
 }
 
-/// Stalls exceed 1% of reads, so uncapped p99 would delay hedges too long.
 /// Allow 1.5 nominal reads for the hedge delay plus one for the replacement.
+fn hedged_read_ms(scenario: &Scenario, bytes: usize) -> u64 {
+    scenario.replicas[0].read_ms(bytes) * 5 / 2 + 30
+}
+
+/// Allow at most 2% of healthy reads to overlap copies.
+async fn assert_rarely_hedged(name: &str) {
+    for seed in [7, 42, 2026] {
+        let report = simulate(scenario_named(name), seed, false, false).await;
+        assert_eq!(report.completed, report.arrivals, "{name} seed {seed}");
+        assert!(
+            report.overlapping_reads * 50 <= report.arrivals,
+            "{name} seed {seed}: {} hedged",
+            report.overlapping_reads
+        );
+    }
+}
+
+/// Stalls exceed 1% of reads, so uncapped p99 would delay hedges too long.
 #[tokio::test(start_paused = true)]
 async fn simulation_s3_shaped_stalls_are_hedged_at_size_aware_tails() {
-    assert_stalls_are_rescued(
-        scenario_named("s3_standard_stalls"),
-        10,
-        |scenario, bytes| scenario.replicas[0].read_ms(bytes) * 5 / 2 + 30,
-    )
-    .await;
+    assert_stalls_are_rescued(scenario_named("s3_standard_stalls"), 10, hedged_read_ms).await;
 }
 
 /// Buffering before headers requires a full-chunk latency bound even for small reads.
@@ -457,20 +469,11 @@ async fn simulation_capacitor_shaped_stalls_are_hedged_to_another_zone() {
 #[tokio::test(start_paused = true)]
 async fn simulation_exact_ranges_hedge_stalls_but_not_healthy_reads() {
     for profile in ["s3_standard", "s3_express", "capacitor"] {
-        let healthy = format!("{profile}_exact_ranges_healthy");
-        for seed in [7, 42, 2026] {
-            let report = simulate(scenario_named(&healthy), seed, false, false).await;
-            assert_eq!(report.completed, report.arrivals, "{healthy} seed {seed}");
-            assert!(
-                report.overlapping_reads * 50 <= report.arrivals,
-                "{healthy} seed {seed}: {} hedged",
-                report.overlapping_reads
-            );
-        }
+        assert_rarely_hedged(&format!("{profile}_exact_ranges_healthy")).await;
         assert_stalls_are_rescued(
             scenario_named(&format!("{profile}_exact_ranges_stalls")),
             5,
-            |scenario, bytes| scenario.replicas[0].read_ms(bytes) * 5 / 2 + 30,
+            hedged_read_ms,
         )
         .await;
     }
@@ -480,21 +483,7 @@ async fn simulation_exact_ranges_hedge_stalls_but_not_healthy_reads() {
 /// reads rarely hedge.
 #[tokio::test(start_paused = true)]
 async fn simulation_sparse_reads_rarely_hedge() {
-    for seed in [7, 42, 2026] {
-        let report = simulate(
-            scenario_named("s3_express_sparse_reads"),
-            seed,
-            false,
-            false,
-        )
-        .await;
-        assert_eq!(report.completed, report.arrivals, "seed {seed}");
-        assert!(
-            report.overlapping_reads * 50 <= report.arrivals,
-            "seed {seed}: {} hedged",
-            report.overlapping_reads
-        );
-    }
+    assert_rarely_hedged("s3_express_sparse_reads").await;
 }
 
 #[tokio::test(start_paused = true)]

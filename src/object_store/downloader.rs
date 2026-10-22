@@ -246,6 +246,7 @@ impl BucketOperation<'_> {
             self.probe.take(),
             self.timeline,
             self.request.bytes(),
+            self.model.request.tail(self.request.bytes()),
         );
         let result = select! {
             biased;
@@ -623,6 +624,12 @@ mod tests {
             .await
     }
 
+    fn seed(downloader: &Downloader, bucket: &str, sample: Sample) {
+        downloader
+            .bucketed_stats
+            .seed(&BucketName::new(bucket).unwrap(), sample);
+    }
+
     fn seed_latency(downloader: &Downloader, bucket: &str, millis: u64) {
         downloader
             .bucketed_stats
@@ -637,6 +644,7 @@ mod tests {
                 None,
                 &RequestTimeline::default(),
                 4,
+                None,
             )
             .complete(outcome);
     }
@@ -649,12 +657,12 @@ mod tests {
 
     /// The uncapped body tail for the 4-byte objects tests read.
     fn object_body_tail(downloader: &Downloader, bucket: &str) -> Option<Duration> {
-        model(downloader, bucket).body_tail(4)
+        model(downloader, bucket).body.tail(4)
     }
 
     /// The uncapped time to first byte for the 4-byte objects tests read.
     fn object_first_byte_tail(downloader: &Downloader, bucket: &str) -> Option<Duration> {
-        model(downloader, bucket).first_byte_tail(4)
+        model(downloader, bucket).first_byte.tail(4)
     }
 
     async fn metrics(downloader: &Downloader, bucket: &str) -> BucketMetrics {
@@ -1002,10 +1010,7 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        downloader.bucketed_stats.seed(
-            &BucketName::new("bucket").unwrap(),
-            Sample::from_millis(10, 4, 90),
-        );
+        seed(&downloader, "bucket", Sample::from_millis(10, 4, 90));
         let start = tokio::time::Instant::now();
         let result = fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
         assert!(
@@ -1036,7 +1041,7 @@ mod tests {
                     range: &(0..4),
                     config: &RequestConfig::default(),
                 },
-                model: downloader.bucketed_stats.model(&bucket),
+                model: model(&downloader, "bucket"),
                 timeline: &timeline,
                 deadline: BucketDeadline::new(
                     tokio::time::Instant::now() + Duration::from_millis(budget_ms),
@@ -1164,10 +1169,7 @@ mod tests {
             })
             .unwrap();
         for bucket in ["local", "peer"] {
-            downloader.bucketed_stats.seed(
-                &BucketName::new(bucket).unwrap(),
-                Sample::from_millis(20, 4, 80),
-            );
+            seed(&downloader, bucket, Sample::from_millis(20, 4, 80));
         }
         let output = fetch(&downloader, &["local", "peer"]).await;
         assert_eq!(output.used_bucket_idx, 1);
@@ -1186,8 +1188,9 @@ mod tests {
             })
             .unwrap();
         for (first_byte_ms, body_ms) in [(30, 2), (2, 30), (29, 29)] {
-            downloader.bucketed_stats.seed(
-                &BucketName::new("local").unwrap(),
+            seed(
+                &downloader,
+                "local",
                 Sample::from_millis(first_byte_ms, 4, body_ms),
             );
         }
@@ -1308,10 +1311,7 @@ mod tests {
                     ..DownloadLimits::default()
                 })
                 .unwrap();
-            downloader.bucketed_stats.seed(
-                &BucketName::new("bucket").unwrap(),
-                Sample::from_millis(5, 4 * MIB, 400),
-            );
+            seed(&downloader, "bucket", Sample::from_millis(5, 4 * MIB, 400));
             assert!(matches!(
                 fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
                 Err(DownloadError::Timeout { .. })
@@ -1466,8 +1466,9 @@ mod tests {
                     ..DownloadLimits::default()
                 })
                 .unwrap();
-            downloader.bucketed_stats.seed(
-                &BucketName::new("bucket").unwrap(),
+            seed(
+                &downloader,
+                "bucket",
                 Sample {
                     requested_bytes: 4,
                     first_byte: Duration::from_millis(10),
@@ -1658,10 +1659,7 @@ mod tests {
                     ..DownloadLimits::default()
                 })
                 .unwrap();
-            downloader.bucketed_stats.seed(
-                &BucketName::new("bucket").unwrap(),
-                Sample::from_millis(5, 16 * MIB, 200),
-            );
+            seed(&downloader, "bucket", Sample::from_millis(5, 16 * MIB, 200));
             let output = fetch(&downloader, &["bucket"]).await;
             assert!(output.latency < Duration::from_millis(30));
             assert_eq!(output.hedged, !fail_body);
@@ -1679,10 +1677,7 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        downloader.bucketed_stats.seed(
-            &BucketName::new("bucket").unwrap(),
-            Sample::from_millis(5, 16 * MIB, 200),
-        );
+        seed(&downloader, "bucket", Sample::from_millis(5, 16 * MIB, 200));
         let result = fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
         assert!(matches!(result, Err(DownloadError::Timeout { .. })));
         assert_eq!(metrics(&downloader, "bucket").await.consecutive_failures, 1);
@@ -1874,10 +1869,7 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        downloader.bucketed_stats.seed(
-            &BucketName::new("local").unwrap(),
-            Sample::from_millis(10, 4, 40),
-        );
+        seed(&downloader, "local", Sample::from_millis(10, 4, 40));
         seed_latency(&downloader, "peer", 60);
         let output = fetch(&downloader, &["local", "peer"]).await;
         assert_eq!(output.used_bucket_idx, 0);
@@ -1931,9 +1923,7 @@ mod tests {
                 range: &(0..4),
                 config: &RequestConfig::default(),
             },
-            model: downloader
-                .bucketed_stats
-                .model(&BucketName::new("local").unwrap()),
+            model: model(&downloader, "local"),
             timeline: &RequestTimeline::default(),
             deadline: BucketDeadline::new(tokio::time::Instant::now(), &OnceLock::new()),
             unmeasured: Duration::from_millis(5),
@@ -2335,9 +2325,7 @@ mod tests {
         ]);
         let bucket = BucketName::new("bucket").unwrap();
         for _ in 0..50 {
-            downloader
-                .bucketed_stats
-                .seed(&bucket, Sample::from_millis(10, 4, 90));
+            seed(&downloader, "bucket", Sample::from_millis(10, 4, 90));
         }
         drop(downloader.attempt_budget.try_hedge(&bucket).unwrap());
         let first = fetch(&downloader, &["bucket"]).await;
@@ -2361,15 +2349,10 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        let bucket = BucketName::new("bucket").unwrap();
         for _ in 0..50 {
-            downloader
-                .bucketed_stats
-                .seed(&bucket, Sample::from_millis(10, 4, 40));
+            seed(&downloader, "bucket", Sample::from_millis(10, 4, 40));
         }
-        downloader
-            .bucketed_stats
-            .seed(&bucket, Sample::from_millis(10, 4, 400));
+        seed(&downloader, "bucket", Sample::from_millis(10, 4, 400));
         let result = fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
         assert!(matches!(result, Err(DownloadError::Timeout { .. })));
         let observed = metrics(&downloader, "bucket").await;

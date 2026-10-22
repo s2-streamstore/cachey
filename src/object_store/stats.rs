@@ -3,16 +3,13 @@ mod reservoir;
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::Duration,
 };
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, MutexGuard};
-use tokio::{
-    sync::{Notify, futures::Notified},
-    time::Instant,
-};
+use tokio::{sync::SetOnce, time::Instant};
 
 pub use self::model::LatencyEstimate;
 use self::model::{Refit, SizeHistogram, SizeModel};
@@ -62,28 +59,22 @@ pub(super) struct Headers {
 /// Request timing and body length from validated headers.
 #[derive(Debug, Default)]
 pub(super) struct RequestTimeline {
-    started: OnceLock<Instant>,
-    headers: OnceLock<Headers>,
-    changed: Notify,
+    started: SetOnce<Instant>,
+    headers: SetOnce<Headers>,
 }
 
 impl RequestTimeline {
     pub fn start(&self) -> Instant {
         let now = Instant::now();
-        if self.started.set(now).is_ok() {
-            self.changed.notify_waiters();
-        }
+        let _ = self.started.set(now);
         now
     }
 
     pub fn receive_headers(&self, body_bytes: u64) {
-        let headers = Headers {
+        let _ = self.headers.set(Headers {
             at: Instant::now(),
             body_bytes,
-        };
-        if self.headers.set(headers).is_ok() {
-            self.changed.notify_waiters();
-        }
+        });
     }
 
     pub fn started(&self) -> Option<Instant> {
@@ -98,20 +89,30 @@ impl RequestTimeline {
         self.headers().map(|headers| headers.body_bytes)
     }
 
-    /// Resolves after the next change; create it before reading the timeline.
-    pub fn changed(&self) -> Notified<'_> {
-        self.changed.notified()
+    /// Resolves once the request starts, or once headers arrive if it has started.
+    pub async fn changed(&self) {
+        if self.started().is_none() {
+            self.started.wait().await;
+        } else {
+            self.headers.wait().await;
+        }
+    }
+
+    fn first_byte(&self) -> Option<Duration> {
+        Some(
+            self.headers()?
+                .at
+                .saturating_duration_since(self.started()?),
+        )
     }
 
     fn sample(&self, requested_bytes: u64) -> Option<Sample> {
-        let started = self.started()?;
         let headers = self.headers()?;
-        let now = Instant::now();
         Some(Sample {
             requested_bytes,
-            first_byte: headers.at.saturating_duration_since(started),
+            first_byte: self.first_byte()?,
             body_bytes: headers.body_bytes,
-            body: now.saturating_duration_since(headers.at),
+            body: Instant::now().saturating_duration_since(headers.at),
         })
     }
 }
@@ -147,57 +148,33 @@ impl Sample {
 /// requested bytes, bodies by the length announced in headers.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct LatencyModel {
-    first_byte: SizeModel,
-    body: SizeModel,
-    request: SizeModel,
+    pub first_byte: SizeModel,
+    pub body: SizeModel,
+    pub request: SizeModel,
 }
 
 impl LatencyModel {
-    pub fn first_byte_hedge_delay(&self, requested_bytes: u64) -> Option<Duration> {
-        self.first_byte.hedge_delay(requested_bytes)
-    }
-
-    pub fn body_hedge_delay(&self, body_bytes: u64) -> Option<Duration> {
-        self.body.hedge_delay(body_bytes)
-    }
-
-    #[cfg(test)]
-    pub fn first_byte_tail(&self, requested_bytes: u64) -> Option<Duration> {
-        self.first_byte.tail(requested_bytes)
-    }
-
-    #[cfg(test)]
-    pub fn body_tail(&self, body_bytes: u64) -> Option<Duration> {
-        self.body.tail(body_bytes)
-    }
-
-    /// p99 of a fresh request, by phase once the response size is known.
-    pub fn request_tail(&self, requested_bytes: u64, body_bytes: Option<u64>) -> Option<Duration> {
-        body_bytes
-            .and_then(|bytes| {
-                Some(
-                    self.first_byte
-                        .tail(requested_bytes)?
-                        .saturating_add(self.body.tail(bytes)?),
-                )
-            })
-            .or_else(|| self.request.tail(requested_bytes))
-    }
-
-    /// Timeouts affect health only after allowing time for each phase reached.
-    /// Use `unmeasured` for unknown phases and the request tail as a floor.
+    /// Timeouts affect health only after allowing time for each phase reached, using
+    /// `unmeasured` for unknown phases. Unless both phases are measured, the request
+    /// model is a floor.
     pub fn timeout_allowance(
         &self,
         requested_bytes: u64,
         announced_body_bytes: Option<u64>,
         unmeasured: Duration,
     ) -> Duration {
-        let first_byte = self.first_byte.tail(requested_bytes).unwrap_or(unmeasured);
-        let reached = announced_body_bytes.map_or(first_byte, |bytes| {
-            first_byte.saturating_add(self.body.tail(bytes).unwrap_or(unmeasured))
-        });
-        self.request_tail(requested_bytes, announced_body_bytes)
-            .map_or(reached, |tail| tail.max(reached))
+        let first_byte = self.first_byte.tail(requested_bytes);
+        let body = announced_body_bytes.map(|bytes| self.body.tail(bytes));
+        let reached = first_byte
+            .unwrap_or(unmeasured)
+            .saturating_add(body.map_or(Duration::ZERO, |tail| tail.unwrap_or(unmeasured)));
+        match (first_byte, body) {
+            (Some(_), Some(Some(_))) => reached,
+            _ => self
+                .request
+                .tail(requested_bytes)
+                .map_or(reached, |tail| tail.max(reached)),
+        }
     }
 }
 
@@ -225,17 +202,6 @@ impl LatencyEstimates {
         self.body.update(now, sample.body_bytes, sample.body);
         self.request
             .update(now, sample.requested_bytes, sample.latency());
-    }
-
-    /// An unvalidated copy still measures any headers it received.
-    fn record_headers(&mut self, now: Instant, requested_bytes: u64, timeline: &RequestTimeline) {
-        if let (Some(started), Some(headers)) = (timeline.started(), timeline.headers()) {
-            self.first_byte.update(
-                now,
-                requested_bytes,
-                headers.at.saturating_duration_since(started),
-            );
-        }
     }
 
     fn histograms(&mut self) -> [&mut SizeHistogram; 3] {
@@ -319,7 +285,7 @@ impl BucketStats {
     }
 
     /// A recovery probe replaces routing history; latency estimates keep theirs.
-    fn succeed(&mut self, now: Instant, sample: &Sample, generation: u64, probe: bool) {
+    fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
         let latency = sample.latency();
         match self.success_latency {
             Some(mean) if !probe => {
@@ -338,6 +304,9 @@ impl BucketStats {
         self.routing_updated_at = now;
         self.best_latency = Some(self.best_latency.map_or(latency, |best| best.min(latency)));
         self.estimates.record(now, sample);
+    }
+
+    fn succeed(&mut self, now: Instant, generation: u64, probe: bool) {
         let error_rate = self.error_rate(now);
         if generation == self.generation {
             self.error_rate = error_rate * (1.0 - ERROR_ALPHA);
@@ -406,11 +375,12 @@ impl BucketStats {
     }
 }
 
-/// Refits once per interval, or sooner while observation counts double. Fitting runs
-/// outside the lock so it does not delay the bucket's copies; claiming the refit under
-/// the lock leaves concurrent callers nothing to refit.
-fn latency_model(stats: &mut MutexGuard<'_, BucketStats>, now: Instant) -> LatencyModel {
-    let due = now.duration_since(stats.summarized_at) >= LATENCY_SNAPSHOT_INTERVAL;
+/// Refits once per interval if `interval` allows, or sooner while observation counts
+/// double, and reports whether it did. Fitting runs outside the lock so it does not
+/// delay the bucket's copies; claiming the refit under the lock leaves concurrent callers
+/// nothing to refit.
+fn refit(stats: &mut MutexGuard<'_, BucketStats>, now: Instant, interval: bool) -> bool {
+    let due = interval && now.duration_since(stats.summarized_at) >= LATENCY_SNAPSHOT_INTERVAL;
     if due {
         stats.summarized_at = now;
     }
@@ -418,16 +388,16 @@ fn latency_model(stats: &mut MutexGuard<'_, BucketStats>, now: Instant) -> Laten
         .estimates
         .histograms()
         .map(|histogram| histogram.refit(due));
-    if refits.iter().any(Option::is_some) {
-        let models =
-            MutexGuard::unlocked(stats, || refits.map(|refit| refit.map(|refit| refit.fit())));
-        for (histogram, model) in stats.estimates.histograms().into_iter().zip(models) {
-            if let Some(model) = model {
-                histogram.set_model(model);
-            }
+    if refits.iter().all(Option::is_none) {
+        return false;
+    }
+    let models = MutexGuard::unlocked(stats, || refits.map(|refit| refit.map(|refit| refit.fit())));
+    for (histogram, model) in stats.estimates.histograms().into_iter().zip(models) {
+        if let Some(model) = model {
+            histogram.set_model(model);
         }
     }
-    stats.estimates.model()
+    true
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -480,15 +450,23 @@ impl Drop for BucketObservation<'_> {
                 stats.timed.remove(&timed);
             }
         }
+        let probe = self.probe.is_some();
         match self.outcome {
             Some(Outcome::Success) => {
                 if let Some(sample) = self.timeline.sample(self.requested_bytes) {
-                    stats.succeed(now, &sample, self.generation, self.probe.is_some());
+                    stats.record(now, &sample, probe);
+                }
+                stats.succeed(now, self.generation, probe);
+            }
+            // An unvalidated copy still measures any headers it received.
+            _ => {
+                if let Some(first_byte) = self.timeline.first_byte() {
+                    stats
+                        .estimates
+                        .first_byte
+                        .update(now, self.requested_bytes, first_byte);
                 }
             }
-            _ => stats
-                .estimates
-                .record_headers(now, self.requested_bytes, self.timeline),
         }
         match self.outcome {
             None => stats.raise_routing_latency(now, now.duration_since(self.started)),
@@ -563,15 +541,15 @@ impl RoutingSnapshot {
         limits: DownloadLimits,
     ) -> VecDeque<(Duration, usize)> {
         let page_budget = limits.page_timeout;
-        let unknown_latency = page_budget / u32::try_from(self.0.len()).unwrap_or(u32::MAX);
+        let unknown_latency = limits.bucket_share(self.0.len());
         let reserve_budget = page_budget / 3 * 2;
         let mut schedule = Vec::with_capacity(self.0.len());
         schedule.extend((0..self.0.len()).filter_map(|index| {
-            let tail = self.tail(index);
-            if index == primary || tail.is_some_and(|tail| tail >= page_budget) {
+            if index == primary || !self.feasible(index, page_budget) {
                 return None;
             }
-            let reserve = tail
+            let reserve = self
+                .tail(index)
                 .map_or(unknown_latency, |tail| {
                     tail.saturating_mul(2)
                         .min(reserve_budget)
@@ -682,33 +660,32 @@ impl BucketedStats {
         self.by_bucket.entry(bucket.clone()).or_default().clone()
     }
 
-    /// A copy becomes overdue after four times its predicted request tail; without a
-    /// prediction for its size, it never does.
+    /// A copy becomes overdue after four times its expected request tail; without an
+    /// expectation for its size, it never does.
     pub(super) fn begin<'a>(
         &self,
         bucket: &BucketName,
         probe: Option<ProbePermit>,
         timeline: &'a RequestTimeline,
         requested_bytes: u64,
+        expected_tail: Option<Duration>,
     ) -> BucketObservation<'a> {
         let stats = self.entry(bucket);
         let started = Instant::now();
-        let (timed, generation) = {
+        let timed = expected_tail.map(|tail| {
+            let overdue = tail.saturating_mul(4).max(Duration::from_millis(1));
+            (started + overdue, started)
+        });
+        let generation = {
             let mut stats = stats.lock();
             if probe.is_some() {
                 stats.probe_after = started + recovery_delay();
             }
-            let timed = latency_model(&mut stats, started)
-                .request_tail(requested_bytes, None)
-                .map(|tail| {
-                    let overdue = tail.saturating_mul(4).max(Duration::from_millis(1));
-                    (started + overdue, started)
-                });
             stats.active += 1;
             if let Some(timed) = timed {
                 *stats.timed.entry(timed).or_default() += 1;
             }
-            (timed, stats.generation)
+            stats.generation
         };
         BucketObservation {
             stats,
@@ -729,6 +706,8 @@ impl BucketedStats {
     ) -> RoutingSnapshot {
         let now = Instant::now();
         let mut preferred_latency = Duration::ZERO;
+        // One interval refit per snapshot keeps a read from paying for every bucket's.
+        let mut refitted = false;
         RoutingSnapshot(
             buckets
                 .iter()
@@ -736,7 +715,8 @@ impl BucketedStats {
                 .map(|(index, bucket)| {
                     let state = self.entry(bucket);
                     let mut stats = state.lock();
-                    let model = latency_model(&mut stats, now);
+                    refitted |= refit(&mut stats, now, !refitted);
+                    let model = stats.estimates.model();
                     let current = stats.current_routing_latency(now);
                     if index == 0 {
                         preferred_latency = current;
@@ -748,7 +728,7 @@ impl BucketedStats {
                     BucketSnapshot {
                         stats: state.clone(),
                         model,
-                        tail: model.request_tail(requested_bytes, None),
+                        tail: model.request.tail(requested_bytes),
                         latency: locality_adjusted(latency, index),
                         deprioritized: stats.deprioritized,
                         error_rate: stats.error_rate(now),
@@ -763,8 +743,10 @@ impl BucketedStats {
     pub(super) fn seed(&self, bucket: &BucketName, sample: Sample) {
         let stats = self.entry(bucket);
         let mut stats = stats.lock();
+        let now = Instant::now();
         let generation = stats.generation;
-        stats.succeed(Instant::now(), &sample, generation, false);
+        stats.record(now, &sample, false);
+        stats.succeed(now, generation, false);
     }
 
     /// Seeds a request for the 4-byte objects tests read, whose latency is all time to first byte.
@@ -775,7 +757,10 @@ impl BucketedStats {
 
     #[cfg(test)]
     pub(super) fn model(&self, bucket: &BucketName) -> LatencyModel {
-        latency_model(&mut self.entry(bucket).lock(), Instant::now())
+        let stats = self.entry(bucket);
+        let mut stats = stats.lock();
+        refit(&mut stats, Instant::now(), true);
+        stats.estimates.model()
     }
 
     #[cfg(test)]
@@ -800,7 +785,8 @@ impl BucketedStats {
             .iter()
             .map(|entry| {
                 let mut stats = entry.value().lock();
-                let model = latency_model(&mut stats, now);
+                refit(&mut stats, now, true);
+                let model = stats.estimates.model();
                 let metrics = BucketMetrics {
                     error_rate: stats.error_rate(now),
                     deprioritized: stats.deprioritized,
@@ -856,7 +842,18 @@ mod tests {
         probe: Option<ProbePermit>,
         timeline: &'a RequestTimeline,
     ) -> BucketObservation<'a> {
-        stats.begin(bucket, probe, timeline, 4)
+        begin_sized(stats, bucket, probe, timeline, 4)
+    }
+
+    fn begin_sized<'a>(
+        stats: &BucketedStats,
+        bucket: &BucketName,
+        probe: Option<ProbePermit>,
+        timeline: &'a RequestTimeline,
+        bytes: u64,
+    ) -> BucketObservation<'a> {
+        let expected = stats.model(bucket).request.tail(bytes);
+        stats.begin(bucket, probe, timeline, bytes, expected)
     }
 
     fn snapshot(stats: &BucketedStats, buckets: &BucketNameSet) -> RoutingSnapshot {
@@ -1008,7 +1005,7 @@ mod tests {
                 "{latency:?}"
             );
             assert_eq!(
-                stats.model(&buckets[0]).body_tail(4 * MIB),
+                stats.model(&buckets[0]).body.tail(4 * MIB),
                 Some(Duration::from_millis(250))
             );
         }
@@ -1055,8 +1052,8 @@ mod tests {
         );
         let model = stats.model(&bucket);
         let unmeasured = Duration::from_millis(100);
-        assert_eq!(model.body_tail(4096), Some(Duration::from_millis(1)));
-        assert_eq!(model.body_tail(page), None);
+        assert_eq!(model.body.tail(4096), Some(Duration::from_millis(1)));
+        assert_eq!(model.body.tail(page), None);
         for (announced, allowance) in [(None, 21), (Some(4096), 21), (Some(page), 120)] {
             assert_eq!(
                 model.timeout_allowance(page, announced, unmeasured),
@@ -1086,15 +1083,13 @@ mod tests {
         let model = stats.model(&bucket);
         assert!(
             model
-                .body_tail(page)
+                .body
+                .tail(page)
                 .unwrap()
                 .abs_diff(Duration::from_millis(1001))
                 <= Duration::from_millis(1)
         );
-        assert_eq!(
-            model.request_tail(page, None),
-            Some(Duration::from_millis(271))
-        );
+        assert_eq!(model.request.tail(page), Some(Duration::from_millis(271)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1120,9 +1115,9 @@ mod tests {
         }
         advance(LATENCY_SNAPSHOT_INTERVAL).await;
         let model = stats.model(&bucket);
-        assert_eq!(model.first_byte_tail(4), Some(Duration::from_millis(30)));
-        assert_eq!(model.body_tail(4), Some(Duration::from_millis(1)));
-        assert_eq!(model.request_tail(4, None), Some(Duration::from_millis(11)));
+        assert_eq!(model.first_byte.tail(4), Some(Duration::from_millis(30)));
+        assert_eq!(model.body.tail(4), Some(Duration::from_millis(1)));
+        assert_eq!(model.request.tail(4), Some(Duration::from_millis(11)));
     }
 
     /// One or two slow copies may be unlucky; three overdue copies are a stall.
@@ -1195,7 +1190,7 @@ mod tests {
             }
             let timeline = RequestTimeline::default();
             let _active = (0..3)
-                .map(|_| stats.begin(&buckets[0], None, &timeline, requested))
+                .map(|_| begin_sized(&stats, &buckets[0], None, &timeline, requested))
                 .collect::<Vec<_>>();
             advance(Duration::from_millis(500)).await;
             assert_eq!(
@@ -1220,7 +1215,7 @@ mod tests {
         }
         let timeline = RequestTimeline::default();
         let _active = (0..3)
-            .map(|_| stats.begin(&buckets[0], None, &timeline, 16 * MIB))
+            .map(|_| begin_sized(&stats, &buckets[0], None, &timeline, 16 * MIB))
             .collect::<Vec<_>>();
         advance(Duration::from_millis(500)).await;
         assert_eq!(best(&stats, &buckets, Duration::from_secs(10)), Some(0));

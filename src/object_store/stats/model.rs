@@ -2,10 +2,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 use tokio::time::Instant;
 
-use super::{
-    OBSERVATION_SPACING,
-    reservoir::{Reservoir, quantile},
-};
+use super::{OBSERVATION_SPACING, reservoir::Reservoir};
 
 const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MICROS: f64 = TIMER_RESOLUTION.as_micros() as f64;
@@ -53,7 +50,7 @@ fn duration(micros: f64) -> Duration {
 
 /// Latency by size: a median line and a tail ratio shared by all sizes.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct SizeModel(Option<Estimate>);
+pub(in crate::object_store) struct SizeModel(Option<Estimate>);
 
 impl SizeModel {
     fn micros(&self, bytes: u64) -> Option<(f64, f64)> {
@@ -161,6 +158,7 @@ impl Fit {
 /// Supporting lines bracket the minimum; each step discards at least a quarter of the bracket.
 fn median_line(
     observations: &[Observation],
+    largest_bytes: u64,
     proportional: bool,
     values: &mut Vec<(f64, f64)>,
 ) -> Line {
@@ -186,11 +184,7 @@ fn median_line(
             }
         };
     }
-    let largest_bytes = observations
-        .iter()
-        .map(|sample| sample.bytes)
-        .max()
-        .unwrap_or(1) as f64;
+    let largest_bytes = largest_bytes as f64;
     // Below this loss, every retained sample fits within the histogram's time precision.
     let resolved_loss = FIT_PRECISION_MICROS
         * observations
@@ -227,26 +221,6 @@ fn median_line(
             lower = fitted;
         }
     }
-}
-
-/// The tail ratio is the p99 quantile regression of latency on the median line. Weighting
-/// ratios by their median keeps small requests' constant stalls from scaling large ones.
-fn fit(observations: &[Observation], proportional: bool) -> SizeModel {
-    let Some(largest_bytes) = observations.iter().map(|sample| sample.bytes).max() else {
-        return SizeModel::default();
-    };
-    let mut values = Vec::with_capacity(observations.len());
-    let median = median_line(observations, proportional, &mut values);
-    values.clear();
-    values.extend(observations.iter().map(|sample| {
-        let median = median.micros(sample.bytes);
-        (sample.micros / median, sample.weight * median)
-    }));
-    SizeModel(Some(Estimate {
-        median,
-        tail_ratio: quantile(&mut values, TAIL_QUANTILE).max(1.0),
-        largest_bytes,
-    }))
 }
 
 /// Latency observations by size. Size strata retain rare sizes for one continuous model.
@@ -293,7 +267,6 @@ impl SizeHistogram {
             self.clock,
             Measurement {
                 bytes,
-                // Timers have millisecond resolution.
                 micros: (latency.as_secs_f64() * 1_000_000.0).max(TIMER_MICROS),
             },
         );
@@ -353,9 +326,46 @@ pub(super) struct Refit {
 }
 
 impl Refit {
+    /// The tail ratio is the p99 quantile regression of latency on the median line. Weighting
+    /// ratios by their median keeps small requests' constant stalls from scaling large ones.
     pub fn fit(&self) -> SizeModel {
-        fit(&self.observations, self.proportional)
+        let observations = &self.observations;
+        let Some(largest_bytes) = observations.iter().map(|sample| sample.bytes).max() else {
+            return SizeModel::default();
+        };
+        let mut values = Vec::with_capacity(observations.len());
+        let median = median_line(observations, largest_bytes, self.proportional, &mut values);
+        values.clear();
+        values.extend(observations.iter().map(|sample| {
+            let median = median.micros(sample.bytes);
+            (sample.micros / median, sample.weight * median)
+        }));
+        SizeModel(Some(Estimate {
+            median,
+            tail_ratio: quantile(&mut values, TAIL_QUANTILE).max(1.0),
+            largest_bytes,
+        }))
     }
+}
+
+/// Weighted nearest-rank quantile, including the selected value's own weight.
+pub(super) fn quantile(mut values: &mut [(f64, f64)], q: f64) -> f64 {
+    let mut target = values.iter().map(|(_, weight)| weight).sum::<f64>() * (q - 1e-9);
+    while !values.is_empty() {
+        let middle = (values.len() - 1) / 2;
+        let (below, pivot, above) =
+            values.select_nth_unstable_by(middle, |left, right| left.0.total_cmp(&right.0));
+        let weight_below: f64 = below.iter().map(|(_, weight)| weight).sum();
+        if target <= weight_below && !below.is_empty() {
+            values = below;
+        } else if target <= weight_below + pivot.1 || above.is_empty() {
+            return pivot.0;
+        } else {
+            target -= weight_below + pivot.1;
+            values = above;
+        }
+    }
+    0.0
 }
 
 #[cfg(test)]
@@ -366,7 +376,9 @@ mod tests {
     use proptest::{collection, prop_assert, proptest};
     use tokio::time::{Instant, advance};
 
-    use super::{Line, Observation, SizeHistogram, TIMER_MICROS, TIMER_RESOLUTION, median_line};
+    use super::{
+        Line, Observation, SizeHistogram, TIMER_MICROS, TIMER_RESOLUTION, median_line, quantile,
+    };
 
     fn body() -> SizeHistogram {
         SizeHistogram::new(true)
@@ -516,6 +528,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn quantiles_take_the_nearest_rank_including_the_selected_weight() {
+        let mut values = [5, 1, 3, 3, 3, 9, 7, 7, 2, 8].map(|value| (f64::from(value), 1.0));
+        for (q, expected) in [
+            (0.0, 1),
+            (0.1, 1),
+            (0.15, 2),
+            (0.25, 3),
+            (0.5, 3),
+            (0.55, 5),
+            (0.6, 5),
+            (0.65, 7),
+            (0.8, 7),
+            (0.85, 8),
+            (0.9, 8),
+            (0.95, 9),
+            (0.99, 9),
+            (1.0, 9),
+        ] {
+            assert_eq!(quantile(&mut values, q), f64::from(expected), "{q}");
+        }
+        // 0.4 × 0.75 rounds above the first weight in floating point.
+        assert_eq!(quantile(&mut [(1.0, 0.3), (2.0, 0.1)], 0.75), 1.0);
+    }
+
     proptest! {
         #[test]
         fn median_lines_match_exhaustive_least_absolute_deviations(
@@ -551,7 +588,8 @@ mod tests {
             }).sum::<f64>();
             let optimal = candidates.iter().copied().map(loss).fold(f64::INFINITY, f64::min);
             let tolerance: f64 = observations.iter().map(|sample| sample.weight).sum();
-            let fitted = median_line(&observations, proportional, &mut Vec::new());
+            let largest_bytes = observations.iter().map(|sample| sample.bytes).max().unwrap();
+            let fitted = median_line(&observations, largest_bytes, proportional, &mut Vec::new());
             prop_assert!(fitted.fixed.is_finite() && fitted.fixed >= 0.0);
             prop_assert!(fitted.per_byte.is_finite() && fitted.per_byte >= 0.0);
             prop_assert!(loss(fitted) <= optimal + tolerance, "{fitted:?}, loss={}, optimal={optimal}", loss(fitted));

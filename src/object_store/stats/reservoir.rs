@@ -10,7 +10,7 @@ const CAPACITY: usize = 256;
 const PRUNE_HALF_LIVES: f64 = 8.0;
 
 #[derive(Debug, Clone, Copy)]
-struct Measurement<T> {
+struct Timestamped<T> {
     value: T,
     /// Model time in seconds.
     at: f64,
@@ -20,7 +20,7 @@ struct Measurement<T> {
 /// Time is the owning model's clock, in seconds.
 #[derive(Debug)]
 pub(super) struct Reservoir<T> {
-    samples: BTreeMap<(u64, u64), Measurement<T>>,
+    samples: BTreeMap<(u64, u64), Timestamped<T>>,
     capacity: usize,
     count: u64,
     pruned: u64,
@@ -61,15 +61,15 @@ impl<T: Copy> Reservoir<T> {
 
     pub fn update(&mut self, at: f64, value: T) {
         let uniform = ((self.random.hash_one(self.count) >> 11) + 1) as f64 / (1_u64 << 53) as f64;
-        self.retain(at, value, uniform);
+        self.insert(at, value, uniform);
     }
 
-    pub(super) fn retain(&mut self, at: f64, value: T, uniform: f64) {
+    fn insert(&mut self, at: f64, value: T, uniform: f64) {
         self.count += 1;
         // Log priorities avoid rescaling. Positive float bits preserve numeric order;
         // the observation count distinguishes equal priorities.
         let priority = (LATENCY_DECAY * at - uniform.ln()).to_bits();
-        let measurement = Measurement { value, at };
+        let sample = Timestamped { value, at };
         if self.samples.len() < self.capacity {
             // Space freed by pruning admits only priorities a full reservoir would keep,
             // so the threshold remains each sample's inclusion bound.
@@ -77,12 +77,12 @@ impl<T: Copy> Reservoir<T> {
                 .discarded_priority
                 .is_none_or(|threshold| priority > threshold)
             {
-                self.samples.insert((priority, self.count), measurement);
+                self.samples.insert((priority, self.count), sample);
             }
         } else if let Some(lowest) = self.samples.first_entry() {
             let discarded = if priority > lowest.key().0 {
                 let ((discarded, _), _) = lowest.remove_entry();
-                self.samples.insert((priority, self.count), measurement);
+                self.samples.insert((priority, self.count), sample);
                 discarded
             } else {
                 priority
@@ -112,29 +112,10 @@ impl<T: Copy> Reservoir<T> {
     }
 }
 
-/// Weighted nearest-rank quantile, including the selected value's own weight.
-pub(super) fn quantile(mut values: &mut [(f64, f64)], q: f64) -> f64 {
-    let mut target = values.iter().map(|(_, weight)| weight).sum::<f64>() * (q - 1e-9);
-    while !values.is_empty() {
-        let middle = (values.len() - 1) / 2;
-        let (below, pivot, above) =
-            values.select_nth_unstable_by(middle, |left, right| left.0.total_cmp(&right.0));
-        let weight_below: f64 = below.iter().map(|(_, weight)| weight).sum();
-        if target <= weight_below && !below.is_empty() {
-            values = below;
-        } else if target <= weight_below + pivot.1 || above.is_empty() {
-            return pivot.0;
-        } else {
-            target -= weight_below + pivot.1;
-            values = above;
-        }
-    }
-    0.0
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{CAPACITY, LATENCY_DECAY, Reservoir, quantile};
+    use super::{CAPACITY, LATENCY_DECAY, Reservoir};
+    use crate::object_store::stats::model::quantile;
 
     #[test]
     fn sampling_estimates_decayed_mass_and_prunes_negligible_weight() {
@@ -146,7 +127,7 @@ mod tests {
             for index in 0..count {
                 let uniform = (f64::from(index) + 0.5) / f64::from(count);
                 for reservoir in [&mut sampled, &mut full] {
-                    reservoir.retain(at, value, uniform);
+                    reservoir.insert(at, value, uniform);
                 }
             }
             at += 15.0;
@@ -164,7 +145,7 @@ mod tests {
         for reservoir in [&mut sampled, &mut full] {
             assert!(reservoir.weighted(at).next().is_none());
             assert_eq!(reservoir.retention().1, 0);
-            reservoir.retain(at, 21.0, 0.5);
+            reservoir.insert(at, 21.0, 0.5);
             assert_eq!(reservoir.weighted(at).next(), Some((21.0, 1.0)));
         }
     }
@@ -179,15 +160,15 @@ mod tests {
             let count = 1000 * CAPACITY;
             for index in 0..count {
                 let uniform = (index as f64 + 0.5) / count as f64;
-                reservoir.retain(0.0, 1, uniform);
+                reservoir.insert(0.0, 1, uniform);
             }
             if survivor {
-                reservoir.retain(2.0 * half_life, 1, 1e-9);
+                reservoir.insert(2.0 * half_life, 1, 1e-9);
             }
             let at = 8.5 * half_life;
             assert_eq!(reservoir.weighted(at).count(), usize::from(survivor));
             for index in 0..100 {
-                reservoir.retain(at, 2, (f64::from(index) + 0.5) / 100.0);
+                reservoir.insert(at, 2, (f64::from(index) + 0.5) / 100.0);
             }
             let refilled: Vec<_> = reservoir
                 .weighted(at)
@@ -199,38 +180,6 @@ mod tests {
             }
             let mass: f64 = refilled.iter().sum();
             assert!((mass / 100.0 - 1.0).abs() < 0.05, "{survivor}: {mass}");
-        }
-    }
-
-    #[test]
-    fn quantiles_take_the_nearest_rank_of_samples_recorded_together() {
-        let mut samples = Reservoir::default();
-        for value in [5, 1, 3, 3, 3, 9, 7, 7, 2, 8] {
-            samples.update(0.0, value);
-        }
-        let mut values: Vec<_> = samples
-            .weighted(0.0)
-            .map(|(value, weight)| (f64::from(value), weight))
-            .collect();
-        for (q, expected) in [
-            (0.0, 1),
-            (0.1, 1),
-            (0.15, 2),
-            (0.25, 3),
-            (0.5, 3),
-            (0.55, 5),
-            (0.6, 5),
-            (0.65, 7),
-            // 0.7 × 10 rounds above 7 in floating point.
-            (0.7, 7),
-            (0.8, 7),
-            (0.85, 8),
-            (0.9, 8),
-            (0.95, 9),
-            (0.99, 9),
-            (1.0, 9),
-        ] {
-            assert_eq!(quantile(&mut values, q), f64::from(expected), "{q}");
         }
     }
 }

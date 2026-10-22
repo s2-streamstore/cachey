@@ -83,7 +83,6 @@ impl BucketState {
     }
 }
 
-#[derive(Default)]
 struct ReplicaStates {
     buckets: Vec<BucketState>,
     failure_sequence: usize,
@@ -91,14 +90,21 @@ struct ReplicaStates {
 }
 
 impl ReplicaStates {
+    fn new(buckets: usize) -> Self {
+        Self {
+            buckets: std::iter::repeat_with(BucketState::default)
+                .take(buckets)
+                .collect(),
+            failure_sequence: 0,
+            largest_object_size: None,
+        }
+    }
+
     /// Conclusive errors settle their bucket; otherwise retain its highest-priority error.
     /// Sequence numbers preserve the latest diagnostic across equally relevant bucket errors.
     fn record(&mut self, index: usize, error: DownloadError) {
         if let DownloadError::RangeNotSatisfied { object_size, .. } = &error {
             self.largest_object_size = self.largest_object_size.max(*object_size);
-        }
-        if index >= self.buckets.len() {
-            self.buckets.resize_with(index + 1, BucketState::default);
         }
         let bucket = &mut self.buckets[index];
         if let Some((_, previous)) = &bucket.error
@@ -136,13 +142,6 @@ impl ReplicaStates {
 struct AttemptPermits {
     admission: DownloadPermit,
     hedge: Option<HedgePermit>,
-}
-
-struct PrimaryAttempt {
-    index: usize,
-    probe: Option<ProbePermit>,
-    permits: Option<AttemptPermits>,
-    backup_admission: Option<DownloadPermit>,
 }
 
 struct InFlightCopy<'a>(&'a AtomicUsize);
@@ -197,7 +196,8 @@ impl ReplicaRequest<'_> {
     /// Allow each unmeasured phase half of a bucket's share of the page, within its timeout.
     fn unmeasured(&self) -> Duration {
         let limits = self.downloader.limits;
-        (limits.page_timeout / u32::try_from(self.buckets.len()).unwrap_or(u32::MAX))
+        limits
+            .bucket_share(self.buckets.len())
             .min(limits.bucket_timeout)
             / 2
     }
@@ -311,24 +311,22 @@ impl Followups<'_> {
     /// failure, within the bucket's shared deadline.
     fn has_time(&self, routing: &RoutingSnapshot, index: usize, now: Instant) -> bool {
         let request = self.request;
-        request.deadlines[index].get().is_none_or(|deadline| {
-            let expected = routing.model(index).timeout_allowance(
-                request.bytes(),
-                request.body_bytes(),
-                request.unmeasured(),
-            );
-            deadline.saturating_duration_since(now) > expected
-        })
+        request
+            .bucket_deadline(index)
+            .admitted()
+            .is_none_or(|deadline| {
+                let expected = routing.model(index).timeout_allowance(
+                    request.bytes(),
+                    request.body_bytes(),
+                    request.unmeasured(),
+                );
+                deadline.saturating_duration_since(now) > expected
+            })
     }
 
     /// Prefer untried buckets. Retry a failed body only after other copies finish,
     /// at most once per page and within the retry budget.
-    fn next(
-        &mut self,
-        trigger: Trigger,
-        hedge: &mut HedgeTimer<'_>,
-        idle: bool,
-    ) -> Option<CopyAttempt> {
+    fn next(&mut self, trigger: Trigger, idle: bool) -> Option<CopyAttempt> {
         if let Trigger::Rescue(index) = trigger
             && self.states.buckets[index].tried
         {
@@ -356,7 +354,11 @@ impl Followups<'_> {
                     },
                     remaining,
                 )
-                .unwrap_or(self.request.primary),
+                .or_else(|| {
+                    let primary = self.request.primary;
+                    (!routing.overloaded(primary) && self.has_time(&routing, primary, now))
+                        .then_some(primary)
+                })?,
             Trigger::Fallback => routing.best(untried, remaining).or_else(|| {
                 if self.retried || !idle {
                     return None;
@@ -372,15 +374,12 @@ impl Followups<'_> {
                 )
             })?,
         };
-        if (early && routing.overloaded(index)) || !self.has_time(&routing, index, now) {
-            return None;
-        }
         let model = routing.model(index);
         let overloaded = routing.all_overloaded();
         let retrying = !early && self.states.buckets[index].tried;
-        // A retry never queues for admission, so it cannot spend a credit and then run
-        // out of time before it starts.
-        let retry_admission = if retrying {
+        // Hedges and retries never queue for admission, so a retry cannot spend a credit
+        // and then run out of time before it starts.
+        let admission = if early || retrying {
             Some(downloader.admission.try_acquire(self.request.bytes())?)
         } else {
             None
@@ -390,24 +389,18 @@ impl Followups<'_> {
             return None;
         }
         self.retried |= retrying;
-        let permits = if early {
-            let admission = downloader.admission.try_acquire(self.request.bytes())?;
-            let budget = downloader
-                .attempt_budget
-                .try_hedge(&self.request.buckets[index])?;
-            hedge.disarm();
-            Some(AttemptPermits {
-                hedge: Some(budget),
-                admission,
-            })
+        let hedge = if early {
+            Some(
+                downloader
+                    .attempt_budget
+                    .try_hedge(&self.request.buckets[index])?,
+            )
         } else {
-            retry_admission
-                .or_else(|| self.backup_admission.take())
-                .map(|admission| AttemptPermits {
-                    hedge: None,
-                    admission,
-                })
+            None
         };
+        let permits = admission
+            .or_else(|| self.backup_admission.take())
+            .map(|admission| AttemptPermits { admission, hedge });
         self.started(index);
         Some(CopyAttempt {
             index,
@@ -432,16 +425,13 @@ impl Downloader {
     ) -> Result<DownloadOutput, DownloadError> {
         let bytes = range.end - range.start;
         let routing = self.bucketed_stats.snapshot(buckets, bytes);
-        let PrimaryAttempt {
-            index: primary,
-            probe,
-            permits: primary_permits,
-            backup_admission,
-        } = self.prepare_primary(
+        let (primary_copy, backup_admission) = self.prepare_primary(
             bytes,
             deadline.saturating_duration_since(Instant::now()),
             &routing,
         );
+        let primary = primary_copy.index;
+        let probing = primary_copy.probe.is_some();
         let request = ReplicaRequest {
             downloader: self,
             buckets,
@@ -456,37 +446,23 @@ impl Downloader {
             copies_in_flight: AtomicUsize::new(0),
             hedged: AtomicBool::new(false),
         };
-        let primary_model = routing.model(primary);
-        let mut rescues = routing.rescue_schedule(primary, probe.is_some(), self.limits);
+        let mut rescues = routing.rescue_schedule(primary, probing, self.limits);
         let mut followups = Followups {
             request: &request,
-            states: ReplicaStates {
-                buckets: (0..buckets.len()).map(|_| BucketState::default()).collect(),
-                ..ReplicaStates::default()
-            },
+            states: ReplicaStates::new(buckets.len()),
             retried: false,
             retry_budget_exhausted: false,
             backup_admission,
         };
         followups.started(primary);
         let mut hedge = HedgeTimer::new(
-            primary_model,
+            primary_copy.model,
             &request.primary_timeline,
             bytes,
-            request.bucket_deadline(primary),
-            self.limits.hedge_budget_percent > 0 && probe.is_none(),
+            self.limits.hedge_budget_percent > 0 && !probing,
         );
         let mut active = Vec::with_capacity(MAX_CONCURRENT_COPIES);
-        active.push((
-            primary,
-            Box::pin(request.attempt(CopyAttempt {
-                index: primary,
-                model: primary_model,
-                is_primary: true,
-                probe,
-                permits: primary_permits,
-            })),
-        ));
+        active.push((primary, Box::pin(request.attempt(primary_copy))));
         while !active.is_empty() {
             let trigger = select! {
                 biased;
@@ -511,20 +487,24 @@ impl Downloader {
                 () = hedge.due() => Trigger::Hedge,
             };
             if active.len() < MAX_CONCURRENT_COPIES
-                && let Some(copy) = followups.next(trigger, &mut hedge, active.is_empty())
+                && let Some(copy) = followups.next(trigger, active.is_empty())
             {
+                if matches!(trigger, Trigger::Hedge) {
+                    hedge.disarm();
+                }
                 active.push((copy.index, Box::pin(request.attempt(copy))));
             }
         }
         Err(followups.into_error())
     }
 
+    /// The primary copy, and admission reserved for a backup while it probes recovery.
     fn prepare_primary(
         &self,
         bytes: u64,
         remaining: Duration,
         routing: &RoutingSnapshot,
-    ) -> PrimaryAttempt {
+    ) -> (CopyAttempt, Option<DownloadPermit>) {
         let (mut index, mut probe) = routing.primary(remaining);
         let reservations = probe.as_ref().and_then(|_| {
             Some((
@@ -537,15 +517,17 @@ impl Downloader {
             index = routing.best(|_| true, remaining).unwrap_or(index);
         }
         let (admission, backup_admission) = reservations.unzip();
-        PrimaryAttempt {
+        let copy = CopyAttempt {
             index,
+            model: routing.model(index),
+            is_primary: true,
             probe,
             permits: admission.map(|admission| AttemptPermits {
                 admission,
                 hedge: None,
             }),
-            backup_admission,
-        }
+        };
+        (copy, backup_admission)
     }
 }
 
@@ -579,7 +561,7 @@ mod tests {
         errors: impl IntoIterator<Item = (usize, DownloadError)>,
         expected: &DownloadError,
     ) {
-        let mut fallback_errors = ReplicaStates::default();
+        let mut fallback_errors = ReplicaStates::new(3);
         for (index, error) in errors {
             fallback_errors.record(index, error);
         }
