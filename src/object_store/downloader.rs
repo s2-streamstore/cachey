@@ -29,6 +29,10 @@ mod timeline;
 
 use timeline::{BucketDeadline, HedgeTimer};
 
+/// The shortest a copy may queue for admission, so bursts of fast reads are absorbed
+/// rather than shed.
+const MIN_ADMISSION_WAIT: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DownloadError {
     #[error("Invalid object state: {0}")]
@@ -224,10 +228,14 @@ impl BucketOperation<'_> {
         let _admission = if let Some(permit) = admission {
             permit
         } else {
+            // A copy queues while it can still finish by the deadline, and no longer than it is
+            // expected to take.
             let deadline = self.deadline.current();
+            let allowance = self.timeout_allowance();
             let latest_start = deadline
-                .checked_sub(self.timeout_allowance())
-                .unwrap_or(deadline);
+                .checked_sub(allowance)
+                .unwrap_or(deadline)
+                .min(Instant::now() + allowance.max(MIN_ADMISSION_WAIT));
             self.downloader
                 .admission
                 .acquire(self.request.bytes(), latest_start)
@@ -496,7 +504,7 @@ mod tests {
 
     use super::{
         BucketDeadline, BucketMetrics, DownloadError, DownloadLimits, DownloadOutput, Downloader,
-        RequestConfig, RequestTimeline, map_get_object_error,
+        MIN_ADMISSION_WAIT, RequestConfig, RequestTimeline, map_get_object_error,
     };
     use crate::{
         object_store::stats::{LatencyModel, Outcome, Sample},
@@ -2352,6 +2360,29 @@ mod tests {
             assert_eq!(script.requests.load(Ordering::SeqCst), 1);
             assert_eq!(script.active.load(Ordering::SeqCst), 0);
             assert!(downloader.admission.try_acquire(4).is_some());
+        }
+    }
+
+    /// Far from its deadline, a read queues only as long as it is expected to take, or long
+    /// enough to absorb a burst of fast reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_read_gives_up_long_before_a_distant_deadline() {
+        for (latency, waited) in [(5, MIN_ADMISSION_WAIT), (150, Duration::from_millis(150))] {
+            let (downloader, _) = scripted_downloader([]);
+            let downloader = downloader
+                .with_test_limits(DownloadLimits {
+                    max_inflight_requests: 1,
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            seed_latency(&downloader, "bucket", latency);
+            let _held = downloader.admission.try_acquire(4).unwrap();
+            let start = tokio::time::Instant::now();
+            assert!(matches!(
+                fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await,
+                Err(DownloadError::AdmissionTimeout)
+            ));
+            assert_eq!(start.elapsed(), waited, "{latency}ms");
         }
     }
 
