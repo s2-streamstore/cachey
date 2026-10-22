@@ -28,9 +28,14 @@ struct Queue {
 }
 
 impl Queue {
-    /// Each copy ahead takes one interval to depart.
-    fn predicted_wait(&self) -> Duration {
-        self.interval.saturating_mul(self.waiting)
+    /// Each copy ahead, and then this one, takes an interval to depart, counting from the
+    /// last departure.
+    fn predicted_wait(&self, now: Instant) -> Duration {
+        self.last_departure.map_or(Duration::ZERO, |last| {
+            self.interval
+                .saturating_mul(self.waiting + 1)
+                .saturating_sub(now.saturating_duration_since(last))
+        })
     }
 
     fn depart(&mut self, now: Instant) {
@@ -94,7 +99,8 @@ impl DownloadAdmission {
         }
         let _waiting = {
             let mut queue = self.queue.lock();
-            if Instant::now() + queue.predicted_wait() >= latest_start {
+            let now = Instant::now();
+            if now + queue.predicted_wait(now) >= latest_start {
                 return Err(DownloadError::AdmissionTimeout);
             }
             queue.waiting += 1;
@@ -170,10 +176,10 @@ mod tests {
                 let arrived = Instant::now();
                 // Behind one waiting copy, the slot frees at 400 ms.
                 let refused = admission
-                    .acquire(4, start + Duration::from_millis(340))
+                    .acquire(4, start + Duration::from_millis(360))
                     .await;
                 let refused_after = arrived.elapsed();
-                let fifth = hold(100, start + Duration::from_millis(500)).await;
+                let fifth = hold(100, start + Duration::from_millis(420)).await;
                 (refused, refused_after, fifth)
             }
         );

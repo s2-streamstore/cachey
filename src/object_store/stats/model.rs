@@ -69,15 +69,8 @@ impl SizeModel {
         Some((median, median * estimate.tail_ratio))
     }
 
-    fn median(&self, bytes: u64) -> Option<Duration> {
+    pub fn median(&self, bytes: u64) -> Option<Duration> {
         self.micros(bytes).map(|(median, _)| duration(median))
-    }
-
-    /// The median at `bytes`, or at the largest retained size if `bytes` is unpredictable.
-    pub fn median_bounded(&self, bytes: u64) -> Option<Duration> {
-        let estimate = self.0?;
-        self.median(bytes)
-            .or_else(|| self.median(estimate.largest_bytes))
     }
 
     /// Uncapped p99.

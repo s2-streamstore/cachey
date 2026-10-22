@@ -27,7 +27,7 @@ use crate::{
 mod replicas;
 mod timeline;
 
-use timeline::{BucketDeadline, HedgeTimer};
+use timeline::{BucketDeadline, HedgeTimer, SharedDeadline};
 
 /// The shortest a copy may queue for admission, so bursts of fast reads are absorbed
 /// rather than shed.
@@ -229,8 +229,8 @@ impl BucketOperation<'_> {
             permit
         } else {
             // A copy queues while it can still finish by the deadline, and no longer than it is
-            // expected to take.
-            let deadline = self.deadline.current();
+            // expected to take. Only a bucket's first copy queues, so no bucket deadline applies.
+            let deadline = self.deadline.page();
             let allowance = self.timeout_allowance();
             let latest_start = deadline
                 .checked_sub(allowance)
@@ -242,7 +242,7 @@ impl BucketOperation<'_> {
                 .await?
         };
         let now = Instant::now();
-        let (bucket_deadline, first_admitted) = self
+        let bucket_deadline = self
             .deadline
             .admit(now, self.downloader.limits.bucket_timeout);
         let budget = bucket_deadline.saturating_duration_since(now);
@@ -282,9 +282,11 @@ impl BucketOperation<'_> {
         };
         let outcome = match &result {
             Ok(_) => Outcome::Success,
-            // Copies to a bucket share its deadline; the first one admitted reports its expiry.
-            Err(_) if expired && !first_admitted => Outcome::Neutral,
-            Err(error) => error.health_outcome(self.timeout_allowance()),
+            Err(error) => match error.health_outcome(self.timeout_allowance()) {
+                // Copies to a bucket share its deadline, whose expiry counts once.
+                Outcome::Failure if expired && !self.deadline.report_expiry() => Outcome::Neutral,
+                outcome => outcome,
+            },
         };
         observation.complete(outcome);
         result
@@ -477,7 +479,7 @@ mod tests {
         io,
         ops::Range,
         sync::{
-            Arc, OnceLock,
+            Arc,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -504,7 +506,7 @@ mod tests {
 
     use super::{
         BucketDeadline, BucketMetrics, DownloadError, DownloadLimits, DownloadOutput, Downloader,
-        MIN_ADMISSION_WAIT, RequestConfig, RequestTimeline, map_get_object_error,
+        MIN_ADMISSION_WAIT, RequestConfig, RequestTimeline, SharedDeadline, map_get_object_error,
     };
     use crate::{
         object_store::stats::{LatencyModel, Outcome, Sample},
@@ -1153,7 +1155,7 @@ mod tests {
                 timeline: &timeline,
                 deadline: BucketDeadline::new(
                     tokio::time::Instant::now() + Duration::from_millis(budget_ms),
-                    &OnceLock::new(),
+                    &SharedDeadline::default(),
                 ),
                 unmeasured: Duration::from_millis(20),
                 probe: None,
@@ -2030,7 +2032,7 @@ mod tests {
             },
             model: model(&downloader, "local"),
             timeline: &RequestTimeline::default(),
-            deadline: BucketDeadline::new(tokio::time::Instant::now(), &OnceLock::new()),
+            deadline: BucketDeadline::new(tokio::time::Instant::now(), &SharedDeadline::default()),
             unmeasured: Duration::from_millis(5),
             probe: None,
         }

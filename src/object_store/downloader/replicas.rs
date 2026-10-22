@@ -18,7 +18,7 @@ use tokio::{
 
 use super::{
     BucketDeadline, BucketOperation, DownloadError, DownloadOutput, Downloader, HedgeTimer,
-    ObjectPiece, PieceRequest, RequestConfig, RequestTimeline,
+    ObjectPiece, PieceRequest, RequestConfig, RequestTimeline, SharedDeadline,
 };
 use crate::{
     object_store::{
@@ -161,7 +161,7 @@ struct ReplicaRequest<'a> {
     page_deadline: Instant,
     primary: usize,
     /// Each bucket's deadline, from its first admission.
-    deadlines: Vec<OnceLock<Instant>>,
+    deadlines: Vec<SharedDeadline>,
     primary_timeline: RequestTimeline,
     /// Response length announced to a finished copy.
     finished_body_bytes: OnceLock<u64>,
@@ -440,7 +440,9 @@ impl Downloader {
             config,
             page_deadline: deadline,
             primary,
-            deadlines: (0..buckets.len()).map(|_| OnceLock::new()).collect(),
+            deadlines: (0..buckets.len())
+                .map(|_| SharedDeadline::default())
+                .collect(),
             primary_timeline: RequestTimeline::default(),
             finished_body_bytes: OnceLock::new(),
             copies_in_flight: AtomicUsize::new(0),

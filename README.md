@@ -119,7 +119,7 @@ Options:
       --iouring
           Use `io_uring` (if available) for disk IO
       --bucket-timeout-ms <BUCKET_TIMEOUT_MS>
-          Maximum bucket download time through body validation, in milliseconds [default: 5000]
+          Maximum time for a page's downloads from one bucket, from first admission through body validation, in milliseconds [default: 5000]
       --page-timeout-ms <PAGE_TIMEOUT_MS>
           Maximum page download time including fallback, in milliseconds [default: 10000]
       --hedge-budget-percent <HEDGE_BUDGET_PERCENT>

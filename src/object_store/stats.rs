@@ -287,32 +287,30 @@ impl BucketStats {
             )
     }
 
-    /// Successes move the routing factor and ease the penalty. The first measurement and
-    /// recovery probes replace both.
+    /// Successes at sizes the request model predicts move the routing factor, and every
+    /// success eases the penalty. The first measurement and recovery probes replace both.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
-        let median = self
-            .estimates
-            .model()
-            .request
-            .median_bounded(sample.requested_bytes);
-        let ratio = median.map_or(1.0, |median| {
-            sample.latency().as_secs_f64() / median.as_secs_f64()
-        });
-        if median.is_some() && !probe {
-            self.routing_factor =
-                self.routing_factor * (1.0 - LATENCY_ALPHA) + ratio * LATENCY_ALPHA;
-            self.routing_penalty = self.routing_penalty(now, true).mul_f64(1.0 - LATENCY_ALPHA);
-        } else {
-            self.routing_factor = ratio;
+        let model = self.estimates.request.model();
+        let ratio = model
+            .median(sample.requested_bytes)
+            .map(|median| sample.latency().as_secs_f64() / median.as_secs_f64());
+        if probe || model.estimate().is_none() {
+            self.routing_factor = ratio.unwrap_or(1.0);
             self.routing_penalty = Duration::ZERO;
+        } else {
+            if let Some(ratio) = ratio {
+                self.routing_factor =
+                    self.routing_factor * (1.0 - LATENCY_ALPHA) + ratio * LATENCY_ALPHA;
+            }
+            self.routing_penalty = self.routing_penalty(now).mul_f64(1.0 - LATENCY_ALPHA);
         }
         self.routing_updated_at = now;
         self.estimates.record(now, sample);
     }
 
-    /// Routing latency at a size, or the penalty alone while unmeasured.
+    /// Routing latency at a size, or the penalty alone at a size the model cannot predict.
     fn routing_latency(&self, now: Instant, median: Option<Duration>) -> Duration {
-        let penalty = self.routing_penalty(now, median.is_some());
+        let penalty = self.routing_penalty(now);
         median.map_or(penalty, |median| {
             median.mul_f64(self.routing_factor) + penalty
         })
@@ -352,22 +350,23 @@ impl BucketStats {
     }
 
     /// An unfinished copy raises the penalty toward how far it outlasted its routing
-    /// latency, and never lowers it.
+    /// latency, and never lowers it. A measured bucket's copy of a size its model cannot
+    /// predict is not judged.
     fn raise_routing_penalty(&mut self, now: Instant, elapsed: Duration, requested_bytes: u64) {
-        let median = self
-            .estimates
-            .model()
-            .request
-            .median_bounded(requested_bytes);
-        let penalty = self.routing_penalty(now, median.is_some());
+        let model = self.estimates.request.model();
+        let median = model.median(requested_bytes);
+        if median.is_none() && model.estimate().is_some() {
+            return;
+        }
+        let penalty = self.routing_penalty(now);
         let overrun = elapsed.saturating_sub(self.routing_latency(now, median));
         self.routing_penalty = penalty + overrun.mul_f64(LATENCY_ALPHA);
         self.routing_updated_at = now;
     }
 
     /// The penalty decays even while the bucket is idle, once it has a measured latency.
-    fn routing_penalty(&self, now: Instant, measured: bool) -> Duration {
-        if !measured {
+    fn routing_penalty(&self, now: Instant) -> Duration {
+        if self.estimates.request.model().estimate().is_none() {
             return self.routing_penalty;
         }
         self.routing_penalty.mul_f64(decay(
@@ -762,7 +761,7 @@ impl BucketedStats {
                     let mut stats = state.lock();
                     refit(&mut stats, now, Some(index) == oldest);
                     let model = stats.estimates.model();
-                    let median = model.request.median_bounded(requested_bytes);
+                    let median = model.request.median(requested_bytes);
                     let current = stats.routing_latency(now, median);
                     if index == 0 {
                         preferred_latency = current;
@@ -1122,6 +1121,35 @@ mod tests {
                 .best(|_| true, Duration::from_secs(1)),
             Some(0)
         );
+    }
+
+    /// Copies of a size beyond a bucket's history neither slow its routing at known sizes
+    /// nor make it look fast at the new size.
+    #[tokio::test(start_paused = true)]
+    async fn sizes_a_bucket_cannot_predict_do_not_steer_routing() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        let best_at = |bytes| {
+            stats
+                .snapshot(&buckets, bytes)
+                .best(|_| true, Duration::from_secs(1))
+        };
+        for _ in 0..20 {
+            stats.seed(&buckets[0], Sample::from_millis(5, 4096, 0));
+            stats.seed(&buckets[1], Sample::from_millis(19, 4096, 0));
+        }
+        assert_eq!(best_at(4096), Some(0));
+        let timeline = RequestTimeline::default();
+        let canceled = begin_sized(&stats, &buckets[0], None, &timeline, 8 * MIB);
+        advance(Duration::from_millis(300)).await;
+        drop(canceled);
+        assert_eq!(best_at(4096), Some(0));
+        for _ in 0..6 {
+            stats.seed(&buckets[0], Sample::from_millis(5, 8 * MIB, 95));
+        }
+        assert_eq!(best_at(4096), Some(0));
+        stats.model(&buckets[0]);
+        assert_eq!(best_at(8 * MIB), Some(0));
     }
 
     #[tokio::test(start_paused = true)]

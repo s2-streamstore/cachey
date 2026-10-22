@@ -13,10 +13,12 @@ affect health.
 Buckets are ranked by routing latency at the read's size: the request model's
 median, scaled by a moving average of successful reads relative to it, plus a
 penalty. The moving average follows a shift in latency sooner than the model does.
-Sizes the model cannot predict use the median at its largest retained size.
-Canceled copies raise the penalty toward how far they outlasted their routing
-latency. The penalty decays with a 5-second half-life once the bucket has a median,
-and stays until then. A bucket's first measurement and recovery probes reset both.
+At a size its model cannot predict, a bucket counts as unmeasured: only its penalty
+ranks it, it never ranks ahead of the first bucket, and its reads of that size leave
+the moving average alone. Canceled copies raise the penalty toward how far they
+outlasted their routing latency, unless their size cannot be predicted. The penalty
+decays with a 5-second half-life once the bucket has a median, and stays until then.
+A bucket's first measurement and recovery probes reset both.
 
 Feasibility, rescue timing, and stall detection use the request model at each
 read's size. A copy is overdue after four times its timeout allowance, which is
@@ -72,8 +74,8 @@ fitted outside it. Metrics report the latest fit.
 ## Deadlines and hedging
 
 The page deadline includes admission, SDK retries, and body validation. Copies to
-one bucket share a deadline starting at its first admission, and only the first copy
-admitted reports that deadline's expiry against health. Up to three copies can run
+one bucket share a deadline starting at its first admission, whose expiry counts
+against health once. Up to three copies can run
 per page; the first validated result wins and cancels the others.
 
 Early hedges use the first-byte model at the requested size, then the body model at
@@ -110,9 +112,9 @@ separate from cache capacity and total process memory.
 Copies other than early hedges and body retries wait for admission while they can
 still finish by the deadline, and no longer than their timeout allowance or 100 ms,
 whichever is longer, so a standing queue does not consume the deadline. A copy fails
-at once if the copies already waiting would take longer to leave the queue. Each is
-expected to take the average time between departures, admitted or abandoned, since
-the queue was last empty.
+at once if it would not be admitted in time: each copy ahead of it, then the copy
+itself, is expected to take the average time between departures, admitted or
+abandoned, since the queue was last empty.
 
 Rust callers use `DownloadLimits`; the default active-copy limit is 1,024. Downloader
 clones share limits.

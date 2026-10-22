@@ -63,7 +63,8 @@ struct Args {
     #[command(flatten)]
     disk_cache: DiskCacheGroup,
 
-    /// Maximum bucket download time through body validation, in milliseconds.
+    /// Maximum time for a page's downloads from one bucket, from first admission through body
+    /// validation, in milliseconds.
     #[arg(long, default_value = "5000", value_parser = clap::value_parser!(u64).range(1..))]
     bucket_timeout_ms: u64,
 

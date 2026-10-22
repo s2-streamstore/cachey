@@ -1,4 +1,10 @@
-use std::{sync::OnceLock, time::Duration};
+use std::{
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use tokio::{
     select,
@@ -7,36 +13,44 @@ use tokio::{
 
 use crate::object_store::stats::{Headers, LatencyModel, RequestTimeline};
 
+/// A page's state for the deadline its copies to one bucket share.
+#[derive(Debug, Default)]
+pub(super) struct SharedDeadline {
+    admitted: OnceLock<Instant>,
+    expiry_reported: AtomicBool,
+}
+
 /// A deadline shared by a page's copies to one bucket, starting at first admission.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BucketDeadline<'a> {
     page: Instant,
-    admitted: &'a OnceLock<Instant>,
+    shared: &'a SharedDeadline,
 }
 
 impl<'a> BucketDeadline<'a> {
-    pub fn new(page: Instant, admitted: &'a OnceLock<Instant>) -> Self {
-        Self { page, admitted }
+    pub fn new(page: Instant, shared: &'a SharedDeadline) -> Self {
+        Self { page, shared }
+    }
+
+    pub fn page(&self) -> Instant {
+        self.page
     }
 
     pub fn admitted(&self) -> Option<Instant> {
-        self.admitted.get().copied()
+        self.shared.admitted.get().copied()
     }
 
-    /// The bucket's deadline once a copy is admitted, or else the page deadline.
-    pub fn current(&self) -> Instant {
-        self.admitted().unwrap_or(self.page)
+    /// First admission starts the bucket timeout, capped by the page deadline.
+    pub fn admit(&self, now: Instant, bucket_timeout: Duration) -> Instant {
+        *self
+            .shared
+            .admitted
+            .get_or_init(|| now + bucket_timeout.min(self.page.saturating_duration_since(now)))
     }
 
-    /// First admission starts the bucket timeout, capped by the page deadline, and is
-    /// reported as such.
-    pub fn admit(&self, now: Instant, bucket_timeout: Duration) -> (Instant, bool) {
-        let mut first = false;
-        let deadline = *self.admitted.get_or_init(|| {
-            first = true;
-            now + bucket_timeout.min(self.page.saturating_duration_since(now))
-        });
-        (deadline, first)
+    /// Whether this is the first report of the deadline's expiry.
+    pub fn report_expiry(&self) -> bool {
+        !self.shared.expiry_reported.swap(true, Ordering::Relaxed)
     }
 }
 
