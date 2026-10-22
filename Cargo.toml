@@ -19,7 +19,6 @@ bytesize = "2.7.0"
 clap = { version = "4.6.7", features = ["derive"] }
 compact_str = { version = "0.10.0", features = ["serde"] }
 dashmap = "6.2.1"
-exponential-decay-histogram = "0.1.16"
 eyre = "0.6.14"
 foyer = "0.22.6"
 futures = "0.3.34"

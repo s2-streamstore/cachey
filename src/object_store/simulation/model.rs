@@ -11,11 +11,9 @@ const PPM: u32 = 1_000_000;
 #[serde(default, deny_unknown_fields)]
 pub struct Replica {
     pub headers_ms: u64,
-    /// Header time added per MiB of response, as for a server that reads the whole response before
-    /// sending headers.
+    /// Models a server buffering the response before headers.
     pub headers_ms_per_mib: u64,
     pub body_ms: u64,
-    /// Body time added per MiB of response, so larger bodies take proportionally longer.
     pub body_ms_per_mib: u64,
     pub slots: u32,
     pub queue: u32,
@@ -42,17 +40,22 @@ impl Replica {
     pub fn body_ms(&self, body_bytes: usize) -> u64 {
         self.body_ms + self.body_ms_per_mib * body_bytes as u64 / MIB
     }
+
+    pub fn read_ms(&self, body_bytes: usize) -> u64 {
+        self.headers_ms(body_bytes) + self.body_ms(body_bytes)
+    }
 }
 
-/// A share of reads whose response is shorter than `body_bytes`: the last page of an object, or
-/// an exact-range read when the scenario requests no fixed page size.
+/// Short responses for object tails or exact-range reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShortBody {
     pub bytes: usize,
-    /// Spreads short responses uniformly from `bytes` up to, but excluding, this length, as the
-    /// last pages of objects of varied sizes are.
+    /// Exclusive upper bound; omit for a fixed size.
     pub max_bytes: Option<usize>,
+    /// Sample sizes uniformly in log space; otherwise sample uniformly in bytes.
+    #[serde(default)]
+    pub log_uniform: bool,
     pub probability_ppm: u32,
 }
 
@@ -226,9 +229,15 @@ impl Scenario {
                 ) =>
             {
                 short.max_bytes.map_or(short.bytes, |max| {
-                    let spread = draw(seed, read, 0, 0, 0, SHORT_BODY_LENGTH_DOMAIN)
-                        % (max - short.bytes) as u64;
-                    short.bytes + spread as usize
+                    let value = draw(seed, read, 0, 0, 0, SHORT_BODY_LENGTH_DOMAIN);
+                    if short.log_uniform {
+                        let fraction = (value >> 11) as f64 / (1_u64 << 53) as f64;
+                        let bytes =
+                            short.bytes as f64 * (max as f64 / short.bytes as f64).powf(fraction);
+                        (bytes as usize).clamp(short.bytes, max - 1)
+                    } else {
+                        short.bytes + (value % (max - short.bytes) as u64) as usize
+                    }
                 })
             }
             _ => self.body_bytes,

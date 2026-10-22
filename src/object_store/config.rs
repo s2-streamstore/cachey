@@ -4,7 +4,7 @@ use aws_sdk_s3::config::{retry::RetryConfig, timeout::TimeoutConfig};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadLimits {
-    /// Maximum duration of a bucket operation, through body validation.
+    /// Shared timeout for a page's copies to one bucket, from first admission through validation.
     pub bucket_timeout: Duration,
     /// Maximum duration across bucket selection and fallback.
     pub page_timeout: Duration,
@@ -79,6 +79,14 @@ impl RequestConfig {
     #[must_use]
     pub fn is_noop(&self) -> bool {
         self == &Self::default()
+    }
+
+    #[must_use]
+    pub(super) fn single_attempt(&self) -> Self {
+        Self {
+            max_attempts: Some(1),
+            ..self.clone()
+        }
     }
 
     fn has_retry_overrides(&self) -> bool {
