@@ -30,7 +30,6 @@ impl Default for DownloadLimits {
 }
 
 impl DownloadLimits {
-    /// Each bucket's share of the page timeout.
     pub(super) fn bucket_share(self, buckets: usize) -> Duration {
         self.page_timeout / u32::try_from(buckets).unwrap_or(u32::MAX)
     }

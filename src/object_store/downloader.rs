@@ -231,7 +231,7 @@ impl BucketOperation<'_> {
             }
         };
         let now = Instant::now();
-        let bucket_deadline = self
+        let (bucket_deadline, first_admitted) = self
             .deadline
             .admit(now, self.downloader.limits.bucket_timeout);
         let budget = bucket_deadline.saturating_duration_since(now);
@@ -248,15 +248,19 @@ impl BucketOperation<'_> {
             self.request.bytes(),
             self.model.request.tail(self.request.bytes()),
         );
+        let mut expired = false;
         let result = select! {
             biased;
             result = fetch() => result,
-            () = sleep_until(bucket_deadline) => Err(DownloadError::Timeout {
-                bucket: self.request.bucket.clone(), timeout: budget,
-            }),
+            () = sleep_until(bucket_deadline) => {
+                expired = true;
+                Err(DownloadError::Timeout { bucket: self.request.bucket.clone(), timeout: budget })
+            }
         };
         let outcome = match &result {
             Ok(_) => Outcome::Success,
+            // Copies to a bucket share its deadline; the first one admitted reports its expiry.
+            Err(_) if expired && !first_admitted => Outcome::Neutral,
             Err(error) => error.health_outcome(self.timeout_allowance()),
         };
         observation.complete(outcome);
@@ -1001,6 +1005,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_stall_shared_by_a_same_bucket_hedge_counts_once() {
+        let (downloader, script) =
+            scripted_downloader([("bucket", 1_000, 0, false), ("bucket", 1_000, 0, false)]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                bucket_timeout: Duration::from_millis(200),
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        seed_latency(&downloader, "bucket", 10);
+        let result = fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+        assert!(
+            matches!(result, Err(DownloadError::Timeout { .. })),
+            "{result:?}"
+        );
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(metrics(&downloader, "bucket").await.consecutive_failures, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_primary_failure_survives_its_hedges_timeout() {
         let (downloader, script) =
             scripted_downloader([("bucket", 1, 92, true), ("bucket", 300, 0, false)]);
@@ -1385,13 +1409,10 @@ mod tests {
             assert_eq!(script.requests.load(Ordering::SeqCst), buckets.len());
             assert_eq!(script.active.load(Ordering::SeqCst), 0);
             for bucket in buckets {
-                let metrics = metrics(&downloader, bucket).await;
-                assert_eq!(metrics.consecutive_failures, 1);
-                assert!(metrics.request.is_none());
-                assert_eq!(
-                    metrics.first_byte.map(|estimate| estimate.base),
-                    Some(Duration::from_millis(10))
-                );
+                assert_eq!(metrics(&downloader, bucket).await.consecutive_failures, 1);
+                let model = model(&downloader, bucket);
+                assert!(model.request.tail(4).is_none());
+                assert_eq!(model.first_byte.tail(4), Some(Duration::from_millis(10)));
             }
         }
     }

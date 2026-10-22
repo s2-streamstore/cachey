@@ -391,10 +391,10 @@ fn refit(stats: &mut MutexGuard<'_, BucketStats>, now: Instant, interval: bool) 
     if refits.iter().all(Option::is_none) {
         return false;
     }
-    let models = MutexGuard::unlocked(stats, || refits.map(|refit| refit.map(|refit| refit.fit())));
-    for (histogram, model) in stats.estimates.histograms().into_iter().zip(models) {
-        if let Some(model) = model {
-            histogram.set_model(model);
+    let fits = MutexGuard::unlocked(stats, || refits.map(|refit| refit.map(Refit::fit)));
+    for (histogram, fitted) in stats.estimates.histograms().into_iter().zip(fits) {
+        if let Some(fitted) = fitted {
+            histogram.store(fitted);
         }
     }
     true
@@ -705,17 +705,22 @@ impl BucketedStats {
         requested_bytes: u64,
     ) -> RoutingSnapshot {
         let now = Instant::now();
+        let states: Vec<_> = buckets.iter().map(|bucket| self.entry(bucket)).collect();
+        // Only the bucket longest without one may refit on the interval, so a read pays
+        // for at most one such fit and every bucket gets its turn.
+        let oldest = states
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, state)| state.lock().summarized_at)
+            .map(|(index, _)| index);
         let mut preferred_latency = Duration::ZERO;
-        // One interval refit per snapshot keeps a read from paying for every bucket's.
-        let mut refitted = false;
         RoutingSnapshot(
-            buckets
-                .iter()
+            states
+                .into_iter()
                 .enumerate()
-                .map(|(index, bucket)| {
-                    let state = self.entry(bucket);
+                .map(|(index, state)| {
                     let mut stats = state.lock();
-                    refitted |= refit(&mut stats, now, !refitted);
+                    refit(&mut stats, now, Some(index) == oldest);
                     let model = stats.estimates.model();
                     let current = stats.current_routing_latency(now);
                     if index == 0 {
@@ -784,8 +789,7 @@ impl BucketedStats {
             .by_bucket
             .iter()
             .map(|entry| {
-                let mut stats = entry.value().lock();
-                refit(&mut stats, now, true);
+                let stats = entry.value().lock();
                 let model = stats.estimates.model();
                 let metrics = BucketMetrics {
                     error_rate: stats.error_rate(now),
@@ -916,6 +920,35 @@ mod tests {
         }
     }
 
+    /// With one snapshot per interval, each bucket's turn to refit still comes.
+    #[tokio::test(start_paused = true)]
+    async fn sparse_snapshots_refit_every_bucket_in_turn() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for bucket in buckets.iter() {
+            for _ in 0..8 {
+                stats.seed_latency(bucket, 10);
+            }
+        }
+        snapshot(&stats, &buckets);
+        let mut routing = None;
+        for _ in 0..buckets.len() {
+            advance(LATENCY_SNAPSHOT_INTERVAL).await;
+            for bucket in buckets.iter() {
+                stats.seed_latency(bucket, 30);
+            }
+            routing = Some(snapshot(&stats, &buckets));
+        }
+        let routing = routing.unwrap();
+        for index in 0..buckets.len() {
+            assert_eq!(
+                routing.tail(index),
+                Some(Duration::from_millis(30)),
+                "{index}"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn elapsed_time_and_pre_failure_completions_do_not_restore_health() {
         let stats = BucketedStats::default();
@@ -1017,6 +1050,7 @@ mod tests {
         let buckets = buckets();
         for bucket in buckets.iter() {
             stats.seed_latency(bucket, 3);
+            stats.model(bucket);
         }
         let mut exported = 0;
         stats.export_bucket_metrics(|bucket, metrics| {

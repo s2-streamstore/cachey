@@ -5,7 +5,6 @@ use std::{
 
 use super::LATENCY_DECAY;
 
-const CAPACITY: usize = 256;
 /// Samples older than this weigh under 0.4% of a new one.
 const PRUNE_HALF_LIVES: f64 = 8.0;
 
@@ -28,11 +27,8 @@ pub(super) struct Reservoir<T> {
     discarded_priority: Option<u64>,
 }
 
-impl<T: Copy> Default for Reservoir<T> {
-    fn default() -> Self {
-        let capacity = CAPACITY;
-        #[cfg(test)]
-        let capacity = crate::object_store::simulation::histogram_capacity().unwrap_or(capacity);
+impl<T: Copy> Reservoir<T> {
+    pub fn new(capacity: usize) -> Self {
         Self {
             samples: BTreeMap::new(),
             capacity,
@@ -42,14 +38,19 @@ impl<T: Copy> Default for Reservoir<T> {
             discarded_priority: None,
         }
     }
-}
 
-impl<T: Copy> Reservoir<T> {
-    #[cfg(test)]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            capacity,
-            ..Self::default()
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    /// Shrinking evicts the lowest priorities, as sampling into the smaller capacity would.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        while self.samples.len() > capacity {
+            let Some(((priority, _), _)) = self.samples.pop_first() else {
+                break;
+            };
+            self.discarded_priority = self.discarded_priority.max(Some(priority));
         }
     }
 
@@ -114,13 +115,15 @@ impl<T: Copy> Reservoir<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CAPACITY, LATENCY_DECAY, Reservoir};
+    use super::{LATENCY_DECAY, Reservoir};
     use crate::object_store::stats::model::quantile;
+
+    const CAPACITY: usize = 256;
 
     #[test]
     fn sampling_estimates_decayed_mass_and_prunes_negligible_weight() {
-        let mut sampled = Reservoir::default();
-        let mut full = Reservoir::with_capacity(20_000);
+        let mut sampled = Reservoir::new(CAPACITY);
+        let mut full = Reservoir::new(20_000);
         assert!(sampled.weighted(0.0).next().is_none());
         let mut at = 0.0;
         for (count, value) in [(10_000, 11.0), (4_000, 41.0)] {
@@ -156,7 +159,7 @@ mod tests {
     fn refilled_samples_keep_unbiased_weights() {
         let half_life = std::f64::consts::LN_2 / LATENCY_DECAY;
         for survivor in [false, true] {
-            let mut reservoir = Reservoir::default();
+            let mut reservoir = Reservoir::new(CAPACITY);
             let count = 1000 * CAPACITY;
             for index in 0..count {
                 let uniform = (index as f64 + 0.5) / count as f64;

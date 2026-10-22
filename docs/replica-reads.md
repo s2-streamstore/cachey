@@ -47,9 +47,10 @@ intervals as fixed cost.
 
 Observations have a 15-second half-life of model time. Model time advances at most
 150 ms per observation, so a half-life spans at least 100 observations when traffic
-is light, and idle buckets keep their history. Size bands four times apart each
-retain up to 256 samples, so rare sizes survive. Priority sampling keeps weights
-unbiased. Samples are dropped once they weigh under 0.4% of a new observation.
+is light, and idle buckets keep their history. Each model retains up to 1,024
+samples, split evenly across size bands four times apart, so rare sizes survive.
+Priority sampling keeps weights unbiased. Samples are dropped once they weigh under
+0.4% of a new observation.
 
 Validated responses train all three models. Copies that receive headers train the
 first-byte model even if they later fail, time out, or are canceled. Otherwise,
@@ -58,14 +59,16 @@ superseded by a hedge stay outside the p99 that detects them. Recovery probes ke
 latency history.
 
 Models refit at most once per second, or sooner while the observation count
-doubles. Samples are copied under the bucket's statistics lock, then fitted outside
-it.
+doubles. A routing decision refits at most one bucket on that interval, the one
+longest without a refit. Samples are copied under the bucket's statistics lock, then
+fitted outside it. Metrics report the latest fit.
 
 ## Deadlines and hedging
 
 The page deadline includes admission, SDK retries, and body validation. Copies to
-one bucket share a deadline starting at its first admission. Up to three copies can
-run per page; the first validated result wins and cancels the others.
+one bucket share a deadline starting at its first admission, and only the first copy
+admitted reports that deadline's expiry against health. Up to three copies can run
+per page; the first validated result wins and cancels the others.
 
 Early hedges use the first-byte model at the requested size, then the body model at
 the announced size. Each delay is p99 capped at 1.5 times the median. Health,

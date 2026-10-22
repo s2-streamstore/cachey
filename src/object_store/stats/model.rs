@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    time::Duration,
+};
 
 use tokio::time::Instant;
 
@@ -9,6 +12,8 @@ const TIMER_MICROS: f64 = TIMER_RESOLUTION.as_micros() as f64;
 const FIT_PRECISION_MICROS: f64 = 0.25;
 const TAIL_QUANTILE: f64 = 0.99;
 const HEDGE_TAIL_CAP: f64 = 1.5;
+/// Samples a histogram retains, split evenly across its size bands.
+const SAMPLES: usize = 1024;
 
 /// Median latency by size; never below timer resolution.
 #[derive(Debug, Clone, Copy)]
@@ -237,6 +242,7 @@ pub(super) struct SizeHistogram {
     updates: u64,
     summarized_updates: u64,
     model: SizeModel,
+    fitted_updates: u64,
 }
 
 impl SizeHistogram {
@@ -249,6 +255,22 @@ impl SizeHistogram {
             updates: 0,
             summarized_updates: 0,
             model: SizeModel::default(),
+            fitted_updates: 0,
+        }
+    }
+
+    fn band_capacity(&self) -> usize {
+        #[cfg(test)]
+        if let Some(capacity) = crate::object_store::simulation::histogram_capacity() {
+            return capacity;
+        }
+        SAMPLES / self.bands.len().max(1)
+    }
+
+    fn rebalance(&mut self) {
+        let capacity = self.band_capacity();
+        for band in self.bands.values_mut() {
+            band.set_capacity(capacity);
         }
     }
 
@@ -263,13 +285,20 @@ impl SizeHistogram {
                 .as_secs_f64();
         }
         self.observed_at = Some(now);
-        self.bands.entry(bytes.ilog2() / 2).or_default().update(
-            self.clock,
-            Measurement {
-                bytes,
-                micros: (latency.as_secs_f64() * 1_000_000.0).max(TIMER_MICROS),
-            },
-        );
+        let band = bytes.ilog2() / 2;
+        if let Entry::Vacant(entry) = self.bands.entry(band) {
+            entry.insert(Reservoir::new(0));
+            self.rebalance();
+        }
+        if let Some(reservoir) = self.bands.get_mut(&band) {
+            reservoir.update(
+                self.clock,
+                Measurement {
+                    bytes,
+                    micros: (latency.as_secs_f64() * 1_000_000.0).max(TIMER_MICROS),
+                },
+            );
+        }
         self.updates += 1;
     }
 
@@ -287,18 +316,25 @@ impl SizeHistogram {
         }
         self.summarized_updates = self.updates;
         let clock = self.clock;
+        let observations = self
+            .bands
+            .values_mut()
+            .flat_map(|band| band.weighted(clock))
+            .map(|(sample, weight)| Observation {
+                bytes: sample.bytes,
+                micros: sample.micros,
+                weight,
+            })
+            .collect();
+        let bands = self.bands.len();
+        self.bands.retain(|_, band| !band.is_empty());
+        if self.bands.len() < bands {
+            self.rebalance();
+        }
         Some(Refit {
-            observations: self
-                .bands
-                .values_mut()
-                .flat_map(|band| band.weighted(clock))
-                .map(|(sample, weight)| Observation {
-                    bytes: sample.bytes,
-                    micros: sample.micros,
-                    weight,
-                })
-                .collect(),
+            observations,
             proportional: self.proportional,
+            updates: self.updates,
         })
     }
 
@@ -306,14 +342,18 @@ impl SizeHistogram {
         self.model
     }
 
-    pub fn set_model(&mut self, model: SizeModel) {
-        self.model = model;
+    /// Keeps the fit of the most observations when refits finish out of order.
+    pub fn store(&mut self, fitted: Fitted) {
+        if fitted.updates > self.fitted_updates {
+            self.model = fitted.model;
+            self.fitted_updates = fitted.updates;
+        }
     }
 
     #[cfg(test)]
     pub fn summary(&mut self, due: bool) -> SizeModel {
         if let Some(refit) = self.refit(due) {
-            self.model = refit.fit();
+            self.store(refit.fit());
         }
         self.model
     }
@@ -323,28 +363,46 @@ impl SizeHistogram {
 pub(super) struct Refit {
     observations: Vec<Observation>,
     proportional: bool,
+    updates: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Fitted {
+    model: SizeModel,
+    updates: u64,
 }
 
 impl Refit {
     /// The tail ratio is the p99 quantile regression of latency on the median line. Weighting
     /// ratios by their median keeps small requests' constant stalls from scaling large ones.
-    pub fn fit(&self) -> SizeModel {
-        let observations = &self.observations;
-        let Some(largest_bytes) = observations.iter().map(|sample| sample.bytes).max() else {
-            return SizeModel::default();
-        };
-        let mut values = Vec::with_capacity(observations.len());
-        let median = median_line(observations, largest_bytes, self.proportional, &mut values);
-        values.clear();
-        values.extend(observations.iter().map(|sample| {
-            let median = median.micros(sample.bytes);
-            (sample.micros / median, sample.weight * median)
-        }));
-        SizeModel(Some(Estimate {
-            median,
-            tail_ratio: quantile(&mut values, TAIL_QUANTILE).max(1.0),
-            largest_bytes,
-        }))
+    pub fn fit(self) -> Fitted {
+        let Self {
+            observations,
+            proportional,
+            updates,
+        } = self;
+        let model = observations
+            .iter()
+            .map(|sample| sample.bytes)
+            .max()
+            .map(|largest_bytes| {
+                let mut values = Vec::with_capacity(observations.len());
+                let median = median_line(&observations, largest_bytes, proportional, &mut values);
+                values.clear();
+                values.extend(observations.iter().map(|sample| {
+                    let median = median.micros(sample.bytes);
+                    (sample.micros / median, sample.weight * median)
+                }));
+                Estimate {
+                    median,
+                    tail_ratio: quantile(&mut values, TAIL_QUANTILE).max(1.0),
+                    largest_bytes,
+                }
+            });
+        Fitted {
+            model: SizeModel(model),
+            updates,
+        }
     }
 }
 
@@ -439,6 +497,42 @@ mod tests {
         }
         let model = histogram.summary(true);
         assert_eq!(model.median(MIB), Some(Duration::from_millis(21)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refit_finishing_late_does_not_replace_a_newer_model() {
+        let mut histogram = body();
+        update(&mut histogram, MIB, 10);
+        let older = histogram.refit(true).unwrap();
+        for _ in 0..2 {
+            update(&mut histogram, MIB, 30);
+        }
+        let newer = histogram.refit(true).unwrap();
+        histogram.store(newer.fit());
+        histogram.store(older.fit());
+        assert_eq!(
+            histogram.model().median(MIB),
+            Some(Duration::from_millis(30))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn size_bands_share_one_sample_budget() {
+        let mut histogram = body();
+        for _ in 0..2000 {
+            update(&mut histogram, MIB, 10);
+        }
+        let retained = |histogram: &SizeHistogram| {
+            histogram
+                .retention()
+                .map(|(_, retained)| retained)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(retained(&histogram), [1024]);
+        for _ in 0..2000 {
+            update(&mut histogram, 4096, 1);
+        }
+        assert_eq!(retained(&histogram), [512, 512]);
     }
 
     #[tokio::test(start_paused = true)]
