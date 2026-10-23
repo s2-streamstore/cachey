@@ -107,6 +107,8 @@ pub struct Scenario {
     pub name: String,
     pub duration_ms: u64,
     pub interval_ms: u64,
+    /// Reads arriving together at each interval.
+    pub burst: u32,
     pub warmup_per_replica: u32,
     pub body_bytes: usize,
     pub short_body: Option<ShortBody>,
@@ -132,6 +134,7 @@ impl Default for Scenario {
             name: String::new(),
             duration_ms: 12_000,
             interval_ms: 20,
+            burst: 1,
             warmup_per_replica: 16,
             body_bytes: 1024,
             short_body: None,
@@ -166,7 +169,7 @@ impl Default for Scenario {
 impl Scenario {
     pub fn validate(&self) -> eyre::Result<()> {
         eyre::ensure!(
-            !self.name.is_empty() && self.interval_ms > 0 && self.duration_ms > 0,
+            !self.name.is_empty() && self.interval_ms > 0 && self.duration_ms > 0 && self.burst > 0,
             "invalid arrival schedule"
         );
         eyre::ensure!(
@@ -251,7 +254,11 @@ impl Scenario {
     }
 
     pub fn reads(&self) -> usize {
-        self.duration_ms.div_ceil(self.interval_ms) as usize
+        self.duration_ms.div_ceil(self.interval_ms) as usize * self.burst as usize
+    }
+
+    pub fn arrival_ms(&self, read: u64) -> u64 {
+        read / u64::from(self.burst) * self.interval_ms
     }
 }
 

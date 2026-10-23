@@ -145,6 +145,22 @@
     ]
   },
   {
+    "name": "s3_standard_admission_bursts",
+    "interval_ms": 2000,
+    "burst": 32,
+    "body_bytes": 16777216,
+    "request_bytes": 16777216,
+    "jitter_percent": 20,
+    "warmup_per_replica": 2,
+    "max_inflight_bytes": 134217728,
+    "replicas": [
+      {
+        "headers_ms": 25,
+        "body_ms_per_mib": 11
+      }
+    ]
+  },
+  {
     "name": "s3_standard_queued_long_read",
     "duration_ms": 2,
     "interval_ms": 1,
@@ -874,6 +890,22 @@
     ]
   },
   {
+    "name": "s3_express_admission_bursts",
+    "interval_ms": 500,
+    "burst": 48,
+    "body_bytes": 16777216,
+    "request_bytes": 16777216,
+    "jitter_percent": 20,
+    "warmup_per_replica": 2,
+    "max_inflight_bytes": 134217728,
+    "replicas": [
+      {
+        "headers_ms": 3,
+        "body_ms_per_mib": 4
+      }
+    ]
+  },
+  {
     "name": "s3_express_caller_cancellation",
     "duration_ms": 200,
     "interval_ms": 20,
@@ -1169,6 +1201,23 @@
         ],
         "kind": "header_stall",
         "duration_ms": 50
+      }
+    ]
+  },
+  {
+    "name": "capacitor_admission_bursts",
+    "interval_ms": 200,
+    "burst": 128,
+    "body_bytes": 4194304,
+    "request_bytes": 4194304,
+    "jitter_percent": 10,
+    "warmup_per_replica": 2,
+    "max_inflight_bytes": 33554432,
+    "replicas": [
+      {
+        "headers_ms": 1,
+        "headers_ms_per_mib": 1,
+        "body_ms_per_mib": 1
       }
     ]
   },

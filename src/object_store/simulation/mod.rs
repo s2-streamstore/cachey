@@ -206,7 +206,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 let buckets = &buckets;
                 let scenario = &scenario;
                 async move {
-                    let at_ms = id as u64 * scenario.interval_ms;
+                    let at_ms = scenario.arrival_ms(id as u64);
                     sleep_until(epoch + Duration::from_millis(at_ms)).await;
                     let object = ObjectKey::new(format!("read-{id}")).unwrap();
                     let config = RequestConfig::default();

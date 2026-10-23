@@ -58,7 +58,9 @@ before headers, then serves it from memory.
 | Capacitor | a deployment per AZ, the first local, chunks up to 4 MiB | 1, 2, 2 ms plus 1 ms per MiB | 1 ms per MiB |
 
 Exact-range fixtures read sizes log-uniformly from 1 KiB to each profile's largest
-response, starting cold. A sparse Express fixture reads once per second.
+response, starting cold. A sparse Express fixture reads once per second. Admission
+burst fixtures send groups of simultaneous reads to one bucket through eight
+admission slots.
 
 ## Interpreting results
 

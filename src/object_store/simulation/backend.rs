@@ -137,7 +137,7 @@ impl Backend {
             .enumerate()
             .find_map(|(index, fault)| {
                 let time_ms = if fault.clock_at_arrival {
-                    read * self.scenario.interval_ms
+                    self.scenario.arrival_ms(read)
                 } else {
                     now_us / 1000
                 };
