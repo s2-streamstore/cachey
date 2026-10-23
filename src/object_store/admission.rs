@@ -9,6 +9,10 @@ use tokio::{
 use super::{DownloadError, DownloadLimits};
 
 const INTERVAL_ALPHA: f64 = 0.1;
+/// A queue younger than this is absorbing a burst rather than standing.
+const BURST_WINDOW: Duration = Duration::from_millis(100);
+/// The shortest a copy may wait in a standing queue, so short reads are not shed.
+pub(super) const MIN_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub(super) struct DownloadAdmission {
@@ -22,6 +26,8 @@ pub(super) struct DownloadAdmission {
 #[derive(Debug, Default)]
 struct Queue {
     waiting: u32,
+    /// When the queue last became non-empty.
+    formed_at: Option<Instant>,
     /// Moving average of the time between departures since the queue last emptied.
     interval: Duration,
     last_departure: Option<Instant>,
@@ -86,25 +92,36 @@ impl DownloadAdmission {
             })
     }
 
-    /// Queues only while a copy can still start by `latest_start`, failing at once when the
-    /// copies already waiting would take too long to admit.
+    /// Queues while a copy can still start by `latest_start`. Copies joining a queue that
+    /// is absorbing a burst wait for as long as that allows, since capacity will reach them;
+    /// in a standing queue, waiting longer than a copy is `expected` to take only delays it.
+    /// A copy that would not be admitted in time fails at once.
     pub async fn acquire(
         &self,
         bytes: u64,
         latest_start: Instant,
+        expected: Duration,
     ) -> Result<DownloadPermit, DownloadError> {
         let bytes = self.byte_permits(bytes)?;
         if let Some(permit) = self.try_acquire_permits(bytes) {
             return Ok(permit);
         }
-        let _waiting = {
+        let (_waiting, latest_start) = {
             let mut queue = self.queue.lock();
             let now = Instant::now();
+            let standing = queue
+                .formed_at
+                .is_some_and(|formed_at| now.saturating_duration_since(formed_at) >= BURST_WINDOW);
+            let latest_start = match now.checked_add(expected.max(MIN_WAIT)) {
+                Some(patience) if standing => latest_start.min(patience),
+                _ => latest_start,
+            };
             if now + queue.predicted_wait(now) >= latest_start {
                 return Err(DownloadError::AdmissionTimeout);
             }
+            queue.formed_at.get_or_insert(now);
             queue.waiting += 1;
-            Waiting(&self.queue)
+            (Waiting(&self.queue), latest_start)
         };
         timeout_at(latest_start, async {
             let request = self
@@ -148,8 +165,11 @@ mod tests {
 
     use tokio::time::{Instant, sleep};
 
-    use super::DownloadAdmission;
+    use super::{BURST_WINDOW, DownloadAdmission, MIN_WAIT};
     use crate::object_store::{DownloadError, DownloadLimits};
+
+    /// An expected latency too long to limit any wait.
+    const UNHURRIED: Duration = Duration::from_secs(60);
 
     /// Copies hold the only slot for 100 ms, so queued copies depart 100 ms apart.
     #[tokio::test(start_paused = true)]
@@ -159,7 +179,7 @@ mod tests {
             ..DownloadLimits::default()
         });
         let hold = |held, latest_start| async move {
-            let permit = admission.acquire(4, latest_start).await?;
+            let permit = admission.acquire(4, latest_start, UNHURRIED).await?;
             sleep(Duration::from_millis(held)).await;
             drop(permit);
             Ok::<_, DownloadError>(())
@@ -176,7 +196,7 @@ mod tests {
                 let arrived = Instant::now();
                 // Behind one waiting copy, the slot frees at 400 ms.
                 let refused = admission
-                    .acquire(4, start + Duration::from_millis(360))
+                    .acquire(4, start + Duration::from_millis(360), UNHURRIED)
                     .await;
                 let refused_after = arrived.elapsed();
                 let fifth = hold(100, start + Duration::from_millis(420)).await;
@@ -202,6 +222,42 @@ mod tests {
         }
     }
 
+    /// Copies joining a queue that is absorbing a burst wait as long as their deadline
+    /// allows; once the queue has stood for the burst window, a copy joining it waits only
+    /// as long as it is expected to take.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_standing_queue_limits_waits_to_the_expected_latency() {
+        let admission = &DownloadAdmission::new(DownloadLimits {
+            max_inflight_requests: 1,
+            ..DownloadLimits::default()
+        });
+        let held = admission.try_acquire(4).unwrap();
+        let late = Instant::now() + Duration::from_secs(1);
+        let expected = Duration::from_millis(10);
+        let burst = |joins_after| async move {
+            sleep(joins_after).await;
+            admission.acquire(4, late, expected).await.map(drop)
+        };
+        let (first, second, (standing, waited), ()) = tokio::join!(
+            burst(Duration::ZERO),
+            burst(BURST_WINDOW / 2),
+            async {
+                sleep(BURST_WINDOW).await;
+                let joined = Instant::now();
+                let result = admission.acquire(4, late, expected).await;
+                (result, joined.elapsed())
+            },
+            async {
+                sleep(Duration::from_millis(300)).await;
+                drop(held);
+            }
+        );
+        first.unwrap();
+        second.unwrap();
+        assert!(matches!(standing, Err(DownloadError::AdmissionTimeout)));
+        assert_eq!(waited, MIN_WAIT);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn waiting_and_cancellation_release_request_and_byte_capacity() {
         let admission = DownloadAdmission::new(DownloadLimits {
@@ -210,13 +266,13 @@ mod tests {
             ..DownloadLimits::default()
         });
         let first = admission
-            .acquire(8, Instant::now() + Duration::from_secs(1))
+            .acquire(8, Instant::now() + Duration::from_secs(1), UNHURRIED)
             .await
             .unwrap();
         assert!(admission.try_acquire(1).is_none());
         assert!(matches!(
             admission
-                .acquire(4, Instant::now() + Duration::from_millis(10))
+                .acquire(4, Instant::now() + Duration::from_millis(10), UNHURRIED)
                 .await,
             Err(DownloadError::AdmissionTimeout)
         ));
@@ -228,7 +284,7 @@ mod tests {
         assert!(admission.try_acquire(8).is_some());
         assert!(matches!(
             admission
-                .acquire(9, Instant::now() + Duration::from_secs(1))
+                .acquire(9, Instant::now() + Duration::from_secs(1), UNHURRIED)
                 .await,
             Err(DownloadError::AdmissionExhausted { .. })
         ));

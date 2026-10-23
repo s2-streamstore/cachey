@@ -110,11 +110,13 @@ Server reads reserve 16 MiB each, admitting 64 copies by default. This limit is
 separate from cache capacity and total process memory.
 
 Copies other than early hedges and body retries wait for admission while they can
-still finish by the deadline, and no longer than their timeout allowance or 100 ms,
-whichever is longer, so a standing queue does not consume the deadline. A copy fails
-at once if it would not be admitted in time: each copy ahead of it, then the copy
-itself, is expected to take the average time between departures, admitted or
-abandoned, since the queue was last empty.
+still finish by the deadline. A queue that formed within the last 100 ms is
+absorbing a burst, which capacity will reach. Once it has stood longer, waiting only
+delays reads without filling more pages, so a copy joining it waits no longer than
+its timeout allowance or 100 ms, whichever is longer. A copy fails at once if it
+would not be admitted in time: each copy ahead of it, then the copy itself, is
+expected to take the average time between departures, admitted or abandoned, since
+the queue was last empty.
 
 Rust callers use `DownloadLimits`; the default active-copy limit is 1,024. Downloader
 clones share limits.
