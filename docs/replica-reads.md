@@ -13,12 +13,13 @@ affect health.
 Buckets are ranked by routing latency at the read's size: the request model's
 median, scaled by a moving average of successful reads relative to it, plus a
 penalty. The moving average follows a shift in latency sooner than the model does.
-At a size its model cannot predict, a bucket counts as unmeasured: only its penalty
-ranks it, it never ranks ahead of the first bucket, and its reads of that size leave
-the moving average alone. Canceled copies raise the penalty toward how far they
-outlasted their routing latency, unless their size cannot be predicted. The penalty
-decays with a 5-second half-life once the bucket has a median, and stays until then.
-A bucket's first measurement and recovery probes reset both.
+Beyond the sizes its model can predict, a bucket is ranked by its median at the
+largest size it has seen, since latency grows with size. It never ranks ahead of the
+first bucket there, and its reads of that size leave the moving average alone.
+Canceled copies raise the penalty toward how far they outlasted their routing
+latency, unless their size cannot be predicted. The penalty decays with a 5-second
+half-life once the bucket has a median, and stays until then. A bucket's first
+measurement and recovery probes reset both.
 
 Feasibility, rescue timing, and stall detection use the request model at each
 read's size. A copy is overdue after four times its timeout allowance, which is
@@ -113,10 +114,11 @@ Copies other than early hedges and body retries wait for admission while they ca
 still finish by the deadline. A queue that formed within the last 100 ms is
 absorbing a burst, which capacity will reach. Once it has stood longer, waiting only
 delays reads without filling more pages, so a copy joining it waits no longer than
-its timeout allowance or 100 ms, whichever is longer. A copy fails at once if it
-would not be admitted in time: each copy ahead of it, then the copy itself, is
-expected to take the average time between departures, admitted or abandoned, since
-the queue was last empty.
+its timeout allowance or 100 ms, whichever is longer. A copy that fails admission
+does not fall back to another bucket, whose copy would wait in the same queue. A
+copy fails at once if it would not be admitted in time: each copy ahead of it, then
+the copy itself, is expected to take the average time between departures, admitted
+or abandoned, since the queue was last empty.
 
 Rust callers use `DownloadLimits`; the default active-copy limit is 1,024. Downloader
 clones share limits.

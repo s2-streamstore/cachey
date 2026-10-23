@@ -17,7 +17,7 @@ use crate::object_store::stats::{Headers, LatencyModel, RequestTimeline};
 #[derive(Debug)]
 pub(super) struct BucketDeadline {
     page: Instant,
-    admitted: OnceLock<Instant>,
+    expires_at: OnceLock<Instant>,
     expiry_reported: AtomicBool,
 }
 
@@ -25,7 +25,7 @@ impl BucketDeadline {
     pub fn new(page: Instant) -> Self {
         Self {
             page,
-            admitted: OnceLock::new(),
+            expires_at: OnceLock::new(),
             expiry_reported: AtomicBool::new(false),
         }
     }
@@ -34,14 +34,15 @@ impl BucketDeadline {
         self.page
     }
 
-    pub fn admitted(&self) -> Option<Instant> {
-        self.admitted.get().copied()
+    /// Set once a copy is admitted.
+    pub fn expires_at(&self) -> Option<Instant> {
+        self.expires_at.get().copied()
     }
 
     /// First admission starts the bucket timeout, capped by the page deadline.
     pub fn admit(&self, now: Instant, bucket_timeout: Duration) -> Instant {
         *self
-            .admitted
+            .expires_at
             .get_or_init(|| now + bucket_timeout.min(self.page.saturating_duration_since(now)))
     }
 

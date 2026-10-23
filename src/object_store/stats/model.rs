@@ -77,6 +77,14 @@ impl SizeModel {
         self.micros(bytes).map(|(median, _)| duration(median))
     }
 
+    /// The median at `bytes`, or beyond the model's reach, at the largest retained size:
+    /// latency grows with size, so that bounds it from below.
+    pub fn median_bounded(&self, bytes: u64) -> Option<Duration> {
+        let estimate = self.0?;
+        self.median(bytes)
+            .or_else(|| self.median(estimate.largest_bytes))
+    }
+
     /// Uncapped p99.
     pub fn tail(&self, bytes: u64) -> Option<Duration> {
         self.micros(bytes).map(|(_, tail)| duration(tail))

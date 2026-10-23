@@ -308,7 +308,7 @@ impl BucketStats {
         self.estimates.record(now, sample);
     }
 
-    /// Routing latency at a size, or the penalty alone at a size the model cannot predict.
+    /// Routing latency from a median, or the penalty alone while unmeasured.
     fn routing_latency(&self, now: Instant, median: Option<Duration>) -> Duration {
         let penalty = self.routing_penalty(now);
         median.map_or(penalty, |median| {
@@ -538,7 +538,8 @@ pub struct BucketedStats {
 struct BucketSnapshot {
     stats: Arc<Mutex<BucketStats>>,
     model: LatencyModel,
-    /// Median latency of a request for the routed size.
+    /// Median latency of a request for the routed size, or a lower bound beyond the
+    /// model's reach.
     median: Option<Duration>,
     /// p99 of a request for the routed size.
     tail: Option<Duration>,
@@ -743,7 +744,7 @@ impl BucketedStats {
     ) -> RoutingSnapshot {
         let now = Instant::now();
         let states: Vec<_> = buckets.iter().map(|bucket| self.entry(bucket)).collect();
-        // Only the bucket longest without one may refit on the interval, so a read pays
+        // Only the bucket longest without one may refit on the interval, so a snapshot pays
         // for at most one such fit and every bucket gets its turn.
         let oldest = states
             .iter()
@@ -759,13 +760,13 @@ impl BucketedStats {
                     let mut stats = state.lock();
                     refit(&mut stats, now, Some(index) == oldest);
                     let model = stats.estimates.model();
-                    let median = model.request.median(requested_bytes);
+                    let median = model.request.median_bounded(requested_bytes);
                     let current = stats.routing_latency(now, median);
                     if index == 0 {
                         preferred_latency = current;
                     }
                     let mut latency = stats.stalled_latency(now, current);
-                    if index > 0 && median.is_none() {
+                    if index > 0 && model.request.median(requested_bytes).is_none() {
                         latency = latency.max(preferred_latency);
                     }
                     BucketSnapshot {
@@ -1146,8 +1147,25 @@ mod tests {
             stats.seed(&buckets[0], Sample::from_millis(5, 8 * MIB, 95));
         }
         assert_eq!(best_at(4096), Some(0));
+        advance(LATENCY_SNAPSHOT_INTERVAL).await;
         stats.model(&buckets[0]);
         assert_eq!(best_at(8 * MIB), Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn beyond_its_history_a_bucket_is_no_faster_than_at_its_largest_size() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for _ in 0..4 {
+            stats.seed(&buckets[0], Sample::from_millis(300, 4096, 0));
+            stats.seed(&buckets[1], Sample::from_millis(10, 8 * MIB, 50));
+        }
+        assert_eq!(
+            stats
+                .snapshot(&buckets, 8 * MIB)
+                .best(|_| true, Duration::from_secs(10)),
+            Some(1)
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -303,14 +303,16 @@ impl Followups<'_> {
     /// failure, within the bucket's shared deadline.
     fn has_time(&self, routing: &RoutingSnapshot, index: usize, now: Instant) -> bool {
         let request = self.request;
-        request.deadlines[index].admitted().is_none_or(|deadline| {
-            let expected = routing.model(index).timeout_allowance(
-                request.bytes,
-                request.body_bytes(),
-                request.unmeasured(),
-            );
-            deadline.saturating_duration_since(now) > expected
-        })
+        request.deadlines[index]
+            .expires_at()
+            .is_none_or(|deadline| {
+                let expected = routing.model(index).timeout_allowance(
+                    request.bytes,
+                    request.body_bytes(),
+                    request.unmeasured(),
+                );
+                deadline.saturating_duration_since(now) > expected
+            })
     }
 
     /// Prefer untried buckets. Retry a failed body only after other copies finish,
@@ -472,7 +474,12 @@ impl Downloader {
                     if is_primary {
                         hedge.disarm();
                     }
+                    // Every bucket's copies wait in the same admission queue.
+                    let admission = matches!(error, DownloadError::AdmissionTimeout);
                     followups.failed(index, error);
+                    if admission {
+                        continue;
+                    }
                     Trigger::Fallback
                 },
                 index = next_rescue(&mut rescues, start) => Trigger::Rescue(index),

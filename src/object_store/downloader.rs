@@ -228,7 +228,7 @@ impl BucketOperation<'_> {
             // copy queues, so no bucket deadline applies.
             let deadline = self.deadline.page();
             let allowance = self.timeout_allowance();
-            let latest_start = deadline.checked_sub(allowance).unwrap_or(deadline);
+            let latest_start = deadline.checked_sub(allowance).unwrap_or_else(Instant::now);
             self.downloader
                 .admission
                 .acquire(self.request.bytes(), latest_start, allowance)
@@ -2423,7 +2423,8 @@ mod tests {
     }
 
     /// Behind a standing queue, a read far from its deadline waits only as long as it is
-    /// expected to take, or long enough not to shed short reads.
+    /// expected to take, or long enough not to shed short reads. Another bucket's copy
+    /// would wait in the same queue, so it does not fall back.
     #[tokio::test(start_paused = true)]
     async fn a_read_behind_a_standing_queue_gives_up_long_before_a_distant_deadline() {
         for (latency, waited) in [(5, MIN_WAIT), (150, Duration::from_millis(150))] {
@@ -2434,14 +2435,17 @@ mod tests {
                     ..DownloadLimits::default()
                 })
                 .unwrap();
-            seed_latency(&downloader, "bucket", latency);
+            for bucket in ["bucket", "peer"] {
+                seed_latency(&downloader, bucket, latency);
+            }
             let _held = downloader.admission.try_acquire(4).unwrap();
             let far = tokio::time::Instant::now() + Duration::from_secs(60);
             let read = async {
                 sleep(Duration::from_millis(100)).await;
                 let start = tokio::time::Instant::now();
                 let result =
-                    fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+                    fetch_with_config(&downloader, &["bucket", "peer"], &RequestConfig::default())
+                        .await;
                 (result, start.elapsed())
             };
             let (result, elapsed) = tokio::select! {
