@@ -69,6 +69,10 @@ impl SizeModel {
         Some((median, median * estimate.tail_ratio))
     }
 
+    pub fn is_measured(&self) -> bool {
+        self.0.is_some()
+    }
+
     pub fn median(&self, bytes: u64) -> Option<Duration> {
         self.micros(bytes).map(|(median, _)| duration(median))
     }

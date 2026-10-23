@@ -27,7 +27,7 @@ use crate::{
 mod replicas;
 mod timeline;
 
-use timeline::{BucketDeadline, HedgeTimer, SharedDeadline};
+use timeline::{BucketDeadline, HedgeTimer};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DownloadError {
@@ -201,7 +201,7 @@ struct BucketOperation<'a> {
     /// The bucket's latency model when the copy was routed.
     model: LatencyModel,
     timeline: &'a RequestTimeline,
-    deadline: BucketDeadline<'a>,
+    deadline: &'a BucketDeadline,
     /// Time allowed for each unmeasured phase.
     unmeasured: Duration,
     probe: Option<ProbePermit>,
@@ -253,13 +253,14 @@ impl BucketOperation<'_> {
             self.timeout_allowance(),
         );
         let mut fetch = pin!(fetch());
+        let mut expiry = pin!(sleep_until(bucket_deadline));
         let mut expired = false;
         let mut announced = false;
         let result = loop {
             select! {
                 biased;
                 result = &mut fetch => break result,
-                () = sleep_until(bucket_deadline) => {
+                () = &mut expiry => {
                     expired = true;
                     break Err(DownloadError::Timeout {
                         bucket: self.request.bucket.clone(),
@@ -499,7 +500,7 @@ mod tests {
 
     use super::{
         BucketDeadline, BucketMetrics, DownloadError, DownloadLimits, DownloadOutput, Downloader,
-        RequestConfig, RequestTimeline, SharedDeadline, map_get_object_error,
+        RequestConfig, RequestTimeline, map_get_object_error,
     };
     use crate::{
         object_store::{
@@ -642,10 +643,19 @@ mod tests {
         buckets: &[&str],
         config: &RequestConfig,
     ) -> Result<DownloadOutput, DownloadError> {
+        fetch_range(downloader, buckets, 0..4, config).await
+    }
+
+    async fn fetch_range(
+        downloader: &Downloader,
+        buckets: &[&str],
+        range: Range<u64>,
+        config: &RequestConfig,
+    ) -> Result<DownloadOutput, DownloadError> {
         let buckets =
             BucketNameSet::new(buckets.iter().map(|name| BucketName::new(*name).unwrap())).unwrap();
         downloader
-            .download(&buckets, ObjectKey::new("object").unwrap(), &(0..4), config)
+            .download(&buckets, ObjectKey::new("object").unwrap(), &range, config)
             .await
     }
 
@@ -1081,16 +1091,7 @@ mod tests {
             }
         }
         let read = async |buckets: &[&str]| {
-            let buckets =
-                BucketNameSet::new(buckets.iter().map(|name| BucketName::new(*name).unwrap()))
-                    .unwrap();
-            downloader
-                .download(
-                    &buckets,
-                    ObjectKey::new("object").unwrap(),
-                    &(0..page),
-                    &RequestConfig::default(),
-                )
+            fetch_range(&downloader, buckets, 0..page, &RequestConfig::default())
                 .await
                 .unwrap()
         };
@@ -1149,9 +1150,8 @@ mod tests {
                 },
                 model: model(&downloader, "bucket"),
                 timeline: &timeline,
-                deadline: BucketDeadline::new(
+                deadline: &BucketDeadline::new(
                     tokio::time::Instant::now() + Duration::from_millis(budget_ms),
-                    &SharedDeadline::default(),
                 ),
                 unmeasured: Duration::from_millis(20),
                 probe: None,
@@ -2028,7 +2028,7 @@ mod tests {
             },
             model: model(&downloader, "local"),
             timeline: &RequestTimeline::default(),
-            deadline: BucketDeadline::new(tokio::time::Instant::now(), &SharedDeadline::default()),
+            deadline: &BucketDeadline::new(tokio::time::Instant::now()),
             unmeasured: Duration::from_millis(5),
             probe: None,
         }

@@ -13,23 +13,21 @@ use tokio::{
 
 use crate::object_store::stats::{Headers, LatencyModel, RequestTimeline};
 
-/// A page's state for the deadline its copies to one bucket share.
-#[derive(Debug, Default)]
-pub(super) struct SharedDeadline {
+/// A deadline shared by a page's copies to one bucket, starting at first admission.
+#[derive(Debug)]
+pub(super) struct BucketDeadline {
+    page: Instant,
     admitted: OnceLock<Instant>,
     expiry_reported: AtomicBool,
 }
 
-/// A deadline shared by a page's copies to one bucket, starting at first admission.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct BucketDeadline<'a> {
-    page: Instant,
-    shared: &'a SharedDeadline,
-}
-
-impl<'a> BucketDeadline<'a> {
-    pub fn new(page: Instant, shared: &'a SharedDeadline) -> Self {
-        Self { page, shared }
+impl BucketDeadline {
+    pub fn new(page: Instant) -> Self {
+        Self {
+            page,
+            admitted: OnceLock::new(),
+            expiry_reported: AtomicBool::new(false),
+        }
     }
 
     pub fn page(&self) -> Instant {
@@ -37,20 +35,19 @@ impl<'a> BucketDeadline<'a> {
     }
 
     pub fn admitted(&self) -> Option<Instant> {
-        self.shared.admitted.get().copied()
+        self.admitted.get().copied()
     }
 
     /// First admission starts the bucket timeout, capped by the page deadline.
     pub fn admit(&self, now: Instant, bucket_timeout: Duration) -> Instant {
         *self
-            .shared
             .admitted
             .get_or_init(|| now + bucket_timeout.min(self.page.saturating_duration_since(now)))
     }
 
     /// Whether this is the first report of the deadline's expiry.
     pub fn report_expiry(&self) -> bool {
-        !self.shared.expiry_reported.swap(true, Ordering::Relaxed)
+        !self.expiry_reported.swap(true, Ordering::Relaxed)
     }
 }
 

@@ -18,7 +18,7 @@ use tokio::{
 
 use super::{
     BucketDeadline, BucketOperation, DownloadError, DownloadOutput, Downloader, HedgeTimer,
-    ObjectPiece, PieceRequest, RequestConfig, RequestTimeline, SharedDeadline,
+    ObjectPiece, PieceRequest, RequestConfig, RequestTimeline,
 };
 use crate::{
     object_store::{
@@ -157,11 +157,11 @@ struct ReplicaRequest<'a> {
     buckets: &'a BucketNameSet,
     object: &'a ObjectKey,
     range: &'a Range<u64>,
+    bytes: u64,
     config: &'a RequestConfig,
     page_deadline: Instant,
     primary: usize,
-    /// Each bucket's deadline, from its first admission.
-    deadlines: Vec<SharedDeadline>,
+    deadlines: Vec<BucketDeadline>,
     primary_timeline: RequestTimeline,
     /// Response length announced to a finished copy.
     finished_body_bytes: OnceLock<u64>,
@@ -179,18 +179,10 @@ struct CopyAttempt {
 }
 
 impl ReplicaRequest<'_> {
-    fn bytes(&self) -> u64 {
-        self.range.end - self.range.start
-    }
-
     fn body_bytes(&self) -> Option<u64> {
         self.primary_timeline
             .announced_body_bytes()
             .or_else(|| self.finished_body_bytes.get().copied())
-    }
-
-    fn bucket_deadline(&self, index: usize) -> BucketDeadline<'_> {
-        BucketDeadline::new(self.page_deadline, &self.deadlines[index])
     }
 
     /// Allow each unmeasured phase half of a bucket's share of the page, within its timeout.
@@ -243,7 +235,7 @@ impl ReplicaRequest<'_> {
             request,
             model,
             timeline,
-            deadline: self.bucket_deadline(index),
+            deadline: &self.deadlines[index],
             unmeasured: self.unmeasured(),
             probe,
         }
@@ -311,17 +303,14 @@ impl Followups<'_> {
     /// failure, within the bucket's shared deadline.
     fn has_time(&self, routing: &RoutingSnapshot, index: usize, now: Instant) -> bool {
         let request = self.request;
-        request
-            .bucket_deadline(index)
-            .admitted()
-            .is_none_or(|deadline| {
-                let expected = routing.model(index).timeout_allowance(
-                    request.bytes(),
-                    request.body_bytes(),
-                    request.unmeasured(),
-                );
-                deadline.saturating_duration_since(now) > expected
-            })
+        request.deadlines[index].admitted().is_none_or(|deadline| {
+            let expected = routing.model(index).timeout_allowance(
+                request.bytes,
+                request.body_bytes(),
+                request.unmeasured(),
+            );
+            deadline.saturating_duration_since(now) > expected
+        })
     }
 
     /// Prefer untried buckets. Retry a failed body only after other copies finish,
@@ -341,7 +330,7 @@ impl Followups<'_> {
         let downloader = self.request.downloader;
         let routing = downloader
             .bucketed_stats
-            .snapshot(self.request.buckets, self.request.bytes());
+            .snapshot(self.request.buckets, self.request.bytes);
         let untried = |index: usize| !self.states.buckets[index].tried;
         let index = match trigger {
             Trigger::Rescue(index) => index,
@@ -380,7 +369,7 @@ impl Followups<'_> {
         // Hedges and retries never queue for admission, so a retry cannot spend a credit
         // and then run out of time before it starts.
         let admission = if early || retrying {
-            Some(downloader.admission.try_acquire(self.request.bytes())?)
+            Some(downloader.admission.try_acquire(self.request.bytes)?)
         } else {
             None
         };
@@ -437,11 +426,12 @@ impl Downloader {
             buckets,
             object,
             range,
+            bytes,
             config,
             page_deadline: deadline,
             primary,
             deadlines: (0..buckets.len())
-                .map(|_| SharedDeadline::default())
+                .map(|_| BucketDeadline::new(deadline))
                 .collect(),
             primary_timeline: RequestTimeline::default(),
             finished_body_bytes: OnceLock::new(),

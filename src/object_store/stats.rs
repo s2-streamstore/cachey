@@ -294,7 +294,7 @@ impl BucketStats {
         let ratio = model
             .median(sample.requested_bytes)
             .map(|median| sample.latency().as_secs_f64() / median.as_secs_f64());
-        if probe || model.estimate().is_none() {
+        if probe || !model.is_measured() {
             self.routing_factor = ratio.unwrap_or(1.0);
             self.routing_penalty = Duration::ZERO;
         } else {
@@ -355,7 +355,7 @@ impl BucketStats {
     fn raise_routing_penalty(&mut self, now: Instant, elapsed: Duration, requested_bytes: u64) {
         let model = self.estimates.request.model();
         let median = model.median(requested_bytes);
-        if median.is_none() && model.estimate().is_some() {
+        if median.is_none() && model.is_measured() {
             return;
         }
         let penalty = self.routing_penalty(now);
@@ -366,7 +366,7 @@ impl BucketStats {
 
     /// The penalty decays even while the bucket is idle, once it has a measured latency.
     fn routing_penalty(&self, now: Instant) -> Duration {
-        if self.estimates.request.model().estimate().is_none() {
+        if !self.estimates.request.model().is_measured() {
             return self.routing_penalty;
         }
         self.routing_penalty.mul_f64(decay(
@@ -409,10 +409,9 @@ impl BucketStats {
 }
 
 /// Refits once per interval if `interval` allows, or sooner while observation counts
-/// double, and reports whether it did. Fitting runs outside the lock so it does not
-/// delay the bucket's copies; claiming the refit under the lock leaves concurrent callers
-/// nothing to refit.
-fn refit(stats: &mut MutexGuard<'_, BucketStats>, now: Instant, interval: bool) -> bool {
+/// double. Fitting runs outside the lock so it does not delay the bucket's copies;
+/// claiming the refit under the lock leaves concurrent callers nothing to refit.
+fn refit(stats: &mut MutexGuard<'_, BucketStats>, now: Instant, interval: bool) {
     let due = interval && now.duration_since(stats.summarized_at) >= LATENCY_SNAPSHOT_INTERVAL;
     if due {
         stats.summarized_at = now;
@@ -422,7 +421,7 @@ fn refit(stats: &mut MutexGuard<'_, BucketStats>, now: Instant, interval: bool) 
         .histograms()
         .map(|histogram| histogram.refit(due));
     if refits.iter().all(Option::is_none) {
-        return false;
+        return;
     }
     let fits = MutexGuard::unlocked(stats, || refits.map(|refit| refit.map(Refit::fit)));
     for (histogram, fitted) in stats.estimates.histograms().into_iter().zip(fits) {
@@ -430,7 +429,6 @@ fn refit(stats: &mut MutexGuard<'_, BucketStats>, now: Instant, interval: bool) 
             histogram.store(fitted);
         }
     }
-    true
 }
 
 #[derive(Debug, Clone, Copy)]
