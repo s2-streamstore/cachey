@@ -8,18 +8,24 @@ eligible for fallback.
 
 Backend failures reduce preference; successful reads and recovery probes restore
 it. Missing objects, invalid ranges, cancellation, and admission failures do not
-affect health.
+affect health. A deprioritized bucket, or one without an outcome for 30 seconds, is
+probed if it might beat the current choice, and the first bucket regardless.
 
 Buckets are ranked by routing latency at the read's size: the request model's
-median, scaled by a moving average of successful reads relative to it, plus a
-penalty. The moving average follows a shift in latency sooner than the model does.
-Beyond the sizes its model can predict, a bucket is ranked by its median at the
-largest size it has seen, since latency grows with size. It never ranks ahead of the
-first bucket there, and its reads of that size leave the moving average alone.
-Canceled copies raise the penalty toward how far they outlasted their routing
-latency, unless their size cannot be predicted. The penalty decays with a 5-second
-half-life once the bucket has a median, and stays until then. A bucket's first
-measurement and recovery probes reset both.
+median, scaled by a moving average of successful reads relative to it and by an
+excess from canceled copies. The moving average follows a shift in latency sooner
+than the model does; when a refit moves the median, the average is rescaled so the
+shift is not counted twice. Beyond the sizes its model can predict, a bucket is
+ranked by its median at the largest size it has seen, since latency grows with size.
+It never ranks ahead of the first bucket there, and its reads of that size leave the
+moving average alone.
+
+Canceled copies raise the excess toward how far they outlasted their routing
+latency, as a fraction, so a slow large read slows small ones only in proportion.
+Copies of a size the model cannot predict are not judged. The excess decays with a
+5-second half-life. Before a bucket has a median, canceled copies raise its routing
+latency directly, which stays until a read succeeds. A bucket's first measurement
+and recovery probes reset the moving average, the excess, and that latency.
 
 Feasibility, rescue timing, and stall detection use the request model at each
 read's size. A copy is overdue after four times its timeout allowance, which is

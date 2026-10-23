@@ -92,10 +92,11 @@ impl DownloadAdmission {
             })
     }
 
-    /// Queues while a copy can still start by `latest_start`. Copies joining a queue that
-    /// is absorbing a burst wait for as long as that allows, since capacity will reach them;
-    /// in a standing queue, waiting longer than a copy is `expected` to take only delays it.
-    /// A copy that would not be admitted in time fails at once.
+    /// Free capacity admits a copy at once. Otherwise it queues while it can still start by
+    /// `latest_start`: copies joining a queue that is absorbing a burst wait for as long as
+    /// that allows, since capacity will reach them, while in a standing queue, waiting
+    /// longer than a copy is `expected` to take only delays it. A copy that would not be
+    /// admitted in time fails at once.
     pub async fn acquire(
         &self,
         bytes: u64,
