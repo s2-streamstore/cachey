@@ -192,13 +192,9 @@ struct PieceRequest<'a> {
     bucket: &'a BucketName,
     object: &'a ObjectKey,
     range: &'a Range<u64>,
+    /// Bytes the range is expected to return.
+    bytes: u64,
     config: &'a RequestConfig,
-}
-
-impl PieceRequest<'_> {
-    fn bytes(&self) -> u64 {
-        self.range.end - self.range.start
-    }
 }
 
 struct BucketOperation<'a> {
@@ -216,7 +212,7 @@ struct BucketOperation<'a> {
 impl BucketOperation<'_> {
     fn timeout_allowance(&self) -> Duration {
         self.model.timeout_allowance(
-            self.request.bytes(),
+            self.request.bytes,
             self.timeline.announced_body_bytes(),
             self.unmeasured,
         )
@@ -237,7 +233,7 @@ impl BucketOperation<'_> {
             let latest_start = deadline.checked_sub(allowance).unwrap_or_else(Instant::now);
             self.downloader
                 .admission
-                .acquire(self.request.bytes(), latest_start, allowance)
+                .acquire(self.request.bytes, latest_start, allowance)
                 .await?
         };
         let now = Instant::now();
@@ -255,7 +251,7 @@ impl BucketOperation<'_> {
             self.request.bucket,
             self.probe.take(),
             self.timeline,
-            self.request.bytes(),
+            self.request.bytes,
             self.timeout_allowance(),
         );
         let mut fetch = pin!(fetch());
@@ -336,25 +332,32 @@ impl Downloader {
         self.bucketed_stats.export_bucket_metrics(f);
     }
 
+    /// A known object size sets how much of the range the read is expected to return, by
+    /// which it is admitted and timed. The whole range is still requested, so a wrong size
+    /// never shortens the download, but a range starting at or past it fails at once.
     pub async fn download(
         &self,
         buckets: &BucketNameSet,
         object: ObjectKey,
         byterange: &Range<u64>,
+        object_size: Option<u64>,
         req_config: &RequestConfig,
     ) -> Result<DownloadOutput, DownloadError> {
-        if byterange.start >= byterange.end {
+        let end = byterange.end.min(object_size.unwrap_or(u64::MAX));
+        if byterange.start >= end {
             return Err(DownloadError::RangeNotSatisfied {
                 requested: byterange.clone(),
-                object_size: None,
+                object_size,
             });
         }
-        let start = Instant::now();
-        let deadline = start.checked_add(self.limits.page_timeout).ok_or_else(|| {
-            DownloadError::Unknown("Page timeout exceeds the clock's supported range".to_owned())
-        })?;
         let output = self
-            .download_replicas(buckets, &object, byterange, req_config, start, deadline)
+            .download_replicas(
+                buckets,
+                &object,
+                byterange,
+                end - byterange.start,
+                req_config,
+            )
             .await?;
         self.attempt_budget.observe_success();
         Ok(output)
@@ -370,10 +373,11 @@ impl Downloader {
             object,
             range,
             config,
+            ..
         } = request;
         #[cfg(test)]
         let _simulation_copy =
-            crate::object_store::simulation::record_copy(object, bucket, request.bytes());
+            crate::object_store::simulation::record_copy(object, bucket, request.bytes);
         let get_object = self
             .s3
             .get_object()
@@ -661,7 +665,13 @@ mod tests {
         let buckets =
             BucketNameSet::new(buckets.iter().map(|name| BucketName::new(*name).unwrap())).unwrap();
         downloader
-            .download(&buckets, ObjectKey::new("object").unwrap(), &range, config)
+            .download(
+                &buckets,
+                ObjectKey::new("object").unwrap(),
+                &range,
+                None,
+                config,
+            )
             .await
     }
 
@@ -811,6 +821,7 @@ mod tests {
                     &buckets,
                     ObjectKey::new("object").unwrap(),
                     &(32..64),
+                    None,
                     &RequestConfig::default(),
                 )
                 .await
@@ -850,12 +861,17 @@ mod tests {
     async fn invalid_request_ranges_do_not_reach_the_backend() {
         let (downloader, script) = scripted_downloader([]);
         let buckets = BucketNameSet::from(BucketName::new("bucket").unwrap());
-        for range in [Range { start: 10, end: 10 }, Range { start: 10, end: 1 }] {
+        for (range, object_size) in [
+            (Range { start: 10, end: 10 }, None),
+            (Range { start: 10, end: 1 }, None),
+            (10..20, Some(10)),
+        ] {
             let result = downloader
                 .download(
                     &buckets,
                     ObjectKey::new("object").unwrap(),
                     &range,
+                    object_size,
                     &RequestConfig::default(),
                 )
                 .await;
@@ -1061,6 +1077,34 @@ mod tests {
         assert_eq!(metrics(&downloader, "bucket").await.consecutive_failures, 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_known_object_size_admits_a_page_read_at_the_size_it_returns() {
+        let (downloader, _) = scripted_downloader([("local", 1, 0, false)]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                max_inflight_bytes: MIB,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        let buckets = BucketNameSet::from(BucketName::new("local").unwrap());
+        let read = async |object_size| {
+            downloader
+                .download(
+                    &buckets,
+                    ObjectKey::new("object").unwrap(),
+                    &(0..16 * MIB),
+                    object_size,
+                    &RequestConfig::default(),
+                )
+                .await
+        };
+        assert!(matches!(
+            read(None).await,
+            Err(DownloadError::AdmissionExhausted { .. })
+        ));
+        assert_eq!(read(Some(4)).await.unwrap().piece.data.len(), 4);
+    }
+
     /// Once headers announce a small object, a page read is overdue by the standard of
     /// small objects rather than of the large pages that dominate its request tail.
     #[tokio::test(start_paused = true)]
@@ -1152,6 +1196,7 @@ mod tests {
                     bucket: &bucket,
                     object: &object,
                     range: &(0..4),
+                    bytes: 4,
                     config: &RequestConfig::default(),
                 },
                 model: model(&downloader, "bucket"),
@@ -1674,6 +1719,7 @@ mod tests {
                         buckets,
                         ObjectKey::new(format!("object-{index}")).unwrap(),
                         &(0..4),
+                        None,
                         &RequestConfig::default(),
                     )
                     .await
@@ -2030,6 +2076,7 @@ mod tests {
                 bucket: &BucketName::new("local").unwrap(),
                 object: &ObjectKey::new("object").unwrap(),
                 range: &(0..4),
+                bytes: 4,
                 config: &RequestConfig::default(),
             },
             model: model(&downloader, "local"),

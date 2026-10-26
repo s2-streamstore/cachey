@@ -185,6 +185,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                             &singleton,
                             ObjectKey::new(format!("read-{id}")).unwrap(),
                             &range,
+                            None,
                             &RequestConfig::default(),
                         )
                         .await
@@ -212,7 +213,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     let config = RequestConfig::default();
                     let body_bytes = scenario.read_body_bytes(seed, id as u64);
                     let range = 0..scenario.read_request_bytes(seed, id as u64);
-                    let operation = downloader.download(buckets, object, &range, &config);
+                    let operation = downloader.download(buckets, object, &range, None, &config);
                     tokio::pin!(operation);
                     let result = if let Some(cancel_ms) = scenario.cancel_read_after_ms {
                         tokio::select! {

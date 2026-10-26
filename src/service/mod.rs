@@ -94,8 +94,8 @@ pub struct FetchRequest {
     pub object: ObjectKey,
     pub buckets: BucketNameSet,
     pub byterange: Range<u64>,
-    /// When known, downloads stop at the object's end, so its pages are read exactly, and
-    /// every page must report this size.
+    /// When known, pages are admitted and timed at the bytes the object holds, and every
+    /// page must report this size.
     pub object_size: Option<u64>,
     pub config: RequestConfig,
 }
@@ -287,24 +287,16 @@ impl PageGetExecutor {
                     );
 
                     let start = u64::from(page_id) * PAGE_SIZE;
-                    let page_end = start + PAGE_SIZE;
-                    let end = page_end.min(self.request.object_size.unwrap_or(u64::MAX));
-                    let download = async |end| {
-                        self.downloader
-                            .download(
-                                &self.request.buckets,
-                                self.request.object.clone(),
-                                &(start..end),
-                                &self.request.config,
-                            )
-                            .await
-                    };
-                    let mut out = download(end).await?;
-                    // Readers share the page, so a size that cut it short does not shorten it.
-                    let object_end = page_end.min(out.piece.object_size);
-                    if object_end > end {
-                        out = download(object_end).await?;
-                    }
+                    let out = self
+                        .downloader
+                        .download(
+                            &self.request.buckets,
+                            self.request.object.clone(),
+                            &(start..start + PAGE_SIZE),
+                            self.request.object_size,
+                            &self.request.config,
+                        )
+                        .await?;
                     metrics::page_download_latency(&self.request.kind, out.latency);
                     if out.hedged {
                         metrics::page_request_count(
@@ -369,7 +361,7 @@ mod tests {
         num::NonZeroUsize,
         sync::{
             Arc,
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -395,13 +387,12 @@ mod tests {
         types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
     };
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct MockS3State {
         expected_bucket: String,
         expected_key: String,
         object: Bytes,
-        request_count: AtomicUsize,
-        requested_bytes: AtomicU64,
+        request_count: Arc<AtomicUsize>,
         response_delay: Duration,
     }
 
@@ -420,14 +411,10 @@ mod tests {
             .split_once('-')
             .unwrap();
         let start = start.parse::<usize>().unwrap();
-        let requested_end = end.parse::<usize>().unwrap() + 1;
-        let end = requested_end.min(state.object.len());
+        let end = (end.parse::<usize>().unwrap() + 1).min(state.object.len());
         assert!(start < end);
 
         state.request_count.fetch_add(1, Ordering::Relaxed);
-        state
-            .requested_bytes
-            .fetch_add((requested_end - start) as u64, Ordering::Relaxed);
         tokio::time::sleep(state.response_delay).await;
         (
             StatusCode::PARTIAL_CONTENT,
@@ -444,18 +431,18 @@ mod tests {
         key: &ObjectKey,
         object: Bytes,
         response_delay: Duration,
-    ) -> (String, Arc<MockS3State>, tokio::task::JoinHandle<()>) {
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let request_count = Arc::new(AtomicUsize::new(0));
         let state = Arc::new(MockS3State {
             expected_bucket: bucket.to_string(),
             expected_key: key.to_string(),
             object,
-            request_count: AtomicUsize::new(0),
-            requested_bytes: AtomicU64::new(0),
+            request_count: Arc::clone(&request_count),
             response_delay,
         });
         let app = Router::new()
             .route("/{bucket}/{*key}", get(mock_get_object))
-            .with_state(Arc::clone(&state));
+            .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock server");
@@ -463,7 +450,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve mock s3");
         });
-        (endpoint, state, handle)
+        (endpoint, request_count, handle)
     }
 
     async fn service(endpoint: &str, memory_size: ByteSize) -> CacheyService {
@@ -623,15 +610,15 @@ mod tests {
         server_handle.abort();
     }
 
-    /// A known object size keeps page downloads within the object, and a size its bucket
-    /// disagrees with fails the read but not the whole page cached for other readers.
+    /// A size its bucket disagrees with fails the read without shortening the cached page,
+    /// and a range past a known size fails without a download.
     #[tokio::test]
-    async fn object_size_bounds_downloads_and_must_match_the_bucket() {
+    async fn object_size_must_match_the_bucket_but_never_shortens_a_page() {
         let kind = ObjectKind::new("object-size").unwrap();
         let object = ObjectKey::new("object").unwrap();
         let bucket = BucketName::new("bucket").unwrap();
         let data = Bytes::from(vec![7; 4096]);
-        let (endpoint, mock, server_handle) =
+        let (endpoint, request_count, server_handle) =
             spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
         let service = service(&endpoint, ByteSize::mib(16)).await;
         let read = |range, object_size| {
@@ -650,13 +637,6 @@ mod tests {
                 )
                 .try_collect::<Vec<_>>()
         };
-        let downloads = || {
-            (
-                mock.request_count.load(Ordering::Relaxed),
-                mock.requested_bytes.load(Ordering::Relaxed),
-            )
-        };
-
         assert!(matches!(
             read(100..200, 1024).await,
             Err(ServiceError::ObjectSizeInconsistency {
@@ -664,10 +644,8 @@ mod tests {
                 new: 4096
             })
         ));
-        assert_eq!(downloads(), (2, 1024 + 4096));
         let chunks = read(100..200, 4096).await.unwrap();
         assert_eq!(chunks[0].data, data.slice(100..200));
-        assert_eq!(downloads(), (2, 1024 + 4096));
         assert!(matches!(
             read(100..200, 8192).await,
             Err(ServiceError::ObjectSizeInconsistency {
@@ -682,7 +660,7 @@ mod tests {
                 ..
             }))
         ));
-        assert_eq!(downloads(), (2, 1024 + 4096));
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
         server_handle.abort();
     }
 
@@ -698,7 +676,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let (endpoint, mock, server_handle) = spawn_mock_s3_server(
+        let (endpoint, request_count, server_handle) = spawn_mock_s3_server(
             &bucket,
             &object,
             object_data.clone(),
@@ -726,7 +704,7 @@ mod tests {
         let ranges = [10..100, 50..200];
         let (left, right) = tokio::join!(read(ranges[0].clone()), read(ranges[1].clone()));
 
-        assert_eq!(mock.request_count.load(Ordering::Relaxed), 1);
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
         for (range, chunks) in ranges.into_iter().zip([left, right]) {
             let chunks = chunks.expect("read");
             assert_eq!(chunks.len(), 1);

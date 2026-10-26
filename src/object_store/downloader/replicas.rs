@@ -157,6 +157,7 @@ struct ReplicaRequest<'a> {
     buckets: &'a BucketNameSet,
     object: &'a ObjectKey,
     range: &'a Range<u64>,
+    bytes: u64,
     config: &'a RequestConfig,
     page_deadline: Instant,
     primary: usize,
@@ -178,10 +179,6 @@ struct CopyAttempt {
 }
 
 impl ReplicaRequest<'_> {
-    fn bytes(&self) -> u64 {
-        self.range.end - self.range.start
-    }
-
     fn body_bytes(&self) -> Option<u64> {
         self.primary_timeline
             .announced_body_bytes()
@@ -231,6 +228,7 @@ impl ReplicaRequest<'_> {
             bucket: &self.buckets[index],
             object: self.object,
             range: self.range,
+            bytes: self.bytes,
             config: hedge_config.as_ref().unwrap_or(self.config),
         };
         let result = BucketOperation {
@@ -310,7 +308,7 @@ impl Followups<'_> {
             .expires_at()
             .is_none_or(|deadline| {
                 let expected = routing.model(index).timeout_allowance(
-                    request.bytes(),
+                    request.bytes,
                     request.body_bytes(),
                     request.unmeasured(),
                 );
@@ -340,7 +338,7 @@ impl Followups<'_> {
         let early = matches!(trigger, Trigger::Hedge);
         let routing = downloader
             .bucketed_stats
-            .snapshot(self.request.buckets, self.request.bytes());
+            .snapshot(self.request.buckets, self.request.bytes);
         let untried = |index: usize| !self.states.buckets[index].tried;
         let index = match trigger {
             Trigger::Rescue(index) => index,
@@ -379,7 +377,7 @@ impl Followups<'_> {
         // Hedges and retries never queue for admission, so a retry cannot spend a credit
         // and then run out of time before it starts.
         let admission = if early || retrying {
-            Some(downloader.admission.try_acquire(self.request.bytes())?)
+            Some(downloader.admission.try_acquire(self.request.bytes)?)
         } else {
             None
         };
@@ -418,11 +416,13 @@ impl Downloader {
         buckets: &BucketNameSet,
         object: &ObjectKey,
         range: &Range<u64>,
+        bytes: u64,
         config: &RequestConfig,
-        start: Instant,
-        deadline: Instant,
     ) -> Result<DownloadOutput, DownloadError> {
-        let bytes = range.end - range.start;
+        let start = Instant::now();
+        let deadline = start.checked_add(self.limits.page_timeout).ok_or_else(|| {
+            DownloadError::Unknown("Page timeout exceeds the clock's supported range".to_owned())
+        })?;
         let routing = self.bucketed_stats.snapshot(buckets, bytes);
         let (primary_copy, backup_admission) = self.prepare_primary(
             bytes,
@@ -438,6 +438,7 @@ impl Downloader {
             buckets,
             object,
             range,
+            bytes,
             config,
             page_deadline: deadline,
             primary,

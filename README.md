@@ -38,9 +38,9 @@ HEAD|GET /fetch/{kind}/{object}
 - If omitted, `kind` is used as the singular bucket name
 
 `C0-Object-Size` behavior:
-- Downloads stop at the object's end, so a page of a small object is read, admitted, and timed at its own size
+- A page of a small object is admitted and timed at its own size, though the whole page is still requested
 - A range starting at or past the size returns 416 without contacting a bucket
-- A bucket reporting a different size returns 409, or 416 for a range past the object's actual end; the page is still read whole and cached for other readers
+- A bucket reporting a different size returns 409, or 416 for a range past the object's actual end; other readers of the page are unaffected
 
 See [replica reads](docs/replica-reads.md) for selection, fallback, hedging, and download limits.
 

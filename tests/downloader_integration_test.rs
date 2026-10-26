@@ -31,7 +31,13 @@ async fn downloads_ranges_and_reports_object_boundaries() {
         upload_test_object(&ctx.client, &ctx.bucket_name, &key, data.clone()).await;
         for range in [0..size, 10..20, size - 1..size, 0..PAGE_SIZE] {
             let output = downloader
-                .download(&buckets, key.clone(), &range, &RequestConfig::default())
+                .download(
+                    &buckets,
+                    key.clone(),
+                    &range,
+                    None,
+                    &RequestConfig::default(),
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -44,7 +50,7 @@ async fn downloads_ranges_and_reports_object_boundaries() {
         }
         let range = size..size + 1;
         let error = downloader
-            .download(&buckets, key, &range, &RequestConfig::default())
+            .download(&buckets, key, &range, None, &RequestConfig::default())
             .await
             .unwrap_err();
         assert!(
@@ -76,6 +82,7 @@ async fn missing_primary_falls_back_without_poisoning_health() {
                 &primary_only,
                 key.clone(),
                 &range,
+                None,
                 &RequestConfig::default(),
             )
             .await;
@@ -95,7 +102,7 @@ async fn missing_primary_falls_back_without_poisoning_health() {
     let buckets =
         BucketNameSet::new([primary, BucketName::new(peer).unwrap()].into_iter()).unwrap();
     let output = downloader
-        .download(&buckets, key, &range, &RequestConfig::default())
+        .download(&buckets, key, &range, None, &RequestConfig::default())
         .await
         .unwrap();
     assert_eq!(output.primary_bucket_idx, 0);
@@ -139,6 +146,7 @@ async fn unsatisfied_ranges_fall_back_to_other_replicas() {
                 &buckets,
                 key.clone(),
                 &(primary_size as u64..PAGE_SIZE),
+                None,
                 &RequestConfig::default(),
             )
             .await
@@ -150,7 +158,7 @@ async fn unsatisfied_ranges_fall_back_to_other_replicas() {
 
         let range = data.len() as u64..PAGE_SIZE;
         let error = downloader
-            .download(&buckets, key, &range, &RequestConfig::default())
+            .download(&buckets, key, &range, None, &RequestConfig::default())
             .await
             .unwrap_err();
         assert!(

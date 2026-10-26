@@ -45,9 +45,9 @@ Each bucket has three models:
 
 Requested bytes are known before headers arrive. Capacitor reads the range before
 sending headers, so its time to first byte grows with size. Page reads request a
-whole page unless the client passes `C0-Object-Size`, in which case they stop at the
-object's end and request exactly what they receive. Without it, their models
-describe whatever response sizes pages return.
+whole page. When the client passes `C0-Object-Size`, they count as requesting only
+what the object holds, which is what they receive, for admission and the models.
+Without it, their models describe whatever response sizes pages return.
 
 Each model fits one line to the median:
 
