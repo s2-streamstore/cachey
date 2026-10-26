@@ -1784,6 +1784,10 @@ mod tests {
         let read = |size, jitter_percent| success(size, jitter_percent, false);
         let probe = |size, jitter_percent| success(size, jitter_percent, true);
         let shift = |percent| (20, Event::Shift { percent });
+        let cancel = |size, elapsed_percent| {
+            let finish = Finish::Cancel { elapsed_percent };
+            (20, Event::Copy { size, finish })
+        };
         for (fixed_ms, ms_per_mib, events) in [
             // A slope fit to noise extrapolated 16 MiB reads far beyond the largest size.
             (
@@ -1828,6 +1832,27 @@ mod tests {
                     read(3, 114),
                     probe(0, 98),
                     read(2, 80),
+                ],
+            ),
+            // Reads at two speeds fit no line, and the plain fit dropped the fixed cost.
+            (
+                20.48,
+                19.53,
+                vec![
+                    read(0, 80),
+                    cancel(0, 84),
+                    cancel(1, 538),
+                    read(3, 110),
+                    cancel(1, 146),
+                    read(0, 80),
+                    shift(50),
+                    read(2, 80),
+                    cancel(2, 792),
+                    read(2, 80),
+                    read(2, 80),
+                    read(2, 80),
+                    read(0, 80),
+                    read(0, 80),
                 ],
             ),
         ] {

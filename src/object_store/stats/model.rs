@@ -188,11 +188,43 @@ impl Fit {
     }
 }
 
+/// The least-absolute-deviations trend, with its fixed cost refit to residuals relative to
+/// the trend's prediction at each size, then its cost per byte refit to absolute deviations
+/// at that fixed cost. Where no line fits every size, absolute deviations at small sizes stay
+/// small even when they are many times the latency, so the trend can drop the fixed cost
+/// entirely. Relative residuals let small sizes set it, while large sizes still decide the
+/// cost per byte.
+fn median_line(
+    observations: &[Observation],
+    largest_bytes: u64,
+    proportional: bool,
+    values: &mut Vec<(f64, f64)>,
+) -> Line {
+    let trend = least_absolute_deviations(observations, largest_bytes, proportional, values);
+    values.clear();
+    values.extend(observations.iter().map(|sample| {
+        (
+            sample.micros - trend.per_byte * sample.bytes as f64,
+            sample.weight / trend.micros(sample.bytes),
+        )
+    }));
+    let fixed = quantile(values, 0.5).max(0.0);
+    values.clear();
+    values.extend(observations.iter().map(|sample| {
+        let bytes = sample.bytes as f64;
+        ((sample.micros - fixed) / bytes, sample.weight * bytes)
+    }));
+    Line {
+        fixed,
+        per_byte: quantile(values, 0.5).max(0.0),
+    }
+}
+
 /// Least absolute deviations with nonnegative coefficients. For each slope the optimal
 /// intercept is a weighted median of residuals, and the loss is convex in the slope.
 /// Nonnegative fixed cost bounds the slope by the zero-intercept fit.
 /// Supporting lines bracket the minimum; each step discards at least a quarter of the bracket.
-fn median_line(
+fn least_absolute_deviations(
     observations: &[Observation],
     largest_bytes: u64,
     proportional: bool,
@@ -481,8 +513,8 @@ mod tests {
     use tokio::time::{Instant, advance};
 
     use super::{
-        Line, Median, Observation, SizeHistogram, TIMER_MICROS, TIMER_RESOLUTION, median_line,
-        quantile,
+        Line, Median, Observation, SizeHistogram, TIMER_MICROS, TIMER_RESOLUTION,
+        least_absolute_deviations, median_line, quantile,
     };
 
     fn body() -> SizeHistogram {
@@ -695,6 +727,25 @@ mod tests {
         ));
     }
 
+    /// Reads from two speeds fit no line. Small reads keep their fixed cost rather than
+    /// trading it for the large read's absolute deviation.
+    #[tokio::test(start_paused = true)]
+    async fn sizes_no_line_fits_keep_the_fixed_cost_of_small_reads() {
+        let mut histogram = SizeHistogram::new(false);
+        for (bytes, millis, count) in [(4096, 16, 3), (MIB, 16, 4), (16 * MIB, 366, 1)] {
+            for _ in 0..count {
+                update(&mut histogram, bytes, millis);
+            }
+        }
+        let model = histogram.summary(true);
+        assert!(
+            model.median(4096).unwrap().value() >= Duration::from_millis(8),
+            "{:?}",
+            model.median(4096)
+        );
+        assert!(model.median(16 * MIB).unwrap().value() >= Duration::from_millis(300));
+    }
+
     #[test]
     fn quantiles_take_the_nearest_rank_including_the_selected_weight() {
         let mut values = [5, 1, 3, 3, 3, 9, 7, 7, 2, 8].map(|value| (f64::from(value), 1.0));
@@ -721,6 +772,28 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn median_lines_recover_lines_that_fit_every_sample(
+            fixed in 1_000.0_f64..100_000.0,
+            per_byte in 0.0_f64..0.05,
+            samples in collection::vec((1_u64..=16 * MIB, 1_u8..=20), 2..12),
+            proportional: bool,
+        ) {
+            let observations: Vec<_> = samples.iter().map(|&(bytes, weight)| Observation {
+                bytes,
+                micros: fixed + per_byte * bytes as f64,
+                weight: f64::from(weight),
+            }).collect();
+            let largest_bytes = observations.iter().map(|sample| sample.bytes).max().unwrap();
+            let fitted = median_line(&observations, largest_bytes, proportional, &mut Vec::new());
+            for sample in &observations {
+                prop_assert!(
+                    (fitted.micros(sample.bytes) - sample.micros).abs() <= 1.0,
+                    "{fitted:?} at {} bytes: {}", sample.bytes, sample.micros
+                );
+            }
+        }
+
         #[test]
         fn median_lines_match_exhaustive_least_absolute_deviations(
             samples in collection::vec((1_u64..=16 * MIB, 0_u32..=1_000_000, 1_u8..=20, 0_u8..=10), 2..12),
@@ -756,7 +829,7 @@ mod tests {
             let optimal = candidates.iter().copied().map(loss).fold(f64::INFINITY, f64::min);
             let tolerance: f64 = observations.iter().map(|sample| sample.weight).sum();
             let largest_bytes = observations.iter().map(|sample| sample.bytes).max().unwrap();
-            let fitted = median_line(&observations, largest_bytes, proportional, &mut Vec::new());
+            let fitted = least_absolute_deviations(&observations, largest_bytes, proportional, &mut Vec::new());
             prop_assert!(fitted.fixed.is_finite() && fitted.fixed >= 0.0);
             prop_assert!(fitted.per_byte.is_finite() && fitted.per_byte >= 0.0);
             prop_assert!(loss(fitted) <= optimal + tolerance, "{fitted:?}, loss={}, optimal={optimal}", loss(fitted));

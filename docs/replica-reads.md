@@ -58,7 +58,13 @@ Each model fits one line to the median:
 median = fixed cost + bytes × cost per byte
 ```
 
-Both coefficients are nonnegative. Predictions have a 1 ms floor. A single tail
+Both coefficients are nonnegative. A line minimizing absolute deviations sets the
+trend; the fixed cost is then refit to residuals relative to the trend's prediction at
+each size, and the cost per byte to absolute deviations at that fixed cost. Absolute
+deviations at small sizes stay small even when they are many times the latency, so
+where no line fits every size, as during a change in speed, the trend can drop the
+fixed cost. Relative residuals let small sizes set it, while large sizes still decide
+the cost per byte. Predictions have a 1 ms floor. A single tail
 ratio scales the median to p99 for every size, so p99 needs as much data as one
 quantile rather than a second line. Observations weigh into the ratio by their
 predicted median, so constant stalls on small reads do not scale large ones. Sizes
