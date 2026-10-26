@@ -26,7 +26,10 @@ latency, as a fraction, so a slow large read slows small ones only in proportion
 Copies of a size the model has not observed are not judged. The excess decays with a
 5-second half-life. Before a bucket has a median, canceled copies raise its routing
 latency directly, which stays until a read succeeds. A bucket's first measurement
-and recovery probes reset the moving average, the excess, and that latency.
+resets the moving average, the excess, and that latency. A recovery probe clears the
+excess and that latency, and lowers the moving average at once when it is faster, but
+raises it only as any read does, since a bucket that looks slow gets no reads to
+correct it.
 
 Feasibility, rescue timing, and stall detection use the request model at each
 read's size. A copy is overdue after four times its timeout allowance, which is

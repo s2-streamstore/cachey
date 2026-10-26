@@ -297,7 +297,10 @@ impl BucketStats {
     }
 
     /// Successes at sizes the request model has observed move the routing factor, and every
-    /// success eases the excess. The first measurement and recovery probes replace both.
+    /// success eases the excess. The first measurement replaces both. A recovery probe
+    /// clears the excess and lowers the factor at once, restoring the bucket's preference,
+    /// but raises it only as any read does: one sample at a poorly fit size would otherwise
+    /// make every size look slow, and a bucket that looks slow gets no reads to correct it.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
         let median = self
             .estimates
@@ -311,15 +314,17 @@ impl BucketStats {
             }
             _ => None,
         };
-        if probe || median.is_none() {
+        let restores = probe && ratio.unwrap_or(1.0) < self.routing_factor;
+        if median.is_none() || restores {
             self.routing_factor = ratio.unwrap_or(1.0);
+        } else if let Some(ratio) = ratio {
+            self.routing_factor =
+                self.routing_factor * (1.0 - LATENCY_ALPHA) + ratio * LATENCY_ALPHA;
+        }
+        if probe || median.is_none() {
             self.routing_excess = 0.0;
             self.unmeasured_latency = Duration::ZERO;
         } else {
-            if let Some(ratio) = ratio {
-                self.routing_factor =
-                    self.routing_factor * (1.0 - LATENCY_ALPHA) + ratio * LATENCY_ALPHA;
-            }
             self.routing_excess = self.routing_excess(now) * (1.0 - LATENCY_ALPHA);
         }
         self.routing_updated_at = now;
@@ -1762,6 +1767,76 @@ mod tests {
                 .build()
                 .unwrap()
                 .block_on(follow_latency(backend, events))?;
+        }
+    }
+
+    /// Histories the property test found, each of which routed a size 8-50x from what it
+    /// had observed.
+    #[tokio::test(start_paused = true)]
+    async fn routing_latency_follows_observed_latency_in_found_histories() {
+        let success = |size, jitter_percent, probe| {
+            let finish = Finish::Success {
+                jitter_percent,
+                probe,
+            };
+            (20, Event::Copy { size, finish })
+        };
+        let read = |size, jitter_percent| success(size, jitter_percent, false);
+        let probe = |size, jitter_percent| success(size, jitter_percent, true);
+        let shift = |percent| (20, Event::Shift { percent });
+        for (fixed_ms, ms_per_mib, events) in [
+            // A slope fit to noise extrapolated 16 MiB reads far beyond the largest size.
+            (
+                28.3,
+                0.0,
+                vec![
+                    read(0, 80),
+                    read(0, 80),
+                    shift(122),
+                    read(0, 80),
+                    read(1, 80),
+                    probe(3, 80),
+                    read(0, 80),
+                ],
+            ),
+            // A line fit to one size predicted smaller ones.
+            (
+                3.0,
+                5.35,
+                vec![
+                    read(3, 80),
+                    read(3, 80),
+                    read(3, 80),
+                    read(3, 80),
+                    probe(0, 80),
+                    read(3, 80),
+                ],
+            ),
+            // A probe at a poorly fit size set the factor for every size.
+            (
+                6.17,
+                19.89,
+                vec![
+                    read(2, 80),
+                    read(2, 80),
+                    read(0, 80),
+                    read(2, 80),
+                    read(2, 80),
+                    shift(109),
+                    read(0, 80),
+                    read(0, 80),
+                    read(3, 114),
+                    probe(0, 98),
+                    read(2, 80),
+                ],
+            ),
+        ] {
+            let backend = Backend {
+                fixed_ms,
+                ms_per_mib,
+                speed: 1.0,
+            };
+            follow_latency(backend, events).await.unwrap();
         }
     }
 }
