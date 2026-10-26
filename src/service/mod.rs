@@ -87,6 +87,19 @@ pub enum ServiceError {
     ObjectSizeInconsistency { prev: u64, new: u64 },
 }
 
+/// A read of a byte range of one object.
+#[derive(Debug, Clone)]
+pub struct FetchRequest {
+    pub kind: ObjectKind,
+    pub object: ObjectKey,
+    pub buckets: BucketNameSet,
+    pub byterange: Range<u64>,
+    /// When known, downloads stop at the object's end, so its pages are read exactly, and
+    /// every page must report this size.
+    pub object_size: Option<u64>,
+    pub config: RequestConfig,
+}
+
 #[derive(Clone)]
 pub struct CacheyService {
     cache: foyer::HybridCache<CacheKey, CacheValue>,
@@ -153,48 +166,41 @@ impl CacheyService {
         self.egress_throughput.lock().bps(lookback)
     }
 
-    /// A known `object_size` keeps downloads within the object, so its pages are read
-    /// exactly, and every page must report that size. A range starting at or past it fails
-    /// without a download.
+    /// Fetches up to `concurrency` pages at a time. A range starting at or past a known
+    /// object size fails without a download.
     ///
     /// # Panics
     ///
     /// If `byterange.start >= byterange.end` or `byterange.end > MAX_RANGE_END`.
-    #[allow(clippy::too_many_arguments)]
     pub fn get(
         self,
-        kind: ObjectKind,
-        object: ObjectKey,
-        buckets: BucketNameSet,
-        byterange: Range<u64>,
-        object_size: Option<u64>,
+        request: FetchRequest,
         concurrency: NonZeroUsize,
-        req_config: RequestConfig,
     ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
+        let byterange = request.byterange.clone();
         assert!(byterange.start < byterange.end);
         assert!(byterange.end <= MAX_RANGE_END);
 
-        let end = byterange.end.min(object_size.unwrap_or(u64::MAX));
+        let end = byterange.end.min(request.object_size.unwrap_or(u64::MAX));
         let pages = (byterange.start < end).then(|| pagerange(&(byterange.start..end)));
         let past_end = pages.is_none().then(|| {
             Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
                 requested: byterange.clone(),
-                object_size,
+                object_size: request.object_size,
             }))
         });
 
-        metrics::fetch_request_bytes(&kind, byterange.end - byterange.start);
-        metrics::fetch_request_pages(&kind, pages.as_ref().map_or(0, ExactSizeIterator::len));
+        metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
+        metrics::fetch_request_pages(
+            &request.kind,
+            pages.as_ref().map_or(0, ExactSizeIterator::len),
+        );
 
+        let mut expected_size = request.object_size;
         let executor = Arc::new(PageGetExecutor {
             downloader: self.downloader,
-            kind,
-            object,
-            buckets,
-            object_size,
-            req_config,
+            request,
         });
-        let mut expected_size = object_size;
 
         futures::stream::iter(past_end).chain(
             futures::stream::iter(pages.into_iter().flatten())
@@ -253,11 +259,7 @@ fn now() -> u32 {
 #[derive(Debug)]
 struct PageGetExecutor {
     downloader: Downloader,
-    kind: ObjectKind,
-    object: ObjectKey,
-    buckets: BucketNameSet,
-    object_size: Option<u64>,
-    req_config: RequestConfig,
+    request: FetchRequest,
 }
 
 impl PageGetExecutor {
@@ -266,11 +268,11 @@ impl PageGetExecutor {
         page_id: PageId,
         cache: foyer::HybridCache<CacheKey, CacheValue>,
     ) -> Result<(PageId, CacheValue), ServiceError> {
-        metrics::page_request_count(&self.kind, metrics::PageRequestType::Access);
+        metrics::page_request_count(&self.request.kind, metrics::PageRequestType::Access);
 
         let cache_key = CacheKey {
-            kind: self.kind.clone(),
-            object: self.object.clone(),
+            kind: self.request.kind.clone(),
+            object: self.request.object.clone(),
             page_id,
         };
         let fetched_by_current_request = Arc::new(AtomicBool::new(false));
@@ -279,21 +281,24 @@ impl PageGetExecutor {
                 let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
                 move || async move {
                     fetched_by_current_request.store(true, Ordering::Relaxed);
-                    metrics::page_request_count(&self.kind, metrics::PageRequestType::Download);
+                    metrics::page_request_count(
+                        &self.request.kind,
+                        metrics::PageRequestType::Download,
+                    );
 
                     let start = u64::from(page_id) * PAGE_SIZE;
-                    let end = (start + PAGE_SIZE).min(self.object_size.unwrap_or(u64::MAX));
+                    let end = (start + PAGE_SIZE).min(self.request.object_size.unwrap_or(u64::MAX));
                     let out = self
                         .downloader
                         .download(
-                            &self.buckets,
-                            self.object.clone(),
+                            &self.request.buckets,
+                            self.request.object.clone(),
                             &(start..end),
-                            &self.req_config,
+                            &self.request.config,
                         )
                         .await?;
                     // A page cut short by a wrong size must not be cached.
-                    if let Some(size) = self.object_size
+                    if let Some(size) = self.request.object_size
                         && out.piece.object_size != size
                     {
                         return Err(ServiceError::ObjectSizeInconsistency {
@@ -301,21 +306,27 @@ impl PageGetExecutor {
                             new: out.piece.object_size,
                         });
                     }
-                    metrics::page_download_latency(&self.kind, out.latency);
+                    metrics::page_download_latency(&self.request.kind, out.latency);
                     if out.hedged {
-                        metrics::page_request_count(&self.kind, metrics::PageRequestType::Hedged);
+                        metrics::page_request_count(
+                            &self.request.kind,
+                            metrics::PageRequestType::Hedged,
+                        );
                     }
                     if out.primary_bucket_idx == 0 {
                         metrics::page_request_count(
-                            &self.kind,
+                            &self.request.kind,
                             metrics::PageRequestType::ClientPref,
                         );
                     }
                     if out.used_bucket_idx != out.primary_bucket_idx {
-                        metrics::page_request_count(&self.kind, metrics::PageRequestType::Fallback);
+                        metrics::page_request_count(
+                            &self.request.kind,
+                            metrics::PageRequestType::Fallback,
+                        );
                     }
                     Ok::<_, ServiceError>(CacheValue {
-                        bucket: self.buckets[out.used_bucket_idx].clone(),
+                        bucket: self.request.buckets[out.used_bucket_idx].clone(),
                         mtime: out.piece.mtime,
                         data: out.piece.data,
                         object_size: out.piece.object_size,
@@ -376,7 +387,9 @@ mod tests {
     use bytesize::ByteSize;
     use futures::TryStreamExt;
 
-    use super::{CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange};
+    use super::{
+        CacheyService, FetchRequest, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange,
+    };
     use crate::{
         cache::{CacheConfig, CacheKey, CacheValue},
         object_store::{DownloadError, DownloadLimits, RequestConfig},
@@ -531,13 +544,15 @@ mod tests {
         let service = service("http://unused.invalid", ByteSize::mib(16)).await;
 
         drop(service.get(
-            ObjectKind::new("full-address-space").unwrap(),
-            ObjectKey::new("object").unwrap(),
-            BucketName::new("bucket").unwrap().into(),
-            0..1 << 40,
-            None,
+            FetchRequest {
+                kind: ObjectKind::new("full-address-space").unwrap(),
+                object: ObjectKey::new("object").unwrap(),
+                buckets: BucketName::new("bucket").unwrap().into(),
+                byterange: 0..1 << 40,
+                object_size: None,
+                config: RequestConfig::default(),
+            },
             NonZeroUsize::MIN,
-            RequestConfig::default(),
         ));
         let snapshot = metrics::gather();
         assert!(
@@ -573,13 +588,15 @@ mod tests {
         );
         let read = |range| {
             service.clone().get(
-                kind.clone(),
-                object.clone(),
-                buckets.clone(),
-                range,
-                None,
+                FetchRequest {
+                    kind: kind.clone(),
+                    object: object.clone(),
+                    buckets: buckets.clone(),
+                    byterange: range,
+                    object_size: None,
+                    config: RequestConfig::default(),
+                },
                 const { NonZeroUsize::new(2).unwrap() },
-                RequestConfig::default(),
             )
         };
         let mut chunks = std::pin::pin!(read(0..PAGE_SIZE + 1));
@@ -622,13 +639,15 @@ mod tests {
             service
                 .clone()
                 .get(
-                    kind.clone(),
-                    object.clone(),
-                    bucket.clone().into(),
-                    range,
-                    Some(object_size),
+                    FetchRequest {
+                        kind: kind.clone(),
+                        object: object.clone(),
+                        buckets: bucket.clone().into(),
+                        byterange: range,
+                        object_size: Some(object_size),
+                        config: RequestConfig::default(),
+                    },
                     NonZeroUsize::MIN,
-                    RequestConfig::default(),
                 )
                 .try_collect::<Vec<_>>()
         };
@@ -693,13 +712,15 @@ mod tests {
             service
                 .clone()
                 .get(
-                    kind.clone(),
-                    object.clone(),
-                    buckets.clone(),
-                    range,
-                    None,
+                    FetchRequest {
+                        kind: kind.clone(),
+                        object: object.clone(),
+                        buckets: buckets.clone(),
+                        byterange: range,
+                        object_size: None,
+                        config: RequestConfig::default(),
+                    },
                     NonZeroUsize::MIN,
-                    RequestConfig::default(),
                 )
                 .try_collect::<Vec<_>>()
         };

@@ -24,7 +24,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     object_store::{DownloadError, RequestConfig},
-    service::{CacheyService, Chunk, ServiceError, metrics},
+    service::{CacheyService, Chunk, FetchRequest, ServiceError, metrics},
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
 };
 
@@ -262,13 +262,15 @@ pub async fn fetch(
     let mut chunks = Box::pin(
         service
             .get(
-                kind.clone(),
-                object,
-                buckets,
-                byterange.clone(),
-                object_size,
+                FetchRequest {
+                    kind: kind.clone(),
+                    object,
+                    buckets,
+                    byterange: byterange.clone(),
+                    object_size,
+                    config: req_config,
+                },
                 concurrency,
-                req_config,
             )
             .peekable(),
     );
