@@ -128,21 +128,35 @@ pub struct Report {
     pub transports: Option<Vec<Transport>>,
 }
 
+/// What a simulated run recorded.
+pub struct Observations<'a> {
+    pub reads: Vec<Read>,
+    pub copies: Vec<Copy>,
+    pub peak_copies: usize,
+    pub peak_bytes: u64,
+    pub backend: &'a State,
+    pub last_read_us: u64,
+    pub histograms: Vec<(u64, usize)>,
+}
+
 impl Report {
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         scenario: Scenario,
         seed: u64,
         native: bool,
         trace: bool,
-        reads: Vec<Read>,
-        copies: Vec<Copy>,
-        peak_copies: usize,
-        peak_bytes: u64,
-        state: &State,
-        last_read_us: u64,
-        mut histograms: Vec<(u64, usize)>,
+        observed: Observations<'_>,
     ) -> Self {
+        let Observations {
+            reads,
+            copies,
+            peak_copies,
+            peak_bytes,
+            backend: state,
+            last_read_us,
+            mut histograms,
+        } = observed;
         let mut errors = BTreeMap::new();
         let mut wins = vec![0; scenario.replicas.len()];
         for read in &reads {

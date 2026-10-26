@@ -12,7 +12,7 @@ use tokio::time::{Instant, sleep_until};
 use self::{
     backend::{Backend, WARM_READ},
     model::{Scenario, mix},
-    report::{Copy, Health, Read, Report},
+    report::{Copy, Health, Observations, Read, Report},
 };
 use super::{Downloader, RequestConfig};
 use crate::{
@@ -293,13 +293,15 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 seed,
                 native_reservoir,
                 trace,
-                reads,
-                copies,
-                peak_copies,
-                peak_bytes,
-                &backend.state.lock(),
-                client_finished_us,
-                histograms,
+                Observations {
+                    reads,
+                    copies,
+                    peak_copies,
+                    peak_bytes,
+                    backend: &backend.state.lock(),
+                    last_read_us: client_finished_us,
+                    histograms,
+                },
             )
         })
         .await
