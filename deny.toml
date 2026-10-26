@@ -4,6 +4,11 @@ all-features = true
 [advisories]
 ignore = [
     "RUSTSEC-2024-0436", # paste unmaintained
+    # zstd 0.13 is pinned by foyer-storage until https://github.com/foyer-rs/foyer/pull/1382 is released.
+    # foyer only uses `zstd::Encoder::new` and `zstd::read::Decoder::new`.
+    { id = "RUSTSEC-2026-0391", reason = "foyer does not use `with_context`" },
+    { id = "RUSTSEC-2026-0398", reason = "seekable feature is not enabled" },
+    { id = "RUSTSEC-2026-0403", reason = "`zstd::read::Decoder` is not affected" },
 ]
 
 [licenses]
