@@ -644,8 +644,8 @@ mod tests {
                 new: 4096
             })
         ));
-        let chunks = read(100..200, 4096).await.unwrap();
-        assert_eq!(chunks[0].data, data.slice(100..200));
+        let chunks = read(2048..2148, 4096).await.unwrap();
+        assert_eq!(chunks[0].data, data.slice(2048..2148));
         assert!(matches!(
             read(100..200, 8192).await,
             Err(ServiceError::ObjectSizeInconsistency {

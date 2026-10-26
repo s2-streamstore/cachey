@@ -653,13 +653,14 @@ mod tests {
         buckets: &[&str],
         config: &RequestConfig,
     ) -> Result<DownloadOutput, DownloadError> {
-        fetch_range(downloader, buckets, 0..4, config).await
+        fetch_range(downloader, buckets, 0..4, None, config).await
     }
 
     async fn fetch_range(
         downloader: &Downloader,
         buckets: &[&str],
         range: Range<u64>,
+        object_size: Option<u64>,
         config: &RequestConfig,
     ) -> Result<DownloadOutput, DownloadError> {
         let buckets =
@@ -669,7 +670,7 @@ mod tests {
                 &buckets,
                 ObjectKey::new("object").unwrap(),
                 &range,
-                None,
+                object_size,
                 config,
             )
             .await
@@ -860,21 +861,19 @@ mod tests {
     #[tokio::test]
     async fn invalid_request_ranges_do_not_reach_the_backend() {
         let (downloader, script) = scripted_downloader([]);
-        let buckets = BucketNameSet::from(BucketName::new("bucket").unwrap());
         for (range, object_size) in [
             (Range { start: 10, end: 10 }, None),
             (Range { start: 10, end: 1 }, None),
             (10..20, Some(10)),
         ] {
-            let result = downloader
-                .download(
-                    &buckets,
-                    ObjectKey::new("object").unwrap(),
-                    &range,
-                    object_size,
-                    &RequestConfig::default(),
-                )
-                .await;
+            let result = fetch_range(
+                &downloader,
+                &["bucket"],
+                range,
+                object_size,
+                &RequestConfig::default(),
+            )
+            .await;
             assert!(matches!(
                 result,
                 Err(DownloadError::RangeNotSatisfied { .. })
@@ -1086,17 +1085,15 @@ mod tests {
                 ..DownloadLimits::default()
             })
             .unwrap();
-        let buckets = BucketNameSet::from(BucketName::new("local").unwrap());
         let read = async |object_size| {
-            downloader
-                .download(
-                    &buckets,
-                    ObjectKey::new("object").unwrap(),
-                    &(0..16 * MIB),
-                    object_size,
-                    &RequestConfig::default(),
-                )
-                .await
+            fetch_range(
+                &downloader,
+                &["local"],
+                0..16 * MIB,
+                object_size,
+                &RequestConfig::default(),
+            )
+            .await
         };
         assert!(matches!(
             read(None).await,
@@ -1141,9 +1138,15 @@ mod tests {
             }
         }
         let read = async |buckets: &[&str]| {
-            fetch_range(&downloader, buckets, 0..page, &RequestConfig::default())
-                .await
-                .unwrap()
+            fetch_range(
+                &downloader,
+                buckets,
+                0..page,
+                None,
+                &RequestConfig::default(),
+            )
+            .await
+            .unwrap()
         };
         let (.., output) = tokio::join!(
             read(&["local"]),

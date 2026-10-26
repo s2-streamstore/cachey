@@ -143,8 +143,11 @@ impl Sample {
         }
     }
 
+    /// At least the timer resolution, as the models observe it.
     fn latency(&self) -> Duration {
-        self.first_byte.saturating_add(self.body)
+        self.first_byte
+            .saturating_add(self.body)
+            .max(TIMER_RESOLUTION)
     }
 }
 
@@ -295,8 +298,6 @@ impl BucketStats {
 
     /// Successes at sizes the request model predicts move the routing factor, and every
     /// success eases the excess. The first measurement and recovery probes replace both.
-    /// Like the model's observations, latency is at least the timer resolution, so the
-    /// factor stays positive.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
         let median = self
             .estimates
@@ -306,12 +307,7 @@ impl BucketStats {
         let ratio = match median {
             Some(Median::Predicted(median)) => {
                 self.routing_bytes = Some(sample.requested_bytes);
-                Some(
-                    sample
-                        .latency()
-                        .max(TIMER_RESOLUTION)
-                        .div_duration_f64(median),
-                )
+                Some(sample.latency().div_duration_f64(median))
             }
             _ => None,
         };
@@ -587,12 +583,15 @@ struct BucketSnapshot {
 }
 
 /// Bucket state for routing one request size.
-pub(super) struct RoutingSnapshot(Vec<BucketSnapshot>);
+pub(super) struct RoutingSnapshot {
+    buckets: Vec<BucketSnapshot>,
+    limits: DownloadLimits,
+}
 
 impl RoutingSnapshot {
     fn compare(&self, left: usize, right: usize, remaining: Duration) -> std::cmp::Ordering {
-        let left_stats = &self.0[left];
-        let right_stats = &self.0[right];
+        let left_stats = &self.buckets[left];
+        let right_stats = &self.buckets[right];
         (!self.feasible(left, remaining), left_stats.deprioritized)
             .cmp(&(!self.feasible(right, remaining), right_stats.deprioritized))
             .then_with(|| {
@@ -605,28 +604,26 @@ impl RoutingSnapshot {
             .then_with(|| (left_stats.latency, left).cmp(&(right_stats.latency, right)))
     }
 
-    /// Whether a request is expected to finish in time; unmeasured buckets may.
+    /// Whether a new copy is expected to finish in the time remaining, within the bucket
+    /// timeout; unmeasured buckets may.
     pub fn feasible(&self, index: usize, remaining: Duration) -> bool {
-        self.tail(index).is_none_or(|tail| tail < remaining)
+        self.tail(index)
+            .is_none_or(|tail| tail < remaining.min(self.limits.bucket_timeout))
     }
 
     pub fn best(&self, eligible: impl Fn(usize) -> bool, remaining: Duration) -> Option<usize> {
-        (0..self.0.len())
+        (0..self.buckets.len())
             .filter(|index| eligible(*index))
             .min_by(|left, right| self.compare(*left, *right, remaining))
     }
 
-    pub fn rescue_schedule(
-        &self,
-        primary: usize,
-        probing: bool,
-        limits: DownloadLimits,
-    ) -> VecDeque<(Duration, usize)> {
+    pub fn rescue_schedule(&self, primary: usize, probing: bool) -> VecDeque<(Duration, usize)> {
+        let limits = self.limits;
         let page_budget = limits.page_timeout;
-        let unknown_latency = limits.bucket_share(self.0.len());
+        let unknown_latency = limits.bucket_share(self.buckets.len());
         let reserve_budget = page_budget / 3 * 2;
-        let mut schedule = Vec::with_capacity(self.0.len());
-        schedule.extend((0..self.0.len()).filter_map(|index| {
+        let mut schedule = Vec::with_capacity(self.buckets.len());
+        schedule.extend((0..self.buckets.len()).filter_map(|index| {
             if index == primary || !self.feasible(index, page_budget) {
                 return None;
             }
@@ -665,7 +662,7 @@ impl RoutingSnapshot {
             .unwrap_or_default()
             .min(limits.bucket_timeout)
             .min(page_budget);
-        let overloaded = self.0.iter().any(|bucket| bucket.overloaded);
+        let overloaded = self.buckets.iter().any(|bucket| bucket.overloaded);
         let mut remaining = total.mul_f64(scale);
         // Convert reservations to launch delays in place, retaining each destination.
         for (after, index) in &mut schedule {
@@ -687,12 +684,12 @@ impl RoutingSnapshot {
 
     pub fn primary(&self, remaining: Duration) -> (usize, Option<ProbePermit>) {
         let winner = self.best(|_| true, remaining).expect("nonempty bucket set");
-        let best = &self.0[winner];
+        let best = &self.buckets[winner];
         if best.deprioritized || !self.feasible(winner, remaining) {
             return (winner, None);
         }
         let now = Instant::now();
-        for (index, snapshot) in self.0.iter().enumerate() {
+        for (index, snapshot) in self.buckets.iter().enumerate() {
             if index == winner {
                 continue;
             }
@@ -720,19 +717,19 @@ impl RoutingSnapshot {
     }
 
     fn tail(&self, index: usize) -> Option<Duration> {
-        self.0[index].tail
+        self.buckets[index].tail
     }
 
     pub fn model(&self, index: usize) -> LatencyModel {
-        self.0[index].model
+        self.buckets[index].model
     }
 
     pub fn overloaded(&self, index: usize) -> bool {
-        self.0[index].overloaded
+        self.buckets[index].overloaded
     }
 
     pub fn all_overloaded(&self) -> bool {
-        self.0.iter().all(|bucket| bucket.overloaded)
+        self.buckets.iter().all(|bucket| bucket.overloaded)
     }
 }
 
@@ -780,6 +777,7 @@ impl BucketedStats {
         &self,
         buckets: &BucketNameSet,
         requested_bytes: u64,
+        limits: DownloadLimits,
     ) -> RoutingSnapshot {
         let now = Instant::now();
         let states: Vec<_> = buckets.iter().map(|bucket| self.entry(bucket)).collect();
@@ -791,8 +789,8 @@ impl BucketedStats {
             .min_by_key(|(_, state)| state.lock().summarized_at)
             .map(|(index, _)| index);
         let mut preferred_latency = Duration::ZERO;
-        RoutingSnapshot(
-            states
+        RoutingSnapshot {
+            buckets: states
                 .into_iter()
                 .enumerate()
                 .map(|(index, state)| {
@@ -820,7 +818,8 @@ impl BucketedStats {
                     }
                 })
                 .collect(),
-        )
+            limits,
+        }
     }
 
     #[cfg(test)]
@@ -907,7 +906,10 @@ mod tests {
         BucketObservation, BucketedStats, LATENCY_SNAPSHOT_INTERVAL, Outcome, ProbePermit,
         RECOVERY_INTERVAL, RECOVERY_SUCCESSES, RequestTimeline, RoutingSnapshot, Sample,
     };
-    use crate::types::{BucketName, BucketNameSet};
+    use crate::{
+        object_store::DownloadLimits,
+        types::{BucketName, BucketNameSet},
+    };
 
     fn buckets() -> BucketNameSet {
         BucketNameSet::new(
@@ -942,7 +944,7 @@ mod tests {
     }
 
     fn snapshot(stats: &BucketedStats, buckets: &BucketNameSet) -> RoutingSnapshot {
-        stats.snapshot(buckets, 4)
+        stats.snapshot(buckets, 4, DownloadLimits::default())
     }
 
     fn best(stats: &BucketedStats, buckets: &BucketNameSet, remaining: Duration) -> Option<usize> {
@@ -951,7 +953,7 @@ mod tests {
 
     fn best_at(stats: &BucketedStats, buckets: &BucketNameSet, bytes: u64) -> Option<usize> {
         stats
-            .snapshot(buckets, bytes)
+            .snapshot(buckets, bytes, DownloadLimits::default())
             .best(|_| true, Duration::from_secs(10))
     }
 
@@ -997,7 +999,7 @@ mod tests {
         }
         let remaining = Duration::from_millis(150);
         for (bytes, tail, feasible) in [(4096, 21, true), (16 * MIB, 200, false)] {
-            let routing = stats.snapshot(&buckets, bytes);
+            let routing = stats.snapshot(&buckets, bytes, DownloadLimits::default());
             let predicted = routing.tail(0).unwrap();
             assert!(
                 predicted.abs_diff(Duration::from_millis(tail)) < Duration::from_millis(1),
@@ -1118,7 +1120,7 @@ mod tests {
             } else {
                 observation.complete(Outcome::Failure);
             }
-            let latency = snapshot(&stats, &buckets).0[0].latency;
+            let latency = snapshot(&stats, &buckets).buckets[0].latency;
             assert_eq!(
                 latency.abs_diff(Duration::from_millis(3)) < Duration::from_micros(1),
                 probe_succeeds,

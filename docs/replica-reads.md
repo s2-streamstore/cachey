@@ -45,9 +45,9 @@ Each bucket has three models:
 
 Requested bytes are known before headers arrive. Capacitor reads the range before
 sending headers, so its time to first byte grows with size. Page reads request a
-whole page. When the client passes `C0-Object-Size`, they count as requesting only
-what the object holds, which is what they receive, for admission and the models.
-Without it, their models describe whatever response sizes pages return.
+whole page. With `C0-Object-Size`, admission and the models count them at the bytes
+the object holds, which is what they receive. Without it, their models describe
+whatever response sizes pages return.
 
 Each model fits one line to the median:
 
@@ -116,8 +116,8 @@ budget still permits fallback and deadline rescue.
 | `--max-download-memory` | 1 GiB of reserved body bytes |
 | `--hedge-budget-percent` | 5% |
 
-Server reads reserve the bytes they request: 16 MiB per page, or less for the end of
-an object of known size. By default, 64 full pages fit. This limit is separate from
+Server reads reserve the bytes they expect: 16 MiB per page, or what remains of an
+object of known size. By default, 64 full pages fit. This limit is separate from
 cache capacity and total process memory.
 
 Copies other than early hedges and body retries wait for admission while they can

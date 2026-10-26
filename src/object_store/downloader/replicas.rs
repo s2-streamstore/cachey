@@ -316,9 +316,8 @@ impl Followups<'_> {
             })
     }
 
-    /// Prefer untried buckets, judged by the time a new copy has: what remains of the page
-    /// within the bucket timeout. Retry a failed body only after other copies finish, at
-    /// most once per page and within the retry budget.
+    /// Prefer untried buckets. Retry a failed body only after other copies finish,
+    /// at most once per page and within the retry budget.
     fn next(&mut self, trigger: Trigger, idle: bool) -> Option<CopyAttempt> {
         if let Trigger::Rescue(index) = trigger
             && self.states.buckets[index].tried
@@ -326,19 +325,17 @@ impl Followups<'_> {
             return None;
         }
         let now = Instant::now();
-        let downloader = self.request.downloader;
-        let remaining = self
-            .request
-            .page_deadline
-            .saturating_duration_since(now)
-            .min(downloader.limits.bucket_timeout);
+        let remaining = self.request.page_deadline.saturating_duration_since(now);
         if remaining.is_zero() {
             return None;
         }
         let early = matches!(trigger, Trigger::Hedge);
-        let routing = downloader
-            .bucketed_stats
-            .snapshot(self.request.buckets, self.request.bytes);
+        let downloader = self.request.downloader;
+        let routing = downloader.bucketed_stats.snapshot(
+            self.request.buckets,
+            self.request.bytes,
+            downloader.limits,
+        );
         let untried = |index: usize| !self.states.buckets[index].tried;
         let index = match trigger {
             Trigger::Rescue(index) => index,
@@ -423,12 +420,10 @@ impl Downloader {
         let deadline = start.checked_add(self.limits.page_timeout).ok_or_else(|| {
             DownloadError::Unknown("Page timeout exceeds the clock's supported range".to_owned())
         })?;
-        let routing = self.bucketed_stats.snapshot(buckets, bytes);
+        let routing = self.bucketed_stats.snapshot(buckets, bytes, self.limits);
         let (primary_copy, backup_admission) = self.prepare_primary(
             bytes,
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(self.limits.bucket_timeout),
+            deadline.saturating_duration_since(Instant::now()),
             &routing,
         );
         let primary = primary_copy.index;
@@ -450,7 +445,7 @@ impl Downloader {
             copies_in_flight: AtomicUsize::new(0),
             hedged: AtomicBool::new(false),
         };
-        let mut rescues = routing.rescue_schedule(primary, probing, self.limits);
+        let mut rescues = routing.rescue_schedule(primary, probing);
         let mut followups = Followups {
             request: &request,
             states: ReplicaStates::new(buckets.len()),
