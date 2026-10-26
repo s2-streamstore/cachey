@@ -7,7 +7,7 @@ use tokio::time::Instant;
 
 use super::{OBSERVATION_SPACING, reservoir::Reservoir};
 
-const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
+pub(super) const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MICROS: f64 = TIMER_RESOLUTION.as_micros() as f64;
 const FIT_PRECISION_MICROS: f64 = 0.25;
 const TAIL_QUANTILE: f64 = 0.99;

@@ -2,7 +2,8 @@
 
 ## Selection and recovery
 
-Replica selection uses backend health, recent latency, and the remaining deadline.
+Replica selection uses backend health, recent latency, and the time a new copy has:
+the remaining page deadline, within the bucket timeout.
 The first client-supplied bucket gets a locality preference; all buckets remain
 eligible for fallback.
 
@@ -92,9 +93,9 @@ the announced size. Each delay is p99 capped at 1.5 times the median. Health,
 rescue, and retry decisions use uncapped estimates.
 
 Early hedges use one SDK attempt, skip overloaded buckets, and never wait for
-admission. They prefer an untried bucket expected to finish before the page
-deadline, or else use the primary's bucket. A failed body can be retried once when
-no other copy or untried bucket remains, without waiting for admission.
+admission. They prefer an untried bucket expected to finish within its timeout and
+the page deadline, or else use the primary's bucket. A failed body can be retried
+once when no other copy or untried bucket remains, without waiting for admission.
 
 A copy's timeout allowance is the p99 of each interval, or half the bucket's share
 of the page timeout for each unmeasured interval. A later copy to a bucket needs

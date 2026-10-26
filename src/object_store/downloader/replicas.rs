@@ -157,7 +157,6 @@ struct ReplicaRequest<'a> {
     buckets: &'a BucketNameSet,
     object: &'a ObjectKey,
     range: &'a Range<u64>,
-    bytes: u64,
     config: &'a RequestConfig,
     page_deadline: Instant,
     primary: usize,
@@ -179,6 +178,10 @@ struct CopyAttempt {
 }
 
 impl ReplicaRequest<'_> {
+    fn bytes(&self) -> u64 {
+        self.range.end - self.range.start
+    }
+
     fn body_bytes(&self) -> Option<u64> {
         self.primary_timeline
             .announced_body_bytes()
@@ -307,7 +310,7 @@ impl Followups<'_> {
             .expires_at()
             .is_none_or(|deadline| {
                 let expected = routing.model(index).timeout_allowance(
-                    request.bytes,
+                    request.bytes(),
                     request.body_bytes(),
                     request.unmeasured(),
                 );
@@ -315,8 +318,9 @@ impl Followups<'_> {
             })
     }
 
-    /// Prefer untried buckets. Retry a failed body only after other copies finish,
-    /// at most once per page and within the retry budget.
+    /// Prefer untried buckets, judged by the time a new copy has: what remains of the page
+    /// within the bucket timeout. Retry a failed body only after other copies finish, at
+    /// most once per page and within the retry budget.
     fn next(&mut self, trigger: Trigger, idle: bool) -> Option<CopyAttempt> {
         if let Trigger::Rescue(index) = trigger
             && self.states.buckets[index].tried
@@ -324,15 +328,19 @@ impl Followups<'_> {
             return None;
         }
         let now = Instant::now();
-        let remaining = self.request.page_deadline.saturating_duration_since(now);
+        let downloader = self.request.downloader;
+        let remaining = self
+            .request
+            .page_deadline
+            .saturating_duration_since(now)
+            .min(downloader.limits.bucket_timeout);
         if remaining.is_zero() {
             return None;
         }
         let early = matches!(trigger, Trigger::Hedge);
-        let downloader = self.request.downloader;
         let routing = downloader
             .bucketed_stats
-            .snapshot(self.request.buckets, self.request.bytes);
+            .snapshot(self.request.buckets, self.request.bytes());
         let untried = |index: usize| !self.states.buckets[index].tried;
         let index = match trigger {
             Trigger::Rescue(index) => index,
@@ -371,7 +379,7 @@ impl Followups<'_> {
         // Hedges and retries never queue for admission, so a retry cannot spend a credit
         // and then run out of time before it starts.
         let admission = if early || retrying {
-            Some(downloader.admission.try_acquire(self.request.bytes)?)
+            Some(downloader.admission.try_acquire(self.request.bytes())?)
         } else {
             None
         };
@@ -418,7 +426,9 @@ impl Downloader {
         let routing = self.bucketed_stats.snapshot(buckets, bytes);
         let (primary_copy, backup_admission) = self.prepare_primary(
             bytes,
-            deadline.saturating_duration_since(Instant::now()),
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(self.limits.bucket_timeout),
             &routing,
         );
         let primary = primary_copy.index;
@@ -428,7 +438,6 @@ impl Downloader {
             buckets,
             object,
             range,
-            bytes,
             config,
             page_deadline: deadline,
             primary,

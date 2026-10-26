@@ -12,7 +12,7 @@ use parking_lot::{Mutex, MutexGuard};
 use tokio::{sync::SetOnce, time::Instant};
 
 pub use self::model::LatencyEstimate;
-use self::model::{Median, Refit, SizeHistogram, SizeModel};
+use self::model::{Median, Refit, SizeHistogram, SizeModel, TIMER_RESOLUTION};
 use crate::{
     object_store::DownloadLimits,
     types::{BucketName, BucketNameSet},
@@ -295,6 +295,8 @@ impl BucketStats {
 
     /// Successes at sizes the request model predicts move the routing factor, and every
     /// success eases the excess. The first measurement and recovery probes replace both.
+    /// Like the model's observations, latency is at least the timer resolution, so the
+    /// factor stays positive.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
         let median = self
             .estimates
@@ -304,7 +306,12 @@ impl BucketStats {
         let ratio = match median {
             Some(Median::Predicted(median)) => {
                 self.routing_bytes = Some(sample.requested_bytes);
-                Some(sample.latency().div_duration_f64(median))
+                Some(
+                    sample
+                        .latency()
+                        .max(TIMER_RESOLUTION)
+                        .div_duration_f64(median),
+                )
             }
             _ => None,
         };
@@ -894,7 +901,7 @@ mod tests {
     use std::time::Duration;
 
     use bytesize::MIB;
-    use tokio::time::advance;
+    use tokio::time::{Instant, advance};
 
     use super::{
         BucketObservation, BucketedStats, LATENCY_SNAPSHOT_INTERVAL, Outcome, ProbePermit,
@@ -1228,6 +1235,24 @@ mod tests {
         advance(Duration::from_millis(600)).await;
         drop(canceled);
         assert_eq!(best_at(&stats, &buckets, 4096), Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_instant_probe_keeps_routing_latency_finite() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        stats.seed(&buckets[0], Sample::from_millis(5, 4096, 0));
+        best_at(&stats, &buckets, 4096);
+        stats.entry(&buckets[0]).lock().record(
+            Instant::now(),
+            &Sample::from_millis(0, 4096, 0),
+            true,
+        );
+        let timeline = RequestTimeline::default();
+        let canceled = begin_sized(&stats, &buckets[0], None, &timeline, 4096);
+        advance(Duration::from_millis(50)).await;
+        drop(canceled);
+        best_at(&stats, &buckets, 4096);
     }
 
     /// A first bucket last measured as slow is still probed once stale, or it could never

@@ -2546,22 +2546,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hedges_skip_peers_that_cannot_finish_before_the_page_deadline() {
-        let (downloader, script) =
-            scripted_downloader([("local", 1_000, 0, false), ("local", 10, 0, false)]);
-        let downloader = downloader
-            .with_test_limits(DownloadLimits {
+    async fn hedges_skip_peers_that_cannot_finish_within_the_page_or_bucket_timeout() {
+        for limits in [
+            DownloadLimits {
                 page_timeout: Duration::from_millis(500),
                 ..DownloadLimits::default()
-            })
-            .unwrap();
-        seed_latency(&downloader, "local", 10);
-        seed_latency(&downloader, "distant", 2_000);
-        let output = fetch(&downloader, &["local", "distant"]).await;
-        assert_eq!(output.used_bucket_idx, 0);
-        assert!(output.hedged);
-        assert_eq!(output.latency, Duration::from_millis(20));
-        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
-        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+            },
+            DownloadLimits {
+                bucket_timeout: Duration::from_millis(500),
+                ..DownloadLimits::default()
+            },
+        ] {
+            let (downloader, script) =
+                scripted_downloader([("local", 1_000, 0, false), ("local", 10, 0, false)]);
+            let downloader = downloader.with_test_limits(limits).unwrap();
+            seed_latency(&downloader, "local", 10);
+            seed_latency(&downloader, "distant", 2_000);
+            let output = fetch(&downloader, &["local", "distant"]).await;
+            assert_eq!(output.used_bucket_idx, 0);
+            assert!(output.hedged);
+            assert_eq!(output.latency, Duration::from_millis(20));
+            assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+        }
     }
 }

@@ -40,7 +40,7 @@ HEAD|GET /fetch/{kind}/{object}
 `C0-Object-Size` behavior:
 - Downloads stop at the object's end, so a page of a small object is read, admitted, and timed at its own size
 - A range starting at or past the size returns 416 without contacting a bucket
-- A bucket reporting a different size returns 409, and nothing it returned is cached
+- A bucket reporting a different size returns 409, or 416 for a range past the object's actual end; the page is still read whole and cached for other readers
 
 See [replica reads](docs/replica-reads.md) for selection, fallback, hedging, and download limits.
 

@@ -287,24 +287,23 @@ impl PageGetExecutor {
                     );
 
                     let start = u64::from(page_id) * PAGE_SIZE;
-                    let end = (start + PAGE_SIZE).min(self.request.object_size.unwrap_or(u64::MAX));
-                    let out = self
-                        .downloader
-                        .download(
-                            &self.request.buckets,
-                            self.request.object.clone(),
-                            &(start..end),
-                            &self.request.config,
-                        )
-                        .await?;
-                    // A page cut short by a wrong size must not be cached.
-                    if let Some(size) = self.request.object_size
-                        && out.piece.object_size != size
-                    {
-                        return Err(ServiceError::ObjectSizeInconsistency {
-                            prev: size,
-                            new: out.piece.object_size,
-                        });
+                    let page_end = start + PAGE_SIZE;
+                    let end = page_end.min(self.request.object_size.unwrap_or(u64::MAX));
+                    let download = async |end| {
+                        self.downloader
+                            .download(
+                                &self.request.buckets,
+                                self.request.object.clone(),
+                                &(start..end),
+                                &self.request.config,
+                            )
+                            .await
+                    };
+                    let mut out = download(end).await?;
+                    // Readers share the page, so a size that cut it short does not shorten it.
+                    let object_end = page_end.min(out.piece.object_size);
+                    if object_end > end {
+                        out = download(object_end).await?;
                     }
                     metrics::page_download_latency(&self.request.kind, out.latency);
                     if out.hedged {
@@ -625,7 +624,7 @@ mod tests {
     }
 
     /// A known object size keeps page downloads within the object, and a size its bucket
-    /// disagrees with fails the read without caching what was downloaded.
+    /// disagrees with fails the read but not the whole page cached for other readers.
     #[tokio::test]
     async fn object_size_bounds_downloads_and_must_match_the_bucket() {
         let kind = ObjectKind::new("object-size").unwrap();
@@ -665,7 +664,7 @@ mod tests {
                 new: 4096
             })
         ));
-        assert_eq!(downloads(), (1, 1024));
+        assert_eq!(downloads(), (2, 1024 + 4096));
         let chunks = read(100..200, 4096).await.unwrap();
         assert_eq!(chunks[0].data, data.slice(100..200));
         assert_eq!(downloads(), (2, 1024 + 4096));
