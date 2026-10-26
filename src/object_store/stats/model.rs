@@ -33,6 +33,7 @@ struct Estimate {
     median: Line,
     /// p99 latency as a multiple of the median, at least 1.
     tail_ratio: f64,
+    smallest_bytes: u64,
     largest_bytes: u64,
 }
 
@@ -56,7 +57,11 @@ fn duration(micros: f64) -> Duration {
 /// Median latency at a size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::object_store) enum Median {
+    /// Within the range of retained sizes.
     Predicted(Duration),
+    /// Outside the range of retained sizes, along the median line: an estimate that can be
+    /// far off, so it is not evidence about the bucket.
+    Extrapolated(Duration),
     /// Beyond the model's reach, the median at its largest retained size: latency grows
     /// with size, so this bounds it from below.
     AtLeast(Duration),
@@ -65,7 +70,7 @@ pub(in crate::object_store) enum Median {
 impl Median {
     pub fn value(self) -> Duration {
         match self {
-            Self::Predicted(median) | Self::AtLeast(median) => median,
+            Self::Predicted(median) | Self::Extrapolated(median) | Self::AtLeast(median) => median,
         }
     }
 }
@@ -90,7 +95,12 @@ impl SizeModel {
     pub fn median(&self, bytes: u64) -> Option<Median> {
         let estimate = self.0?;
         Some(match self.micros(bytes) {
-            Some((median, _)) => Median::Predicted(duration(median)),
+            Some((median, _))
+                if (estimate.smallest_bytes..=estimate.largest_bytes).contains(&bytes) =>
+            {
+                Median::Predicted(duration(median))
+            }
+            Some((median, _)) => Median::Extrapolated(duration(median)),
             None => Median::AtLeast(duration(estimate.median.micros(estimate.largest_bytes))),
         })
     }
@@ -328,6 +338,12 @@ impl SizeHistogram {
         self.bands.values().map(Reservoir::retention)
     }
 
+    /// Observations the current model was fit from.
+    #[cfg(test)]
+    pub fn fitted_updates(&self) -> u64 {
+        self.fitted_updates
+    }
+
     /// Observations to refit once `due`, or as soon as the observation count doubles.
     pub fn refit(&mut self, due: bool) -> Option<Refit> {
         if self.updates == self.summarized_updates
@@ -411,10 +427,10 @@ impl Refit {
                 .then(left.weight.total_cmp(&right.weight))
         });
         let model = observations
-            .iter()
-            .map(|sample| sample.bytes)
-            .max()
-            .map(|largest_bytes| {
+            .first()
+            .zip(observations.last())
+            .map(|(smallest, largest)| (smallest.bytes, largest.bytes))
+            .map(|(smallest_bytes, largest_bytes)| {
                 let mut values = Vec::with_capacity(observations.len());
                 let median = median_line(&observations, largest_bytes, proportional, &mut values);
                 values.clear();
@@ -425,6 +441,7 @@ impl Refit {
                 Estimate {
                     median,
                     tail_ratio: quantile(&mut values, TAIL_QUANTILE).max(1.0),
+                    smallest_bytes,
                     largest_bytes,
                 }
             });
@@ -581,6 +598,10 @@ mod tests {
         let model = histogram.summary(false);
         assert_eq!(
             model.median(4096),
+            Some(Median::Extrapolated(Duration::from_millis(25)))
+        );
+        assert_eq!(
+            model.median(16 * MIB),
             Some(Median::Predicted(Duration::from_millis(25)))
         );
         assert_eq!(

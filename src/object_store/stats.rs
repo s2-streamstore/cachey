@@ -296,7 +296,7 @@ impl BucketStats {
             )
     }
 
-    /// Successes at sizes the request model predicts move the routing factor, and every
+    /// Successes at sizes the request model has observed move the routing factor, and every
     /// success eases the excess. The first measurement and recovery probes replace both.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
         let median = self
@@ -382,7 +382,7 @@ impl BucketStats {
 
     /// An unfinished copy raises routing latency toward its elapsed time, and never lowers
     /// it. Relative to the scaled median, the rise carries over to other sizes. A measured
-    /// bucket's copy of a size its model cannot predict is not judged.
+    /// bucket's copy of a size its model has not observed is not judged.
     fn raise_routing_latency(&mut self, now: Instant, elapsed: Duration, requested_bytes: u64) {
         match self.estimates.request.model().median(requested_bytes) {
             Some(Median::Predicted(median)) => {
@@ -391,7 +391,7 @@ impl BucketStats {
                 self.routing_excess = excess + (outlasted - excess).max(0.0) * LATENCY_ALPHA;
                 self.routing_updated_at = now;
             }
-            Some(Median::AtLeast(_)) => {}
+            Some(Median::Extrapolated(_) | Median::AtLeast(_)) => {}
             None => {
                 self.unmeasured_latency += elapsed
                     .saturating_sub(self.unmeasured_latency)
@@ -808,7 +808,7 @@ impl BucketedStats {
                         preferred_latency = current;
                     }
                     let mut latency = stats.stalled_latency(now, current);
-                    if index > 0 && !matches!(median, Some(Median::Predicted(_))) {
+                    if index > 0 && matches!(median, None | Some(Median::AtLeast(_))) {
                         latency = latency.max(preferred_latency);
                     }
                     BucketSnapshot {
@@ -904,12 +904,19 @@ fn locality_adjusted(latency: Duration, index: usize) -> Duration {
 mod tests {
     use std::time::Duration;
 
-    use bytesize::MIB;
+    use bytesize::{KIB, MIB};
+    use parking_lot::Mutex;
+    use proptest::{
+        collection, prop_assert, prop_oneof, proptest,
+        strategy::Strategy,
+        test_runner::{Config as ProptestConfig, TestCaseError},
+    };
     use tokio::time::{Instant, advance};
 
     use super::{
-        BucketObservation, BucketedStats, LATENCY_SNAPSHOT_INTERVAL, Outcome, ProbePermit,
-        RECOVERY_INTERVAL, RECOVERY_SUCCESSES, RequestTimeline, RoutingSnapshot, Sample,
+        BucketObservation, BucketStats, BucketedStats, LATENCY_SNAPSHOT_INTERVAL, Median,
+        OBSERVATION_SPACING, Outcome, ProbePermit, RECOVERY_INTERVAL, RECOVERY_SUCCESSES,
+        RequestTimeline, RoutingSnapshot, Sample, TIMER_RESOLUTION,
     };
     use crate::{
         object_store::DownloadLimits,
@@ -1554,6 +1561,207 @@ mod tests {
             assert_eq!(index, 0);
             assert!(probe.is_none());
             assert!(!stats.entry(&buckets[0]).lock().deprioritized);
+        }
+    }
+
+    /// Sizes in distinct bands, from small reads to whole pages.
+    const ROUTED_SIZES: [u64; 4] = [4 * KIB, 64 * KIB, MIB, 16 * MIB];
+    /// Speed shifts span 4x and jitter 1.56x, so a size observed at one speed can route up
+    /// to 6.25x from its observations once other sizes see another.
+    const ROUTING_SLACK: f64 = 8.0;
+    /// A size is judged once a fit includes this many of its observations, since a line fit
+    /// to fewer can trade them for other sizes' larger deviations.
+    const JUDGED_OBSERVATIONS: usize = 3;
+
+    #[derive(Debug, Clone)]
+    enum Finish {
+        Success { jitter_percent: u32, probe: bool },
+        Cancel { elapsed_percent: u32 },
+    }
+
+    #[derive(Debug, Clone)]
+    enum Event {
+        Copy {
+            size: usize,
+            finish: Finish,
+        },
+        /// Every size slows down or speeds up by the same factor.
+        Shift {
+            percent: u32,
+        },
+        Idle {
+            secs: u64,
+        },
+    }
+
+    fn event() -> impl Strategy<Value = Event> {
+        let finish = prop_oneof![
+            9 => (80_u32..=125, proptest::bool::weighted(0.1))
+                .prop_map(|(jitter_percent, probe)| Finish::Success { jitter_percent, probe }),
+            2 => (25_u32..=800).prop_map(|elapsed_percent| Finish::Cancel { elapsed_percent }),
+        ];
+        prop_oneof![
+            11 => (0..ROUTED_SIZES.len(), finish)
+                .prop_map(|(size, finish)| Event::Copy { size, finish }),
+            1 => (50_u32..=200).prop_map(|percent| Event::Shift { percent }),
+            1 => (1_u64..=60).prop_map(|secs| Event::Idle { secs }),
+        ]
+    }
+
+    /// A bucket whose latency is linear in size, scaled by its current speed.
+    struct Backend {
+        fixed_ms: f64,
+        ms_per_mib: f64,
+        speed: f64,
+    }
+
+    impl Backend {
+        fn latency(&self, size: usize, percent: u32) -> Duration {
+            let ms = self.fixed_ms + self.ms_per_mib * ROUTED_SIZES[size] as f64 / MIB as f64;
+            Duration::from_secs_f64(ms * self.speed * f64::from(percent) / 100_000.0)
+        }
+    }
+
+    /// Routes a read as a download does, which is when models refit.
+    fn route(stats: &BucketedStats, buckets: &BucketNameSet, size: usize) -> Duration {
+        stats
+            .snapshot(buckets, ROUTED_SIZES[size], DownloadLimits::default())
+            .buckets[0]
+            .latency
+    }
+
+    /// Records a success, widening the range of observed-to-predicted ratios that the
+    /// routing factor averages.
+    fn record_success(
+        stats: &Mutex<BucketStats>,
+        bytes: u64,
+        latency: Duration,
+        probe: bool,
+        ratios: &mut (f64, f64),
+    ) {
+        let mut stats = stats.lock();
+        if let Some(Median::Predicted(median)) = stats.estimates.request.model().median(bytes) {
+            let ratio = latency.max(TIMER_RESOLUTION).div_duration_f64(median);
+            *ratios = (ratios.0.min(ratio), ratios.1.max(ratio));
+        }
+        let now = Instant::now();
+        let generation = stats.generation;
+        let sample = Sample {
+            requested_bytes: bytes,
+            first_byte: latency,
+            body_bytes: bytes,
+            body: Duration::ZERO,
+        };
+        stats.record(now, &sample, probe);
+        stats.succeed(now, generation, probe);
+    }
+
+    async fn follow_latency(
+        mut backend: Backend,
+        events: Vec<(u64, Event)>,
+    ) -> Result<(), TestCaseError> {
+        let stats = BucketedStats::default();
+        let buckets = BucketNameSet::from(BucketName::new("bucket").unwrap());
+        let entry = stats.entry(&buckets[0]);
+        let mut ratios = (1.0, 1.0);
+        let mut successes = 0;
+        // The range of latencies observed at each size, and which successes observed it.
+        let mut observed: [(Duration, Duration, Vec<u64>); ROUTED_SIZES.len()] =
+            std::array::from_fn(|_| (Duration::MAX, Duration::ZERO, Vec::new()));
+        for (gap_ms, event) in events {
+            advance(Duration::from_millis(gap_ms)).await;
+            let (size, finish) = match event {
+                Event::Copy { size, finish } => (size, finish),
+                Event::Shift { percent } => {
+                    backend.speed = f64::from(percent) / 100.0;
+                    continue;
+                }
+                Event::Idle { secs } => {
+                    advance(Duration::from_secs(secs)).await;
+                    continue;
+                }
+            };
+            let latency = route(&stats, &buckets, size);
+            {
+                let stats = entry.lock();
+                let factor = stats.routing_factor;
+                prop_assert!(
+                    ratios.0 - 1e-9 <= factor && factor <= ratios.1 + 1e-9,
+                    "factor {factor} outside {ratios:?}"
+                );
+                let (low, high, seen) = &observed[size];
+                let judged = seen
+                    .get(JUDGED_OBSERVATIONS - 1)
+                    .is_some_and(|&nth| stats.estimates.request.fitted_updates() >= nth);
+                let scaled = latency.div_f64(1.0 + stats.routing_excess(Instant::now()));
+                prop_assert!(
+                    !judged
+                        || (low.div_f64(ROUTING_SLACK) <= scaled
+                            && scaled <= high.mul_f64(ROUTING_SLACK)),
+                    "{scaled:?} routed where {low:?}..={high:?} was observed"
+                );
+            }
+            match finish {
+                Finish::Success {
+                    jitter_percent,
+                    probe,
+                } => {
+                    let latency = backend.latency(size, jitter_percent);
+                    successes += 1;
+                    let (low, high, seen) = &mut observed[size];
+                    *low = (*low).min(latency);
+                    *high = (*high).max(latency);
+                    seen.push(successes);
+                    record_success(&entry, ROUTED_SIZES[size], latency, probe, &mut ratios);
+                }
+                Finish::Cancel { elapsed_percent } => {
+                    let timeline = RequestTimeline::default();
+                    let copy =
+                        begin_sized(&stats, &buckets[0], None, &timeline, ROUTED_SIZES[size]);
+                    advance(backend.latency(size, elapsed_percent)).await;
+                    drop(copy);
+                }
+            }
+        }
+        // Once the bucket settles, routing latency converges on its latency at each size.
+        for _ in 0..50 {
+            for (size, &bytes) in ROUTED_SIZES.iter().enumerate() {
+                advance(OBSERVATION_SPACING).await;
+                route(&stats, &buckets, size);
+                let latency = backend.latency(size, 100);
+                record_success(&entry, bytes, latency, false, &mut ratios);
+            }
+        }
+        advance(Duration::from_secs(60)).await;
+        for size in 0..ROUTED_SIZES.len() {
+            let routed = route(&stats, &buckets, size);
+            let latency = backend.latency(size, 100);
+            prop_assert!(
+                latency.mul_f64(0.8) <= routed && routed <= latency.mul_f64(1.25),
+                "{routed:?} routed for a settled {latency:?}"
+            );
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The routing factor stays within the ratios it averages, routing latency stays
+        /// near what each size has observed, and both settle once the bucket does.
+        #[test]
+        fn routing_latency_follows_observed_latency(
+            fixed_ms in 3.0_f64..50.0,
+            ms_per_mib in 0.0_f64..20.0,
+            events in collection::vec((20_u64..=150, event()), 1..200),
+        ) {
+            let backend = Backend { fixed_ms, ms_per_mib, speed: 1.0 };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap()
+                .block_on(follow_latency(backend, events))?;
         }
     }
 }

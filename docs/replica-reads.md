@@ -18,12 +18,12 @@ excess from canceled copies. The moving average follows a shift in latency soone
 than the model does; when a refit moves the median, the average is rescaled so the
 shift is not counted twice. Beyond the sizes its model can predict, a bucket is
 ranked by its median at the largest size it has seen, since latency grows with size.
-It never ranks ahead of the first bucket there, and its reads of that size leave the
-moving average alone.
+It never ranks ahead of the first bucket there. Only reads of sizes the model has
+observed move the moving average, since an extrapolated median can be far off.
 
 Canceled copies raise the excess toward how far they outlasted their routing
 latency, as a fraction, so a slow large read slows small ones only in proportion.
-Copies of a size the model cannot predict are not judged. The excess decays with a
+Copies of a size the model has not observed are not judged. The excess decays with a
 5-second half-life. Before a bucket has a median, canceled copies raise its routing
 latency directly, which stays until a read succeeds. A bucket's first measurement
 and recovery probes reset the moving average, the excess, and that latency.
