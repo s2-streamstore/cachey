@@ -465,7 +465,7 @@ impl Downloader {
                         Ok(piece) => return Ok(request.output(piece, index, start)),
                         Err(error) => error,
                     };
-                    if !error.should_attempt_fallback_bucket() {
+                    if error.ends_read() {
                         return Err(error);
                     }
                     if error.repeats_within_bucket() {
@@ -474,10 +474,9 @@ impl Downloader {
                     if is_primary {
                         hedge.disarm();
                     }
-                    // Every bucket's copies wait in the same admission queue.
-                    let admission = matches!(error, DownloadError::AdmissionTimeout);
+                    let fallback = error.should_attempt_fallback_bucket();
                     followups.failed(index, error);
-                    if admission {
+                    if !fallback {
                         continue;
                     }
                     Trigger::Fallback

@@ -53,6 +53,23 @@ fn duration(micros: f64) -> Duration {
     Duration::try_from_secs_f64(micros.round() / 1_000_000.0).unwrap_or(Duration::MAX)
 }
 
+/// Median latency at a size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::object_store) enum Median {
+    Predicted(Duration),
+    /// Beyond the model's reach, the median at its largest retained size: latency grows
+    /// with size, so this bounds it from below.
+    AtLeast(Duration),
+}
+
+impl Median {
+    pub fn value(self) -> Duration {
+        match self {
+            Self::Predicted(median) | Self::AtLeast(median) => median,
+        }
+    }
+}
+
 /// Latency by size: a median line and a tail ratio shared by all sizes.
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::object_store) struct SizeModel(Option<Estimate>);
@@ -69,20 +86,13 @@ impl SizeModel {
         Some((median, median * estimate.tail_ratio))
     }
 
-    pub fn is_measured(&self) -> bool {
-        self.0.is_some()
-    }
-
-    pub fn median(&self, bytes: u64) -> Option<Duration> {
-        self.micros(bytes).map(|(median, _)| duration(median))
-    }
-
-    /// The median at `bytes`, or beyond the model's reach, at the largest retained size:
-    /// latency grows with size, so that bounds it from below.
-    pub fn median_bounded(&self, bytes: u64) -> Option<Duration> {
+    /// None until measured.
+    pub fn median(&self, bytes: u64) -> Option<Median> {
         let estimate = self.0?;
-        self.median(bytes)
-            .or_else(|| self.median(estimate.largest_bytes))
+        Some(match self.micros(bytes) {
+            Some((median, _)) => Median::Predicted(duration(median)),
+            None => Median::AtLeast(duration(estimate.median.micros(estimate.largest_bytes))),
+        })
     }
 
     /// Uncapped p99.
@@ -388,10 +398,18 @@ impl Refit {
     /// ratios by their median keeps small requests' constant stalls from scaling large ones.
     pub fn fit(self) -> Fitted {
         let Self {
-            observations,
+            mut observations,
             proportional,
             updates,
         } = self;
+        // Reservoirs return samples in random order; a fixed order makes rounding depend
+        // only on which samples were kept.
+        observations.sort_unstable_by(|left, right| {
+            left.bytes
+                .cmp(&right.bytes)
+                .then(left.micros.total_cmp(&right.micros))
+                .then(left.weight.total_cmp(&right.weight))
+        });
         let model = observations
             .iter()
             .map(|sample| sample.bytes)
@@ -446,7 +464,8 @@ mod tests {
     use tokio::time::{Instant, advance};
 
     use super::{
-        Line, Observation, SizeHistogram, TIMER_MICROS, TIMER_RESOLUTION, median_line, quantile,
+        Line, Median, Observation, SizeHistogram, TIMER_MICROS, TIMER_RESOLUTION, median_line,
+        quantile,
     };
 
     fn body() -> SizeHistogram {
@@ -466,7 +485,10 @@ mod tests {
         }
         let model = histogram.summary(true);
         assert_eq!(model.tail(1), Some(TIMER_RESOLUTION));
-        assert_eq!(model.median(4 * MIB), Some(Duration::from_millis(41)));
+        assert_eq!(
+            model.median(4 * MIB),
+            Some(Median::Predicted(Duration::from_millis(41)))
+        );
         assert!(model.tail(16 * MIB).unwrap() <= Duration::from_millis(162));
     }
 
@@ -491,7 +513,10 @@ mod tests {
             update(&mut histogram, MIB, 21);
         }
         let model = histogram.summary(true);
-        assert_eq!(model.median(MIB), Some(Duration::from_millis(21)));
+        assert_eq!(
+            model.median(MIB),
+            Some(Median::Predicted(Duration::from_millis(21)))
+        );
         assert_eq!(model.tail(MIB), Some(Duration::from_millis(21)));
     }
 
@@ -507,7 +532,10 @@ mod tests {
             update(&mut histogram, MIB, 21);
         }
         let model = histogram.summary(true);
-        assert_eq!(model.median(MIB), Some(Duration::from_millis(21)));
+        assert_eq!(
+            model.median(MIB),
+            Some(Median::Predicted(Duration::from_millis(21)))
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -523,7 +551,7 @@ mod tests {
         histogram.store(older.fit());
         assert_eq!(
             histogram.model().median(MIB),
-            Some(Duration::from_millis(30))
+            Some(Median::Predicted(Duration::from_millis(30)))
         );
     }
 
@@ -551,8 +579,14 @@ mod tests {
         let mut histogram = SizeHistogram::new(false);
         update(&mut histogram, 16 * MIB, 25);
         let model = histogram.summary(false);
-        assert_eq!(model.median(4096), Some(Duration::from_millis(25)));
-        assert!(model.median(32 * MIB).is_none());
+        assert_eq!(
+            model.median(4096),
+            Some(Median::Predicted(Duration::from_millis(25)))
+        );
+        assert_eq!(
+            model.median(32 * MIB),
+            Some(Median::AtLeast(Duration::from_millis(25)))
+        );
     }
 
     /// Buffered bodies of one size, or fixed overhead across sizes, measure no cost per byte.
@@ -594,7 +628,10 @@ mod tests {
         }
         update(&mut histogram, 16 * MIB, 1001);
         let model = histogram.summary(true);
-        assert_eq!(model.median(MIB), Some(Duration::from_millis(11)));
+        assert_eq!(
+            model.median(MIB),
+            Some(Median::Predicted(Duration::from_millis(11)))
+        );
         // With a nonnegative intercept, extrapolation grows no faster than response size.
         assert!(model.hedge_delay(16 * MIB).unwrap() <= Duration::from_millis(265));
         for _ in 0..800 {
@@ -624,7 +661,11 @@ mod tests {
         let near = |actual: Option<Duration>, expected: Duration, tolerance_micros| {
             actual.unwrap().abs_diff(expected) <= Duration::from_micros(tolerance_micros)
         };
-        assert!(near(model.median(16 * MIB), Duration::from_millis(180), 1));
+        assert!(near(
+            model.median(16 * MIB).map(Median::value),
+            Duration::from_millis(180),
+            1
+        ));
         assert!(near(model.tail(16 * MIB), Duration::from_millis(800), 1));
         assert!(near(
             model.hedge_delay(16 * MIB),

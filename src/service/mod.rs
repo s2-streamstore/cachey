@@ -77,7 +77,7 @@ pub struct Chunk {
     pub cached_at: Option<NonZeroU32>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ServiceError {
     #[error("Cache error: {0}")]
     Cache(#[from] foyer::Error),
@@ -174,7 +174,7 @@ impl CacheyService {
         assert!(byterange.start < byterange.end);
         assert!(byterange.end <= MAX_RANGE_END);
 
-        let end = object_size.map_or(byterange.end, |size| byterange.end.min(size));
+        let end = byterange.end.min(object_size.unwrap_or(u64::MAX));
         let pages = (byterange.start < end).then(|| pagerange(&(byterange.start..end)));
         let past_end = pages.is_none().then(|| {
             Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
@@ -282,9 +282,7 @@ impl PageGetExecutor {
                     metrics::page_request_count(&self.kind, metrics::PageRequestType::Download);
 
                     let start = u64::from(page_id) * PAGE_SIZE;
-                    let end = self
-                        .object_size
-                        .map_or(start + PAGE_SIZE, |size| size.min(start + PAGE_SIZE));
+                    let end = (start + PAGE_SIZE).min(self.object_size.unwrap_or(u64::MAX));
                     let out = self
                         .downloader
                         .download(
@@ -326,12 +324,10 @@ impl PageGetExecutor {
                 }
             })
             .await
-            .map_err(|err| match err.downcast_ref::<ServiceError>() {
-                Some(ServiceError::Download(error)) => ServiceError::Download(error.clone()),
-                Some(&ServiceError::ObjectSizeInconsistency { prev, new }) => {
-                    ServiceError::ObjectSizeInconsistency { prev, new }
-                }
-                _ => ServiceError::Cache(err),
+            .map_err(|err| {
+                err.downcast_ref::<ServiceError>()
+                    .cloned()
+                    .unwrap_or(ServiceError::Cache(err))
             })?;
         let key = entry.key();
         metrics::page_request_count(&key.kind, metrics::PageRequestType::Success);
@@ -387,13 +383,13 @@ mod tests {
         types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
     };
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     struct MockS3State {
         expected_bucket: String,
         expected_key: String,
         object: Bytes,
-        request_count: Arc<AtomicUsize>,
-        requested_bytes: Arc<AtomicU64>,
+        request_count: AtomicUsize,
+        requested_bytes: AtomicU64,
         response_delay: Duration,
     }
 
@@ -436,25 +432,18 @@ mod tests {
         key: &ObjectKey,
         object: Bytes,
         response_delay: Duration,
-    ) -> (
-        String,
-        Arc<AtomicUsize>,
-        Arc<AtomicU64>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let requested_bytes = Arc::new(AtomicU64::new(0));
+    ) -> (String, Arc<MockS3State>, tokio::task::JoinHandle<()>) {
         let state = Arc::new(MockS3State {
             expected_bucket: bucket.to_string(),
             expected_key: key.to_string(),
             object,
-            request_count: Arc::clone(&request_count),
-            requested_bytes: Arc::clone(&requested_bytes),
+            request_count: AtomicUsize::new(0),
+            requested_bytes: AtomicU64::new(0),
             response_delay,
         });
         let app = Router::new()
             .route("/{bucket}/{*key}", get(mock_get_object))
-            .with_state(state);
+            .with_state(Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock server");
@@ -462,7 +451,24 @@ mod tests {
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve mock s3");
         });
-        (endpoint, request_count, requested_bytes, handle)
+        (endpoint, state, handle)
+    }
+
+    async fn service(endpoint: &str, memory_size: ByteSize) -> CacheyService {
+        CacheyService::new(
+            ServiceConfig {
+                cache: CacheConfig {
+                    memory_size,
+                    disk_cache: None,
+                    metrics_registry: None,
+                },
+                download_limits: DownloadLimits::default(),
+            },
+            mock_s3_client(endpoint),
+            axum_server::Handle::new(),
+        )
+        .await
+        .expect("service")
     }
 
     fn mock_s3_client(endpoint: &str) -> aws_sdk_s3::Client {
@@ -522,20 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_address_space_records_all_pages() {
-        let service = CacheyService::new(
-            ServiceConfig {
-                cache: CacheConfig {
-                    memory_size: ByteSize::mib(16),
-                    disk_cache: None,
-                    metrics_registry: None,
-                },
-                download_limits: DownloadLimits::default(),
-            },
-            mock_s3_client("http://unused.invalid"),
-            axum_server::Handle::new(),
-        )
-        .await
-        .unwrap();
+        let service = service("http://unused.invalid", ByteSize::mib(16)).await;
 
         drop(service.get(
             ObjectKind::new("full-address-space").unwrap(),
@@ -561,22 +554,9 @@ mod tests {
         let bucket = BucketName::new("bucket").unwrap();
         let buckets = BucketNameSet::from(bucket.clone());
         let data = Bytes::from(vec![7; 2 * PAGE_SIZE as usize]);
-        let (endpoint, _, _, server_handle) =
+        let (endpoint, _, server_handle) =
             spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
-        let service = CacheyService::new(
-            ServiceConfig {
-                cache: CacheConfig {
-                    memory_size: ByteSize::mib(64),
-                    disk_cache: None,
-                    metrics_registry: None,
-                },
-                download_limits: DownloadLimits::default(),
-            },
-            mock_s3_client(&endpoint),
-            axum_server::Handle::new(),
-        )
-        .await
-        .expect("service");
+        let service = service(&endpoint, ByteSize::mib(64)).await;
         service.cache.insert(
             CacheKey {
                 kind: kind.clone(),
@@ -635,22 +615,9 @@ mod tests {
         let object = ObjectKey::new("object").unwrap();
         let bucket = BucketName::new("bucket").unwrap();
         let data = Bytes::from(vec![7; 4096]);
-        let (endpoint, request_count, requested_bytes, server_handle) =
+        let (endpoint, mock, server_handle) =
             spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
-        let service = CacheyService::new(
-            ServiceConfig {
-                cache: CacheConfig {
-                    memory_size: ByteSize::mib(16),
-                    disk_cache: None,
-                    metrics_registry: None,
-                },
-                download_limits: DownloadLimits::default(),
-            },
-            mock_s3_client(&endpoint),
-            axum_server::Handle::new(),
-        )
-        .await
-        .expect("service");
+        let service = service(&endpoint, ByteSize::mib(16)).await;
         let read = |range, object_size| {
             service
                 .clone()
@@ -667,8 +634,8 @@ mod tests {
         };
         let downloads = || {
             (
-                request_count.load(Ordering::Relaxed),
-                requested_bytes.load(Ordering::Relaxed),
+                mock.request_count.load(Ordering::Relaxed),
+                mock.requested_bytes.load(Ordering::Relaxed),
             )
         };
 
@@ -713,27 +680,14 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let (endpoint, request_count, _, server_handle) = spawn_mock_s3_server(
+        let (endpoint, mock, server_handle) = spawn_mock_s3_server(
             &bucket,
             &object,
             object_data.clone(),
             Duration::from_millis(50),
         )
         .await;
-        let service = CacheyService::new(
-            ServiceConfig {
-                cache: CacheConfig {
-                    memory_size: ByteSize::mib(16),
-                    disk_cache: None,
-                    metrics_registry: None,
-                },
-                download_limits: DownloadLimits::default(),
-            },
-            mock_s3_client(&endpoint),
-            axum_server::Handle::new(),
-        )
-        .await
-        .expect("service");
+        let service = service(&endpoint, ByteSize::mib(16)).await;
 
         let read = |range| {
             service
@@ -752,7 +706,7 @@ mod tests {
         let ranges = [10..100, 50..200];
         let (left, right) = tokio::join!(read(ranges[0].clone()), read(ranges[1].clone()));
 
-        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        assert_eq!(mock.request_count.load(Ordering::Relaxed), 1);
         for (range, chunks) in ranges.into_iter().zip([left, right]) {
             let chunks = chunks.expect("read");
             assert_eq!(chunks.len(), 1);

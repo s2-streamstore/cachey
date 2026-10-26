@@ -43,7 +43,7 @@ reservations are independent of response size.
 
 Seeds control faults, jitter, and recovery probes. SDK retries use deterministic
 backoff. By default, histograms keep every observation until it ages out.
-Sampling uses a fixed hash key under test, so production-sampling runs repeat too.
+Production sampling is unseeded, so repeat runs when comparing small differences.
 
 ## Fixtures
 

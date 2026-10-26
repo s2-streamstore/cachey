@@ -12,7 +12,7 @@ use parking_lot::{Mutex, MutexGuard};
 use tokio::{sync::SetOnce, time::Instant};
 
 pub use self::model::LatencyEstimate;
-use self::model::{Refit, SizeHistogram, SizeModel};
+use self::model::{Median, Refit, SizeHistogram, SizeModel};
 use crate::{
     object_store::DownloadLimits,
     types::{BucketName, BucketNameSet},
@@ -296,14 +296,19 @@ impl BucketStats {
     /// Successes at sizes the request model predicts move the routing factor, and every
     /// success eases the excess. The first measurement and recovery probes replace both.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
-        let model = self.estimates.request.model();
-        let ratio = model
-            .median(sample.requested_bytes)
-            .map(|median| sample.latency().as_secs_f64() / median.as_secs_f64());
-        if ratio.is_some() {
-            self.routing_bytes = Some(sample.requested_bytes);
-        }
-        if probe || !model.is_measured() {
+        let median = self
+            .estimates
+            .request
+            .model()
+            .median(sample.requested_bytes);
+        let ratio = match median {
+            Some(Median::Predicted(median)) => {
+                self.routing_bytes = Some(sample.requested_bytes);
+                Some(sample.latency().div_duration_f64(median))
+            }
+            _ => None,
+        };
+        if probe || median.is_none() {
             self.routing_factor = ratio.unwrap_or(1.0);
             self.routing_excess = 0.0;
             self.unmeasured_latency = Duration::ZERO;
@@ -328,12 +333,11 @@ impl BucketStats {
     /// Keeps routing latency where the factor was measured continuous across a refit, so
     /// the median does not count a shift the factor already tracks.
     fn rescale_routing(&mut self, before: SizeModel) {
-        let Some(bytes) = self.routing_bytes else {
-            return;
-        };
-        let after = self.estimates.request.model();
-        if let (Some(old), Some(new)) = (before.median(bytes), after.median(bytes)) {
-            self.routing_factor *= old.as_secs_f64() / new.as_secs_f64();
+        if let Some(bytes) = self.routing_bytes
+            && let Some(Median::Predicted(old)) = before.median(bytes)
+            && let Some(Median::Predicted(new)) = self.estimates.request.model().median(bytes)
+        {
+            self.routing_factor *= old.div_duration_f64(new);
         }
     }
 
@@ -374,16 +378,14 @@ impl BucketStats {
     /// it. Relative to the scaled median, the rise carries over to other sizes. A measured
     /// bucket's copy of a size its model cannot predict is not judged.
     fn raise_routing_latency(&mut self, now: Instant, elapsed: Duration, requested_bytes: u64) {
-        let model = self.estimates.request.model();
-        match model.median(requested_bytes) {
-            Some(median) => {
+        match self.estimates.request.model().median(requested_bytes) {
+            Some(Median::Predicted(median)) => {
                 let excess = self.routing_excess(now);
-                let outlasted =
-                    elapsed.as_secs_f64() / median.mul_f64(self.routing_factor).as_secs_f64() - 1.0;
+                let outlasted = elapsed.div_duration_f64(median) / self.routing_factor - 1.0;
                 self.routing_excess = excess + (outlasted - excess).max(0.0) * LATENCY_ALPHA;
                 self.routing_updated_at = now;
             }
-            None if model.is_measured() => {}
+            Some(Median::AtLeast(_)) => {}
             None => {
                 self.unmeasured_latency += elapsed
                     .saturating_sub(self.unmeasured_latency)
@@ -790,19 +792,19 @@ impl BucketedStats {
                     let mut stats = state.lock();
                     refit(&mut stats, now, Some(index) == oldest);
                     let model = stats.estimates.model();
-                    let median = model.request.median_bounded(requested_bytes);
-                    let current = stats.routing_latency(now, median);
+                    let median = model.request.median(requested_bytes);
+                    let current = stats.routing_latency(now, median.map(Median::value));
                     if index == 0 {
                         preferred_latency = current;
                     }
                     let mut latency = stats.stalled_latency(now, current);
-                    if index > 0 && model.request.median(requested_bytes).is_none() {
+                    if index > 0 && !matches!(median, Some(Median::Predicted(_))) {
                         latency = latency.max(preferred_latency);
                     }
                     BucketSnapshot {
                         stats: state.clone(),
                         model,
-                        median,
+                        median: median.map(Median::value),
                         tail: model.request.tail(requested_bytes),
                         latency: locality_adjusted(latency, index),
                         deprioritized: stats.deprioritized,
@@ -938,6 +940,12 @@ mod tests {
 
     fn best(stats: &BucketedStats, buckets: &BucketNameSet, remaining: Duration) -> Option<usize> {
         snapshot(stats, buckets).best(|_| true, remaining)
+    }
+
+    fn best_at(stats: &BucketedStats, buckets: &BucketNameSet, bytes: u64) -> Option<usize> {
+        stats
+            .snapshot(buckets, bytes)
+            .best(|_| true, Duration::from_secs(10))
     }
 
     #[tokio::test(start_paused = true)]
@@ -1144,12 +1152,7 @@ mod tests {
         for bucket in buckets.iter().skip(1) {
             stats.seed(bucket, Sample::from_millis(19, 4096, 1));
         }
-        assert_eq!(
-            stats
-                .snapshot(&buckets, 4096)
-                .best(|_| true, Duration::from_secs(1)),
-            Some(0)
-        );
+        assert_eq!(best_at(&stats, &buckets, 4096), Some(0));
     }
 
     /// Copies of a size beyond a bucket's history neither slow its routing at known sizes
@@ -1158,28 +1161,23 @@ mod tests {
     async fn sizes_a_bucket_cannot_predict_do_not_steer_routing() {
         let stats = BucketedStats::default();
         let buckets = buckets();
-        let best_at = |bytes| {
-            stats
-                .snapshot(&buckets, bytes)
-                .best(|_| true, Duration::from_secs(1))
-        };
         for _ in 0..20 {
             stats.seed(&buckets[0], Sample::from_millis(5, 4096, 0));
             stats.seed(&buckets[1], Sample::from_millis(19, 4096, 0));
         }
-        assert_eq!(best_at(4096), Some(0));
+        assert_eq!(best_at(&stats, &buckets, 4096), Some(0));
         let timeline = RequestTimeline::default();
         let canceled = begin_sized(&stats, &buckets[0], None, &timeline, 8 * MIB);
         advance(Duration::from_millis(300)).await;
         drop(canceled);
-        assert_eq!(best_at(4096), Some(0));
+        assert_eq!(best_at(&stats, &buckets, 4096), Some(0));
         for _ in 0..6 {
             stats.seed(&buckets[0], Sample::from_millis(5, 8 * MIB, 95));
         }
-        assert_eq!(best_at(4096), Some(0));
+        assert_eq!(best_at(&stats, &buckets, 4096), Some(0));
         advance(LATENCY_SNAPSHOT_INTERVAL).await;
         stats.model(&buckets[0]);
-        assert_eq!(best_at(8 * MIB), Some(0));
+        assert_eq!(best_at(&stats, &buckets, 8 * MIB), Some(0));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1190,12 +1188,7 @@ mod tests {
             stats.seed(&buckets[0], Sample::from_millis(300, 4096, 0));
             stats.seed(&buckets[1], Sample::from_millis(10, 8 * MIB, 50));
         }
-        assert_eq!(
-            stats
-                .snapshot(&buckets, 8 * MIB)
-                .best(|_| true, Duration::from_secs(10)),
-            Some(1)
-        );
+        assert_eq!(best_at(&stats, &buckets, 8 * MIB), Some(1));
     }
 
     /// Once the median catches up to a shift, the routing factor no longer counts it.
@@ -1229,17 +1222,12 @@ mod tests {
         for bucket in buckets.iter().skip(1) {
             stats.seed(bucket, Sample::from_millis(15, 4096, 0));
         }
-        let small = || {
-            stats
-                .snapshot(&buckets, 4096)
-                .best(|_| true, Duration::from_secs(1))
-        };
-        assert_eq!(small(), Some(0));
+        assert_eq!(best_at(&stats, &buckets, 4096), Some(0));
         let timeline = RequestTimeline::default();
         let canceled = begin_sized(&stats, &buckets[0], None, &timeline, 16 * MIB);
         advance(Duration::from_millis(600)).await;
         drop(canceled);
-        assert_eq!(small(), Some(0));
+        assert_eq!(best_at(&stats, &buckets, 4096), Some(0));
     }
 
     /// A first bucket last measured as slow is still probed once stale, or it could never

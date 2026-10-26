@@ -1,12 +1,9 @@
-#[cfg(not(test))]
-use std::hash::RandomState as Seeds;
-use std::{collections::BTreeMap, hash::BuildHasher};
+use std::{
+    collections::BTreeMap,
+    hash::{BuildHasher, RandomState},
+};
 
 use super::LATENCY_DECAY;
-
-/// A fixed key, so simulations repeat exactly.
-#[cfg(test)]
-type Seeds = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
 
 /// Samples older than this weigh under 0.4% of a new one.
 const PRUNE_HALF_LIVES: f64 = 8.0;
@@ -26,7 +23,7 @@ pub(super) struct Reservoir<T> {
     capacity: usize,
     count: u64,
     pruned: u64,
-    random: Seeds,
+    random: RandomState,
     discarded_priority: Option<u64>,
 }
 
@@ -37,7 +34,7 @@ impl<T: Copy> Reservoir<T> {
             capacity,
             count: 0,
             pruned: 0,
-            random: Seeds::default(),
+            random: RandomState::new(),
             discarded_priority: None,
         }
     }

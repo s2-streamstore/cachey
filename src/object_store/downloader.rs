@@ -64,16 +64,22 @@ pub enum DownloadError {
 }
 
 impl DownloadError {
+    /// No copy could be admitted, so the read ends at once.
+    fn ends_read(&self) -> bool {
+        matches!(self, Self::AdmissionExhausted { .. })
+    }
+
+    /// Every bucket's copies wait in the same admission queue, so admission failures do
+    /// not fall back.
     fn should_attempt_fallback_bucket(&self) -> bool {
         match self {
-            Self::AdmissionExhausted { .. } => false,
+            Self::AdmissionTimeout | Self::AdmissionExhausted { .. } => false,
             Self::InvalidObjectState(_)
             | Self::NoSuchKey
             | Self::RangeNotSatisfied { .. }
             | Self::InvalidResponse(_)
             | Self::BodyStreaming(_)
             | Self::Overloaded(_)
-            | Self::AdmissionTimeout
             | Self::Timeout { .. }
             | Self::Unknown(_) => true,
         }
