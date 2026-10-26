@@ -334,13 +334,20 @@ impl BucketStats {
     }
 
     /// Keeps routing latency where the factor was measured continuous across a refit, so
-    /// the median does not count a shift the factor already tracks.
+    /// the median does not count a shift the factor already tracks. A refit explains at
+    /// most the factor's whole deviation, so a factor that had only partly tracked the
+    /// median's move settles at 1 rather than past it.
     fn rescale_routing(&mut self, before: SizeModel) {
         if let Some(bytes) = self.routing_bytes
             && let Some(Median::Predicted(old)) = before.median(bytes)
             && let Some(Median::Predicted(new)) = self.estimates.request.model().median(bytes)
         {
-            self.routing_factor *= old.div_duration_f64(new);
+            let rescaled = self.routing_factor * old.div_duration_f64(new);
+            self.routing_factor = if (rescaled - 1.0) * (self.routing_factor - 1.0) > 0.0 {
+                rescaled
+            } else {
+                1.0
+            };
         }
     }
 
@@ -1216,6 +1223,24 @@ mod tests {
         }
         stats.model(&buckets[0]);
         assert_eq!(best(&stats, &buckets, Duration::from_secs(1)), Some(0));
+    }
+
+    /// A refit that learns how size affects latency explains the factor's deviation rather
+    /// than inflating it to keep a stale prediction.
+    #[tokio::test(start_paused = true)]
+    async fn a_refit_learning_size_does_not_inflate_the_factor() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        stats.seed(&buckets[0], Sample::from_millis(200, 16 * MIB, 0));
+        best_at(&stats, &buckets, 4096);
+        stats.seed(&buckets[0], Sample::from_millis(5, 4096, 0));
+        advance(LATENCY_SNAPSHOT_INTERVAL).await;
+        let routing = stats.snapshot(&buckets, 4096, DownloadLimits::default());
+        assert!(
+            routing.buckets[0].latency < Duration::from_millis(20),
+            "{:?}",
+            routing.buckets[0].latency
+        );
     }
 
     /// A canceled copy raises routing latency in proportion at other sizes, rather than by

@@ -208,6 +208,8 @@ impl CacheyService {
                 .buffered(concurrency.get())
                 .map(move |result| {
                     let (page_id, value) = result?;
+                    // A range past the object's end is unsatisfiable whatever size was expected.
+                    let (data, range) = slice_page_data(page_id, &byterange, &value)?;
                     let expected_size = *expected_size.get_or_insert(value.object_size);
                     if value.object_size != expected_size {
                         return Err(ServiceError::ObjectSizeInconsistency {
@@ -215,7 +217,6 @@ impl CacheyService {
                             prev: expected_size,
                         });
                     }
-                    let (data, range) = slice_page_data(page_id, &byterange, &value)?;
                     self.egress_throughput.lock().record(data.len());
                     Ok(Chunk {
                         bucket: value.bucket,
@@ -610,8 +611,9 @@ mod tests {
         server_handle.abort();
     }
 
-    /// A size its bucket disagrees with fails the read without shortening the cached page,
-    /// and a range past a known size fails without a download.
+    /// A size its bucket disagrees with fails the read without shortening the cached page.
+    /// A range past a known size fails without a download, and one past the actual end is
+    /// unsatisfiable whatever size was passed.
     #[tokio::test]
     async fn object_size_must_match_the_bucket_but_never_shortens_a_page() {
         let kind = ObjectKind::new("object-size").unwrap();
@@ -653,13 +655,15 @@ mod tests {
                 new: 4096
             })
         ));
-        assert!(matches!(
-            read(4096..4196, 4096).await,
-            Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
-                object_size: Some(4096),
-                ..
-            }))
-        ));
+        for object_size in [4096, 8192] {
+            assert!(matches!(
+                read(4096..4196, object_size).await,
+                Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
+                    object_size: Some(4096),
+                    ..
+                }))
+            ));
+        }
         assert_eq!(request_count.load(Ordering::Relaxed), 1);
         server_handle.abort();
     }
