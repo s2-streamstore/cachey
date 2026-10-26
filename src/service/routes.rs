@@ -31,6 +31,7 @@ use crate::{
 const CONTENT_TYPE: &str = "application/octet-stream";
 static C0_BUCKET_HEADER: HeaderName = HeaderName::from_static("c0-bucket");
 static C0_CONFIG_HEADER: HeaderName = HeaderName::from_static("c0-config");
+static C0_OBJECT_SIZE_HEADER: HeaderName = HeaderName::from_static("c0-object-size");
 
 fn on_chunk_error(
     kind: &ObjectKind,
@@ -204,6 +205,31 @@ where
     }
 }
 
+#[derive(Debug)]
+pub struct ObjectSizeHeader(pub Option<u64>);
+
+impl<S> FromRequestParts<S> for ObjectSizeHeader
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .headers
+            .get(&C0_OBJECT_SIZE_HEADER)
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or((StatusCode::BAD_REQUEST, "Invalid C0-Object-Size header"))
+            })
+            .transpose()
+            .map(Self)
+    }
+}
+
 #[instrument(skip(service))]
 #[allow(clippy::too_many_lines)]
 pub async fn fetch(
@@ -211,6 +237,7 @@ pub async fn fetch(
     Path((kind, object)): Path<(ObjectKind, ObjectKey)>,
     method: axum::http::Method,
     RangeHeader(byterange): RangeHeader,
+    ObjectSizeHeader(object_size): ObjectSizeHeader,
     BucketHeaders(buckets): BucketHeaders,
     req_config: RequestConfig,
 ) -> Response {
@@ -239,6 +266,7 @@ pub async fn fetch(
                 object,
                 buckets,
                 byterange.clone(),
+                object_size,
                 concurrency,
                 req_config,
             )

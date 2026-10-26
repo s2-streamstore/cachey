@@ -31,10 +31,16 @@ HEAD|GET /fetch/{kind}/{object}
 | `Range` | yes | Byte range in format `bytes={first}-{last}` |
 | `C0-Bucket` | no | Bucket(s) containing the object |
 | `C0-Config` | no | Override S3 request config |
+| `C0-Object-Size` | no | Size of the object in bytes |
 
 `C0-Bucket` behavior:
 - Multiple headers specify redundant buckets, with the preferred bucket first
 - If omitted, `kind` is used as the singular bucket name
+
+`C0-Object-Size` behavior:
+- Downloads stop at the object's end, so a page of a small object is read, admitted, and timed at its own size
+- A range starting at or past the size returns 416 without contacting a bucket
+- A bucket reporting a different size returns 409, and nothing it returned is cached
 
 See [replica reads](docs/replica-reads.md) for selection, fallback, hedging, and download limits.
 
