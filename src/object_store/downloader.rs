@@ -1102,6 +1102,22 @@ mod tests {
         assert_eq!(read(Some(4)).await.unwrap().piece.data.len(), 4);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn an_understated_object_size_is_measured_at_the_returned_length() {
+        let (downloader, _) = scripted_downloader([("local", 1, 0, false)]);
+        fetch_range(
+            &downloader,
+            &["local"],
+            0..16 * MIB,
+            Some(2),
+            &RequestConfig::default(),
+        )
+        .await
+        .unwrap();
+        let request = model(&downloader, "local").request.estimate().unwrap();
+        assert_eq!(request.largest_bytes, 4);
+    }
+
     /// Once headers announce a small object, a page read is overdue by the standard of
     /// small objects rather than of the large pages that dominate its request tail.
     #[tokio::test(start_paused = true)]

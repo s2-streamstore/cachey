@@ -334,20 +334,16 @@ impl BucketStats {
     }
 
     /// Keeps routing latency where the factor was measured continuous across a refit, so
-    /// the median does not count a shift the factor already tracks. A refit explains at
-    /// most the factor's whole deviation, so a factor that had only partly tracked the
-    /// median's move settles at 1 rather than past it.
+    /// the median does not count a shift the factor already tracks. A refit can only
+    /// explain the factor's deviation, so the factor moves toward 1 and never past it.
     fn rescale_routing(&mut self, before: SizeModel) {
         if let Some(bytes) = self.routing_bytes
             && let Some(Median::Predicted(old)) = before.median(bytes)
             && let Some(Median::Predicted(new)) = self.estimates.request.model().median(bytes)
         {
-            let rescaled = self.routing_factor * old.div_duration_f64(new);
-            self.routing_factor = if (rescaled - 1.0) * (self.routing_factor - 1.0) > 0.0 {
-                rescaled
-            } else {
-                1.0
-            };
+            let factor = self.routing_factor;
+            self.routing_factor =
+                (factor * old.div_duration_f64(new)).clamp(factor.min(1.0), factor.max(1.0));
         }
     }
 
@@ -529,9 +525,13 @@ impl Drop for BucketObservation<'_> {
         stats.active -= 1;
         stats.untrack(self.timed);
         let probe = self.probe.is_some();
+        // A response longer than expected shows the request was at least that large.
+        let requested_bytes = self
+            .requested_bytes
+            .max(self.timeline.announced_body_bytes().unwrap_or(0));
         match self.outcome {
             Some(Outcome::Success) => {
-                if let Some(sample) = self.timeline.sample(self.requested_bytes) {
+                if let Some(sample) = self.timeline.sample(requested_bytes) {
                     stats.record(now, &sample, probe);
                 }
                 stats.succeed(now, self.generation, probe);
@@ -542,16 +542,14 @@ impl Drop for BucketObservation<'_> {
                     stats
                         .estimates
                         .first_byte
-                        .update(now, self.requested_bytes, first_byte);
+                        .update(now, requested_bytes, first_byte);
                 }
             }
         }
         match self.outcome {
-            None => stats.raise_routing_latency(
-                now,
-                now.duration_since(self.started),
-                self.requested_bytes,
-            ),
+            None => {
+                stats.raise_routing_latency(now, now.duration_since(self.started), requested_bytes);
+            }
             Some(Outcome::Failure) => stats.fail(now, false),
             Some(Outcome::Overload) => stats.fail(now, true),
             Some(Outcome::Success | Outcome::Neutral) => {}
@@ -1229,18 +1227,23 @@ mod tests {
     /// than inflating it to keep a stale prediction.
     #[tokio::test(start_paused = true)]
     async fn a_refit_learning_size_does_not_inflate_the_factor() {
-        let stats = BucketedStats::default();
-        let buckets = buckets();
-        stats.seed(&buckets[0], Sample::from_millis(200, 16 * MIB, 0));
-        best_at(&stats, &buckets, 4096);
-        stats.seed(&buckets[0], Sample::from_millis(5, 4096, 0));
-        advance(LATENCY_SNAPSHOT_INTERVAL).await;
-        let routing = stats.snapshot(&buckets, 4096, DownloadLimits::default());
-        assert!(
-            routing.buckets[0].latency < Duration::from_millis(20),
-            "{:?}",
-            routing.buckets[0].latency
-        );
+        for slow_large_reads in [0, 3] {
+            let stats = BucketedStats::default();
+            let buckets = buckets();
+            stats.seed(&buckets[0], Sample::from_millis(200, 16 * MIB, 0));
+            best_at(&stats, &buckets, 4096);
+            for _ in 0..slow_large_reads {
+                stats.seed(&buckets[0], Sample::from_millis(400, 16 * MIB, 0));
+            }
+            stats.seed(&buckets[0], Sample::from_millis(5, 4096, 0));
+            advance(LATENCY_SNAPSHOT_INTERVAL).await;
+            let routing = stats.snapshot(&buckets, 4096, DownloadLimits::default());
+            assert!(
+                routing.buckets[0].latency < Duration::from_millis(20),
+                "{slow_large_reads}: {:?}",
+                routing.buckets[0].latency
+            );
+        }
     }
 
     /// A canceled copy raises routing latency in proportion at other sizes, rather than by
