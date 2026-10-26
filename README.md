@@ -39,6 +39,7 @@ HEAD|GET /fetch/{kind}/{object}
 
 `C0-Object-Size` behavior:
 - A page of a small object is admitted and timed at its own size, though the whole page is still requested
+- Admission trusts the size, so one that understates the object lets a read hold more than it reserved
 - A range starting at or past the size returns 416 without contacting a bucket
 - A bucket reporting a different size returns 409, or 416 for a range past the object's actual end; other readers of the page are unaffected
 

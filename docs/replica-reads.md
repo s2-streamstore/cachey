@@ -117,8 +117,9 @@ budget still permits fallback and deadline rescue.
 | `--hedge-budget-percent` | 5% |
 
 Server reads reserve the bytes they expect: 16 MiB per page, or what remains of an
-object of known size. By default, 64 full pages fit. This limit is separate from
-cache capacity and total process memory.
+object of known size. Admission trusts that size, so a page whose size is understated
+can hold up to the rest of the page beyond its reservation. By default, 64 full pages
+fit. This limit is separate from cache capacity and total process memory.
 
 Copies other than early hedges and body retries wait for admission while they can
 still finish by the deadline. A queue that formed within the last 100 ms is
