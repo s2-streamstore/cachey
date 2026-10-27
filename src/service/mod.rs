@@ -286,13 +286,16 @@ struct PageGetExecutor {
 }
 
 impl PageGetExecutor {
+    fn count(&self, typ: PageRequestType) {
+        metrics::page_request_count(&self.request.kind, self.request.exact, typ);
+    }
+
     async fn execute(
         self: Arc<Self>,
         span: Span,
         cache: foyer::HybridCache<CacheKey, CacheValue>,
     ) -> Result<(Span, CacheValue), ServiceError> {
-        let exact = self.request.exact;
-        metrics::page_request_count(&self.request.kind, exact, metrics::PageRequestType::Access);
+        self.count(PageRequestType::Access);
 
         let cache_key = CacheKey {
             kind: self.request.kind.clone(),
@@ -303,49 +306,34 @@ impl PageGetExecutor {
         let fetched_by_current_request = Arc::new(AtomicBool::new(false));
         let entry = cache
             .get_or_fetch(&cache_key, {
+                let executor = Arc::clone(&self);
                 let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
                 move || async move {
                     fetched_by_current_request.store(true, Ordering::Relaxed);
-                    metrics::page_request_count(
-                        &self.request.kind,
-                        exact,
-                        metrics::PageRequestType::Download,
-                    );
+                    executor.count(PageRequestType::Download);
 
-                    let out = self
+                    let out = executor
                         .downloader
                         .download(
-                            &self.request.buckets,
-                            self.request.object.clone(),
+                            &executor.request.buckets,
+                            executor.request.object.clone(),
                             &download_range,
-                            self.request.object_size,
-                            &self.request.config,
+                            executor.request.object_size,
+                            &executor.request.config,
                         )
                         .await?;
-                    metrics::page_download_latency(&self.request.kind, out.latency);
+                    metrics::page_download_latency(&executor.request.kind, out.latency);
                     if out.hedged {
-                        metrics::page_request_count(
-                            &self.request.kind,
-                            exact,
-                            metrics::PageRequestType::Hedged,
-                        );
+                        executor.count(PageRequestType::Hedged);
                     }
                     if out.primary_bucket_idx == 0 {
-                        metrics::page_request_count(
-                            &self.request.kind,
-                            exact,
-                            metrics::PageRequestType::ClientPref,
-                        );
+                        executor.count(PageRequestType::ClientPref);
                     }
                     if out.used_bucket_idx != out.primary_bucket_idx {
-                        metrics::page_request_count(
-                            &self.request.kind,
-                            exact,
-                            metrics::PageRequestType::Fallback,
-                        );
+                        executor.count(PageRequestType::Fallback);
                     }
                     Ok::<_, ServiceError>(CacheValue {
-                        bucket: self.request.buckets[out.used_bucket_idx].clone(),
+                        bucket: executor.request.buckets[out.used_bucket_idx].clone(),
                         mtime: out.piece.mtime,
                         data: out.piece.data,
                         object_size: out.piece.object_size,
@@ -359,35 +347,22 @@ impl PageGetExecutor {
                     .cloned()
                     .unwrap_or(ServiceError::Cache(err))
             })?;
-        let key = entry.key();
-        metrics::page_request_count(&key.kind, exact, metrics::PageRequestType::Success);
+        self.count(PageRequestType::Success);
 
         let mut value = entry.value().clone();
         match entry.source() {
             Source::Memory => {
-                metrics::page_request_count(&key.kind, exact, metrics::PageRequestType::CacheHit);
-                metrics::page_request_count(
-                    &key.kind,
-                    exact,
-                    metrics::PageRequestType::CacheHitMemory,
-                );
+                self.count(PageRequestType::CacheHit);
+                self.count(PageRequestType::CacheHitMemory);
             }
             Source::Disk => {
-                metrics::page_request_count(&key.kind, exact, metrics::PageRequestType::CacheHit);
-                metrics::page_request_count(
-                    &key.kind,
-                    exact,
-                    metrics::PageRequestType::CacheHitDisk,
-                );
+                self.count(PageRequestType::CacheHit);
+                self.count(PageRequestType::CacheHitDisk);
             }
             Source::Outer => {
                 value.cached_at = 0;
                 if !fetched_by_current_request.load(Ordering::Relaxed) {
-                    metrics::page_request_count(
-                        &key.kind,
-                        exact,
-                        metrics::PageRequestType::Coalesced,
-                    );
+                    self.count(PageRequestType::Coalesced);
                 }
             }
         }

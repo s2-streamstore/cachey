@@ -593,8 +593,7 @@ mod tests {
             span in prop_oneof![
                 (0u16..=u16::MAX).prop_map(Span::Page),
                 (0u64..u64::MAX, 1u64..=u64::MAX)
-                    .prop_map(|(start, len)| Span::Exact(start..start.saturating_add(len)))
-                    .prop_filter("non-empty", |span| !matches!(span, Span::Exact(range) if range.is_empty())),
+                    .prop_map(|(start, len)| Span::Exact(start..start.saturating_add(len))),
             ]
         ) {
             let key = CacheKey {
