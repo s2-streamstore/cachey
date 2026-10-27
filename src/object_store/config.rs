@@ -11,8 +11,8 @@ pub struct DownloadLimits {
     pub download_timeout: Duration,
     /// Hedge credits earned per successful download, as a percentage (0–100).
     pub hedge_budget_percent: u8,
-    /// Request-count guard for arbitrary ranges; fixed-size server pages are normally
-    /// memory-limited.
+    /// Request-count guard for arbitrary ranges; server reads, at most a page each, are
+    /// normally memory-limited.
     pub max_inflight_requests: u32,
     /// Requested body bytes reserved by active backend requests, separate from the cache.
     pub max_inflight_bytes: u64,

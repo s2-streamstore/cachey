@@ -185,7 +185,8 @@ impl ReplicaRequest<'_> {
             .or_else(|| self.finished_body_bytes.get().copied())
     }
 
-    /// Allow each unmeasured phase half of a bucket's share of the page, within its timeout.
+    /// Allow each unmeasured phase half of a bucket's share of the download timeout, within
+    /// its own timeout.
     fn unmeasured(&self) -> Duration {
         let limits = self.downloader.limits;
         limits
