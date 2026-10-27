@@ -37,6 +37,12 @@ pub struct Read {
     pub health: Vec<Health>,
 }
 
+impl Read {
+    pub fn latency_us(&self) -> u64 {
+        self.end_us - self.arrival_us
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[allow(clippy::struct_field_names)]
 pub struct Latency {
@@ -115,28 +121,42 @@ pub struct Report {
     wins_by_replica: Vec<usize>,
     pub recoveries: Vec<Recovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reads: Option<Vec<Read>>,
+    pub reads: Option<Vec<Read>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     copies: Option<Vec<Copy>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    transports: Option<Vec<Transport>>,
+    pub transports: Option<Vec<Transport>>,
+}
+
+/// What a simulated run recorded.
+pub struct Observations<'a> {
+    pub reads: Vec<Read>,
+    pub copies: Vec<Copy>,
+    pub peak_copies: usize,
+    pub peak_bytes: u64,
+    pub backend: &'a State,
+    pub last_read_us: u64,
+    pub histograms: Vec<(u64, usize)>,
 }
 
 impl Report {
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         scenario: Scenario,
         seed: u64,
         native: bool,
         trace: bool,
-        reads: Vec<Read>,
-        copies: Vec<Copy>,
-        peak_copies: usize,
-        peak_bytes: u64,
-        state: &State,
-        last_read_us: u64,
-        mut histograms: Vec<(u64, usize)>,
+        observed: Observations<'_>,
     ) -> Self {
+        let Observations {
+            reads,
+            copies,
+            peak_copies,
+            peak_bytes,
+            backend: state,
+            last_read_us,
+            mut histograms,
+        } = observed;
         let mut errors = BTreeMap::new();
         let mut wins = vec![0; scenario.replicas.len()];
         for read in &reads {
@@ -203,7 +223,7 @@ impl Report {
                         "short"
                     })
                     .or_default()
-                    .push(read.end_us - read.arrival_us);
+                    .push(read.latency_us());
             }
         }
         Self {
@@ -219,8 +239,7 @@ impl Report {
             completed_before_deadline: reads
                 .iter()
                 .filter(|read| {
-                    read.error.is_none()
-                        && read.end_us - read.arrival_us < scenario.page_timeout_ms * 1000
+                    read.error.is_none() && read.latency_us() < scenario.page_timeout_ms * 1000
                 })
                 .count(),
             errors,
@@ -234,19 +253,14 @@ impl Report {
                 reads
                     .iter()
                     .filter(|read| read.error.is_none())
-                    .map(|read| read.end_us - read.arrival_us)
+                    .map(Read::latency_us)
                     .collect(),
             ),
             success_latency_by_response: latency_by_response
                 .into_iter()
                 .map(|(response, latencies)| (response, Latency::new(latencies)))
                 .collect(),
-            all_arrival_latency: Latency::new(
-                reads
-                    .iter()
-                    .map(|read| read.end_us - read.arrival_us)
-                    .collect(),
-            ),
+            all_arrival_latency: Latency::new(reads.iter().map(Read::latency_us).collect()),
             copy_operations: copies.len(),
             transport_attempts: state.transports.len(),
             sdk_invocations: state

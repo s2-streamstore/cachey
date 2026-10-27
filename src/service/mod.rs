@@ -77,14 +77,27 @@ pub struct Chunk {
     pub cached_at: Option<NonZeroU32>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ServiceError {
     #[error("Cache error: {0}")]
     Cache(#[from] foyer::Error),
     #[error("Object store: {0}")]
     Download(#[from] DownloadError),
-    #[error("Object size was inconsistent across downloads: {new} != {prev}")]
+    #[error("Object size {new} is inconsistent with {prev}")]
     ObjectSizeInconsistency { prev: u64, new: u64 },
+}
+
+/// A read of a byte range of one object.
+#[derive(Debug, Clone)]
+pub struct FetchRequest {
+    pub kind: ObjectKind,
+    pub object: ObjectKey,
+    pub buckets: BucketNameSet,
+    pub byterange: Range<u64>,
+    /// When known, pages are admitted and timed at the bytes the object holds, and every
+    /// page must report this size.
+    pub object_size: Option<u64>,
+    pub config: RequestConfig,
 }
 
 #[derive(Clone)]
@@ -153,58 +166,68 @@ impl CacheyService {
         self.egress_throughput.lock().bps(lookback)
     }
 
+    /// Fetches up to `concurrency` pages at a time. A range starting at or past a known
+    /// object size fails without a download.
+    ///
     /// # Panics
     ///
     /// If `byterange.start >= byterange.end` or `byterange.end > MAX_RANGE_END`.
     pub fn get(
         self,
-        kind: ObjectKind,
-        object: ObjectKey,
-        buckets: BucketNameSet,
-        byterange: Range<u64>,
+        request: FetchRequest,
         concurrency: NonZeroUsize,
-        req_config: RequestConfig,
     ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
+        let byterange = request.byterange.clone();
         assert!(byterange.start < byterange.end);
         assert!(byterange.end <= MAX_RANGE_END);
 
-        let pagerange = pagerange(&byterange);
+        let end = byterange.end.min(request.object_size.unwrap_or(u64::MAX));
+        let pages = (byterange.start < end).then(|| pagerange(&(byterange.start..end)));
+        let past_end = pages.is_none().then(|| {
+            Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
+                requested: byterange.clone(),
+                object_size: request.object_size,
+            }))
+        });
 
-        metrics::fetch_request_bytes(&kind, byterange.end - byterange.start);
-        metrics::fetch_request_pages(&kind, pagerange.len());
+        metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
+        metrics::fetch_request_pages(
+            &request.kind,
+            pages.as_ref().map_or(0, ExactSizeIterator::len),
+        );
 
+        let mut expected_size = request.object_size;
         let executor = Arc::new(PageGetExecutor {
             downloader: self.downloader,
-            kind,
-            object,
-            buckets,
-            req_config,
+            request,
         });
-        let mut object_size = None;
 
-        futures::stream::iter(pagerange)
-            .map(move |page_id| executor.clone().execute(page_id, self.cache.clone()))
-            .buffered(concurrency.get())
-            .map(move |result| {
-                let (page_id, value) = result?;
-                let expected_size = *object_size.get_or_insert(value.object_size);
-                if value.object_size != expected_size {
-                    return Err(ServiceError::ObjectSizeInconsistency {
-                        new: value.object_size,
-                        prev: expected_size,
-                    });
-                }
-                let (data, range) = slice_page_data(page_id, &byterange, &value)?;
-                self.egress_throughput.lock().record(data.len());
-                Ok(Chunk {
-                    bucket: value.bucket,
-                    mtime: value.mtime,
-                    data,
-                    range,
-                    object_size: value.object_size,
-                    cached_at: NonZeroU32::new(value.cached_at),
-                })
-            })
+        futures::stream::iter(past_end).chain(
+            futures::stream::iter(pages.into_iter().flatten())
+                .map(move |page_id| executor.clone().execute(page_id, self.cache.clone()))
+                .buffered(concurrency.get())
+                .map(move |result| {
+                    let (page_id, value) = result?;
+                    // A range past the object's end is unsatisfiable whatever size was expected.
+                    let (data, range) = slice_page_data(page_id, &byterange, &value)?;
+                    let expected_size = *expected_size.get_or_insert(value.object_size);
+                    if value.object_size != expected_size {
+                        return Err(ServiceError::ObjectSizeInconsistency {
+                            new: value.object_size,
+                            prev: expected_size,
+                        });
+                    }
+                    self.egress_throughput.lock().record(data.len());
+                    Ok(Chunk {
+                        bucket: value.bucket,
+                        mtime: value.mtime,
+                        data,
+                        range,
+                        object_size: value.object_size,
+                        cached_at: NonZeroU32::new(value.cached_at),
+                    })
+                }),
+        )
     }
 
     pub fn into_router(self) -> axum::Router {
@@ -237,10 +260,7 @@ fn now() -> u32 {
 #[derive(Debug)]
 struct PageGetExecutor {
     downloader: Downloader,
-    kind: ObjectKind,
-    object: ObjectKey,
-    buckets: BucketNameSet,
-    req_config: RequestConfig,
+    request: FetchRequest,
 }
 
 impl PageGetExecutor {
@@ -249,11 +269,11 @@ impl PageGetExecutor {
         page_id: PageId,
         cache: foyer::HybridCache<CacheKey, CacheValue>,
     ) -> Result<(PageId, CacheValue), ServiceError> {
-        metrics::page_request_count(&self.kind, metrics::PageRequestType::Access);
+        metrics::page_request_count(&self.request.kind, metrics::PageRequestType::Access);
 
         let cache_key = CacheKey {
-            kind: self.kind.clone(),
-            object: self.object.clone(),
+            kind: self.request.kind.clone(),
+            object: self.request.object.clone(),
             page_id,
         };
         let fetched_by_current_request = Arc::new(AtomicBool::new(false));
@@ -262,34 +282,43 @@ impl PageGetExecutor {
                 let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
                 move || async move {
                     fetched_by_current_request.store(true, Ordering::Relaxed);
-                    metrics::page_request_count(&self.kind, metrics::PageRequestType::Download);
+                    metrics::page_request_count(
+                        &self.request.kind,
+                        metrics::PageRequestType::Download,
+                    );
 
                     let start = u64::from(page_id) * PAGE_SIZE;
-                    let end = start + PAGE_SIZE;
                     let out = self
                         .downloader
                         .download(
-                            &self.buckets,
-                            self.object.clone(),
-                            &(start..end),
-                            &self.req_config,
+                            &self.request.buckets,
+                            self.request.object.clone(),
+                            &(start..start + PAGE_SIZE),
+                            self.request.object_size,
+                            &self.request.config,
                         )
                         .await?;
-                    metrics::page_download_latency(&self.kind, out.latency);
+                    metrics::page_download_latency(&self.request.kind, out.latency);
                     if out.hedged {
-                        metrics::page_request_count(&self.kind, metrics::PageRequestType::Hedged);
+                        metrics::page_request_count(
+                            &self.request.kind,
+                            metrics::PageRequestType::Hedged,
+                        );
                     }
                     if out.primary_bucket_idx == 0 {
                         metrics::page_request_count(
-                            &self.kind,
+                            &self.request.kind,
                             metrics::PageRequestType::ClientPref,
                         );
                     }
                     if out.used_bucket_idx != out.primary_bucket_idx {
-                        metrics::page_request_count(&self.kind, metrics::PageRequestType::Fallback);
+                        metrics::page_request_count(
+                            &self.request.kind,
+                            metrics::PageRequestType::Fallback,
+                        );
                     }
-                    Ok::<_, DownloadError>(CacheValue {
-                        bucket: self.buckets[out.used_bucket_idx].clone(),
+                    Ok::<_, ServiceError>(CacheValue {
+                        bucket: self.request.buckets[out.used_bucket_idx].clone(),
                         mtime: out.piece.mtime,
                         data: out.piece.data,
                         object_size: out.piece.object_size,
@@ -298,9 +327,10 @@ impl PageGetExecutor {
                 }
             })
             .await
-            .map_err(|err| match err.downcast_ref::<DownloadError>() {
-                Some(download_err) => ServiceError::Download(download_err.clone()),
-                None => ServiceError::Cache(err),
+            .map_err(|err| {
+                err.downcast_ref::<ServiceError>()
+                    .cloned()
+                    .unwrap_or(ServiceError::Cache(err))
             })?;
         let key = entry.key();
         metrics::page_request_count(&key.kind, metrics::PageRequestType::Success);
@@ -349,10 +379,12 @@ mod tests {
     use bytesize::ByteSize;
     use futures::TryStreamExt;
 
-    use super::{CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange};
+    use super::{
+        CacheyService, FetchRequest, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange,
+    };
     use crate::{
         cache::{CacheConfig, CacheKey, CacheValue},
-        object_store::{DownloadLimits, RequestConfig},
+        object_store::{DownloadError, DownloadLimits, RequestConfig},
         types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
     };
 
@@ -422,6 +454,23 @@ mod tests {
         (endpoint, request_count, handle)
     }
 
+    async fn service(endpoint: &str, memory_size: ByteSize) -> CacheyService {
+        CacheyService::new(
+            ServiceConfig {
+                cache: CacheConfig {
+                    memory_size,
+                    disk_cache: None,
+                    metrics_registry: None,
+                },
+                download_limits: DownloadLimits::default(),
+            },
+            mock_s3_client(endpoint),
+            axum_server::Handle::new(),
+        )
+        .await
+        .expect("service")
+    }
+
     fn mock_s3_client(endpoint: &str) -> aws_sdk_s3::Client {
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
@@ -479,28 +528,18 @@ mod tests {
 
     #[tokio::test]
     async fn full_address_space_records_all_pages() {
-        let service = CacheyService::new(
-            ServiceConfig {
-                cache: CacheConfig {
-                    memory_size: ByteSize::mib(16),
-                    disk_cache: None,
-                    metrics_registry: None,
-                },
-                download_limits: DownloadLimits::default(),
-            },
-            mock_s3_client("http://unused.invalid"),
-            axum_server::Handle::new(),
-        )
-        .await
-        .unwrap();
+        let service = service("http://unused.invalid", ByteSize::mib(16)).await;
 
         drop(service.get(
-            ObjectKind::new("full-address-space").unwrap(),
-            ObjectKey::new("object").unwrap(),
-            BucketName::new("bucket").unwrap().into(),
-            0..1 << 40,
+            FetchRequest {
+                kind: ObjectKind::new("full-address-space").unwrap(),
+                object: ObjectKey::new("object").unwrap(),
+                buckets: BucketName::new("bucket").unwrap().into(),
+                byterange: 0..1 << 40,
+                object_size: None,
+                config: RequestConfig::default(),
+            },
             NonZeroUsize::MIN,
-            RequestConfig::default(),
         ));
         let snapshot = metrics::gather();
         assert!(
@@ -519,20 +558,7 @@ mod tests {
         let data = Bytes::from(vec![7; 2 * PAGE_SIZE as usize]);
         let (endpoint, _, server_handle) =
             spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
-        let service = CacheyService::new(
-            ServiceConfig {
-                cache: CacheConfig {
-                    memory_size: ByteSize::mib(64),
-                    disk_cache: None,
-                    metrics_registry: None,
-                },
-                download_limits: DownloadLimits::default(),
-            },
-            mock_s3_client(&endpoint),
-            axum_server::Handle::new(),
-        )
-        .await
-        .expect("service");
+        let service = service(&endpoint, ByteSize::mib(64)).await;
         service.cache.insert(
             CacheKey {
                 kind: kind.clone(),
@@ -549,12 +575,15 @@ mod tests {
         );
         let read = |range| {
             service.clone().get(
-                kind.clone(),
-                object.clone(),
-                buckets.clone(),
-                range,
+                FetchRequest {
+                    kind: kind.clone(),
+                    object: object.clone(),
+                    buckets: buckets.clone(),
+                    byterange: range,
+                    object_size: None,
+                    config: RequestConfig::default(),
+                },
                 const { NonZeroUsize::new(2).unwrap() },
-                RequestConfig::default(),
             )
         };
         let mut chunks = std::pin::pin!(read(0..PAGE_SIZE + 1));
@@ -582,6 +611,63 @@ mod tests {
         server_handle.abort();
     }
 
+    /// A size its bucket disagrees with fails the read without shortening the cached page.
+    /// A range past a known size fails without a download, and one past the actual end is
+    /// unsatisfiable whatever size was passed.
+    #[tokio::test]
+    async fn object_size_must_match_the_bucket_but_never_shortens_a_page() {
+        let kind = ObjectKind::new("object-size").unwrap();
+        let object = ObjectKey::new("object").unwrap();
+        let bucket = BucketName::new("bucket").unwrap();
+        let data = Bytes::from(vec![7; 4096]);
+        let (endpoint, request_count, server_handle) =
+            spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
+        let service = service(&endpoint, ByteSize::mib(16)).await;
+        let read = |range, object_size| {
+            service
+                .clone()
+                .get(
+                    FetchRequest {
+                        kind: kind.clone(),
+                        object: object.clone(),
+                        buckets: bucket.clone().into(),
+                        byterange: range,
+                        object_size: Some(object_size),
+                        config: RequestConfig::default(),
+                    },
+                    NonZeroUsize::MIN,
+                )
+                .try_collect::<Vec<_>>()
+        };
+        assert!(matches!(
+            read(100..200, 1024).await,
+            Err(ServiceError::ObjectSizeInconsistency {
+                prev: 1024,
+                new: 4096
+            })
+        ));
+        let chunks = read(2048..2148, 4096).await.unwrap();
+        assert_eq!(chunks[0].data, data.slice(2048..2148));
+        assert!(matches!(
+            read(100..200, 8192).await,
+            Err(ServiceError::ObjectSizeInconsistency {
+                prev: 8192,
+                new: 4096
+            })
+        ));
+        for object_size in [4096, 8192] {
+            assert!(matches!(
+                read(4096..4196, object_size).await,
+                Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
+                    object_size: Some(4096),
+                    ..
+                }))
+            ));
+        }
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        server_handle.abort();
+    }
+
     #[tokio::test]
     async fn concurrent_service_reads_share_one_download() {
         let kind = ObjectKind::new("coalesced-reads").unwrap();
@@ -601,31 +687,21 @@ mod tests {
             Duration::from_millis(50),
         )
         .await;
-        let service = CacheyService::new(
-            ServiceConfig {
-                cache: CacheConfig {
-                    memory_size: ByteSize::mib(16),
-                    disk_cache: None,
-                    metrics_registry: None,
-                },
-                download_limits: DownloadLimits::default(),
-            },
-            mock_s3_client(&endpoint),
-            axum_server::Handle::new(),
-        )
-        .await
-        .expect("service");
+        let service = service(&endpoint, ByteSize::mib(16)).await;
 
         let read = |range| {
             service
                 .clone()
                 .get(
-                    kind.clone(),
-                    object.clone(),
-                    buckets.clone(),
-                    range,
+                    FetchRequest {
+                        kind: kind.clone(),
+                        object: object.clone(),
+                        buckets: buckets.clone(),
+                        byterange: range,
+                        object_size: None,
+                        config: RequestConfig::default(),
+                    },
                     NonZeroUsize::MIN,
-                    RequestConfig::default(),
                 )
                 .try_collect::<Vec<_>>()
         };

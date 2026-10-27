@@ -12,7 +12,7 @@ use tokio::time::{Instant, sleep_until};
 use self::{
     backend::{Backend, WARM_READ},
     model::{Scenario, mix},
-    report::{Copy, Health, Read, Report},
+    report::{Copy, Health, Observations, Read, Report},
 };
 use super::{Downloader, RequestConfig};
 use crate::{
@@ -170,8 +170,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 for warm in 0..scenario.warmup_per_replica {
                     let id = WARM_READ + replica as u64 * 1_000_000 + u64::from(warm);
                     let range = 0..scenario.read_request_bytes(seed, id);
-                    // Calibration needs to measure even a replica that cannot meet the campaign
-                    // deadline.
+                    // Calibrate even replicas too slow for the campaign deadline.
                     let calibration = downloader
                         .clone()
                         .with_test_limits(super::DownloadLimits {
@@ -186,6 +185,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                             &singleton,
                             ObjectKey::new(format!("read-{id}")).unwrap(),
                             &range,
+                            None,
                             &RequestConfig::default(),
                         )
                         .await
@@ -207,13 +207,13 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 let buckets = &buckets;
                 let scenario = &scenario;
                 async move {
-                    let at_ms = id as u64 * scenario.interval_ms;
+                    let at_ms = scenario.arrival_ms(id as u64);
                     sleep_until(epoch + Duration::from_millis(at_ms)).await;
                     let object = ObjectKey::new(format!("read-{id}")).unwrap();
                     let config = RequestConfig::default();
                     let body_bytes = scenario.read_body_bytes(seed, id as u64);
                     let range = 0..scenario.read_request_bytes(seed, id as u64);
-                    let operation = downloader.download(buckets, object, &range, &config);
+                    let operation = downloader.download(buckets, object, &range, None, &config);
                     tokio::pin!(operation);
                     let result = if let Some(cancel_ms) = scenario.cancel_read_after_ms {
                         tokio::select! {
@@ -294,16 +294,25 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 seed,
                 native_reservoir,
                 trace,
-                reads,
-                copies,
-                peak_copies,
-                peak_bytes,
-                &backend.state.lock(),
-                client_finished_us,
-                histograms,
+                Observations {
+                    reads,
+                    copies,
+                    peak_copies,
+                    peak_bytes,
+                    backend: &backend.state.lock(),
+                    last_read_us: client_finished_us,
+                    histograms,
+                },
             )
         })
         .await
+}
+
+fn scenario_named(name: &str) -> Scenario {
+    model::scenarios()
+        .into_iter()
+        .find(|scenario| scenario.name == name)
+        .unwrap()
 }
 
 #[tokio::test(start_paused = true)]
@@ -323,10 +332,7 @@ async fn simulation_guarantees() {
         "s3_express_single_zone_slow_bodies",
         "s3_express_header_stalls_page_admission",
     ] {
-        let mut scenario = model::scenarios()
-            .into_iter()
-            .find(|scenario| scenario.name == name)
-            .unwrap();
+        let mut scenario = scenario_named(name);
         if !matches!(
             name,
             "s3_standard_internal_errors"
@@ -360,13 +366,127 @@ async fn simulation_guarantees() {
 
 #[tokio::test(start_paused = true)]
 async fn simulation_reads_finishing_at_their_tail_are_not_hedged() {
-    let scenario = model::scenarios()
-        .into_iter()
-        .find(|scenario| scenario.name == "s3_express_healthy_page_admission")
-        .unwrap();
+    let scenario = scenario_named("s3_express_healthy_page_admission");
     let report = simulate(scenario, 7, false, false).await;
     assert_eq!(report.completed, report.arrivals, "{report:?}");
     assert_eq!(report.overlapping_reads, 0, "{report:?}");
+}
+
+/// Check latency bounds for hedges that escape faults; allow at most 1% late unhedged reads.
+async fn assert_stalls_are_rescued(
+    scenario: Scenario,
+    min_rescued: usize,
+    bound_ms: impl Fn(&model::Scenario, usize) -> u64,
+) -> Vec<Report> {
+    let mut reports = Vec::new();
+    for seed in [7, 42, 2026] {
+        let late = |read: &Read| read.latency_us() > bound_ms(&scenario, read.body_bytes) * 1000;
+        let report = simulate(scenario.clone(), seed, false, true).await;
+        assert_eq!(report.completed, report.arrivals, "seed {seed}");
+        let (rescued, unhedged): (Vec<_>, Vec<_>) =
+            report.reads.iter().flatten().partition(|read| read.hedged);
+        assert!(
+            rescued.len() >= min_rescued,
+            "seed {seed}: {}",
+            rescued.len()
+        );
+        let late_rescues = rescued
+            .iter()
+            .filter(|read| {
+                late(read)
+                    && report
+                        .transports
+                        .iter()
+                        .flatten()
+                        .any(|transport| transport.read == read.id && transport.fault.is_none())
+            })
+            .map(|read| (read.body_bytes, read.latency_us()))
+            .collect::<Vec<_>>();
+        assert!(late_rescues.is_empty(), "seed {seed}: {late_rescues:?}");
+        let late_unhedged = unhedged.iter().filter(|read| late(read)).count();
+        assert!(
+            late_unhedged * 100 <= report.arrivals,
+            "seed {seed}: {late_unhedged}"
+        );
+        reports.push(report);
+    }
+    reports
+}
+
+/// Allow 1.5 nominal reads for the hedge delay plus one for the replacement.
+fn hedged_read_ms(scenario: &Scenario, bytes: usize) -> u64 {
+    scenario.replicas[0].read_ms(bytes) * 5 / 2 + 30
+}
+
+/// Allow at most 2% of healthy reads to overlap copies.
+async fn assert_rarely_hedged(name: &str) {
+    for seed in [7, 42, 2026] {
+        let report = simulate(scenario_named(name), seed, false, false).await;
+        assert_eq!(report.completed, report.arrivals, "{name} seed {seed}");
+        assert!(
+            report.overlapping_reads * 50 <= report.arrivals,
+            "{name} seed {seed}: {} hedged",
+            report.overlapping_reads
+        );
+    }
+}
+
+/// Stalls exceed 1% of reads, so uncapped p99 would delay hedges too long.
+#[tokio::test(start_paused = true)]
+async fn simulation_s3_shaped_stalls_are_hedged_at_size_aware_tails() {
+    assert_stalls_are_rescued(scenario_named("s3_standard_stalls"), 10, hedged_read_ms).await;
+}
+
+/// Buffering before headers requires a full-chunk latency bound even for small reads.
+/// Startup uncertainty must not cause lasting preference for another zone.
+#[tokio::test(start_paused = true)]
+async fn simulation_capacitor_shaped_stalls_are_hedged_to_another_zone() {
+    let mut scenario = scenario_named("capacitor_stalls");
+    let bound_ms = |scenario: &Scenario, _| scenario.replicas[0].read_ms(scenario.body_bytes) * 3;
+    assert_stalls_are_rescued(scenario.clone(), 5, bound_ms).await;
+    scenario.duration_ms = 120_000;
+    for fault in &mut scenario.faults {
+        fault.end_ms = scenario.duration_ms;
+    }
+    for report in assert_stalls_are_rescued(scenario, 5, bound_ms).await {
+        let settled_reads: Vec<_> = report
+            .reads
+            .iter()
+            .flatten()
+            .filter(|read| read.arrival_us >= 60_000_000)
+            .collect();
+        let local_wins = settled_reads
+            .iter()
+            .filter(|read| read.winner == Some(0))
+            .count();
+        assert!(
+            local_wins * 10 >= settled_reads.len() * 9,
+            "{local_wins}/{}",
+            settled_reads.len()
+        );
+    }
+}
+
+/// Exact-range sizes span three orders of magnitude. Size-aware estimates hedge stalls
+/// without spending the hedge budget on healthy large reads.
+#[tokio::test(start_paused = true)]
+async fn simulation_exact_ranges_hedge_stalls_but_not_healthy_reads() {
+    for profile in ["s3_standard", "s3_express", "capacitor"] {
+        assert_rarely_hedged(&format!("{profile}_exact_ranges_healthy")).await;
+        assert_stalls_are_rescued(
+            scenario_named(&format!("{profile}_exact_ranges_stalls")),
+            5,
+            hedged_read_ms,
+        )
+        .await;
+    }
+}
+
+/// At one read per second, a half-life still spans enough observations that healthy
+/// reads rarely hedge.
+#[tokio::test(start_paused = true)]
+async fn simulation_sparse_reads_rarely_hedge() {
+    assert_rarely_hedged("s3_express_sparse_reads").await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -375,10 +495,7 @@ async fn simulation_reservations_survive_reordering_and_admission_wait() {
         "s3_standard_cross_region_deadline",
         "s3_standard_queued_long_read",
     ] {
-        let scenario = model::scenarios()
-            .into_iter()
-            .find(|scenario| scenario.name == name)
-            .unwrap();
+        let scenario = scenario_named(name);
         let report = simulate(scenario, 7, false, true).await;
         assert_eq!(report.completed, report.arrivals, "{name}: {report:?}");
     }
@@ -386,10 +503,7 @@ async fn simulation_reservations_survive_reordering_and_admission_wait() {
 
 #[tokio::test(start_paused = true)]
 async fn simulation_repeatability_and_cancellation() {
-    let mut scenario = model::scenarios()
-        .into_iter()
-        .find(|scenario| scenario.name == "s3_express_independent_errors")
-        .unwrap();
+    let mut scenario = scenario_named("s3_express_independent_errors");
     scenario.duration_ms = 500;
     scenario.faults[0].start_ms = 0;
     let first = simulate(scenario.clone(), 42, false, true).await;
@@ -398,10 +512,7 @@ async fn simulation_repeatability_and_cancellation() {
         serde_json::to_value(first).unwrap(),
         serde_json::to_value(second).unwrap()
     );
-    let recovery = model::scenarios()
-        .into_iter()
-        .find(|scenario| scenario.name == "s3_express_recovery_during_peer_outage")
-        .unwrap();
+    let recovery = scenario_named("s3_express_recovery_during_peer_outage");
     let recovery_report = simulate(recovery, 7, false, true).await;
     assert_eq!(
         recovery_report
@@ -411,10 +522,7 @@ async fn simulation_repeatability_and_cancellation() {
             .count(),
         1
     );
-    let scenario = model::scenarios()
-        .into_iter()
-        .find(|scenario| scenario.name == "s3_express_caller_cancellation")
-        .unwrap();
+    let scenario = scenario_named("s3_express_caller_cancellation");
     let report = simulate(scenario, 7, false, true).await;
     assert_eq!(
         report.errors.get("caller_cancelled"),
@@ -427,12 +535,9 @@ async fn simulation_repeatability_and_cancellation() {
 async fn simulation_rescue_preserves_availability_and_work_under_overload() {
     for (name, completed, attempts) in [
         ("capacitor_overload", 1807, 3100),
-        ("s3_express_overload_sdk_retries", 1806, 3620),
+        ("s3_express_overload_sdk_retries", 1808, 3620),
     ] {
-        let scenario = model::scenarios()
-            .into_iter()
-            .find(|scenario| scenario.name == name)
-            .unwrap();
+        let scenario = scenario_named(name);
         let report = simulate(scenario, 7, false, false).await;
         assert!(report.completed >= completed, "{name}: {report:?}");
         assert!(report.transport_attempts <= attempts, "{name}: {report:?}");

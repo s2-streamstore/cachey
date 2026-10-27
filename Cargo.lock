@@ -1031,7 +1031,6 @@ dependencies = [
  "clap",
  "compact_str",
  "dashmap",
- "exponential-decay-histogram",
  "eyre",
  "foyer",
  "futures",
@@ -1566,16 +1565,6 @@ checksum = "de48cc4d1c1d97a20fd819def54b890cadde72ed3ad0c614822a0a433361be96"
 dependencies = [
  "cfg-if",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "exponential-decay-histogram"
-version = "0.1.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d17a9528521b325e13758a0f768d10b5847a7899a0301330f1d570d8611a429"
-dependencies = [
- "ordered-float",
- "rand",
 ]
 
 [[package]]
@@ -2891,15 +2880,6 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "ordered-float"
-version = "5.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c7c9e0d9b23589f26070720bac724174bfec1083e82f7854cdd0267518343c0"
-dependencies = [
- "num-traits",
-]
 
 [[package]]
 name = "outref"

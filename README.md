@@ -31,10 +31,17 @@ HEAD|GET /fetch/{kind}/{object}
 | `Range` | yes | Byte range in format `bytes={first}-{last}` |
 | `C0-Bucket` | no | Bucket(s) containing the object |
 | `C0-Config` | no | Override S3 request config |
+| `C0-Object-Size` | no | Size of the object in bytes |
 
 `C0-Bucket` behavior:
 - Multiple headers specify redundant buckets, with the preferred bucket first
 - If omitted, `kind` is used as the singular bucket name
+
+`C0-Object-Size` behavior:
+- A page of a small object is admitted and timed at its own size, though the whole page is still requested
+- Admission trusts the size, so one that understates the object lets a read hold more than it reserved
+- A range starting at or past the size returns 416 without contacting a bucket
+- A bucket reporting a different size returns 409, or 416 for a range past the object's actual end; other readers of the page are unaffected
 
 See [replica reads](docs/replica-reads.md) for selection, fallback, hedging, and download limits.
 
@@ -119,7 +126,7 @@ Options:
       --iouring
           Use `io_uring` (if available) for disk IO
       --bucket-timeout-ms <BUCKET_TIMEOUT_MS>
-          Maximum bucket download time through body validation, in milliseconds [default: 5000]
+          Maximum time for a page's downloads from one bucket, from first admission through body validation, in milliseconds [default: 5000]
       --page-timeout-ms <PAGE_TIMEOUT_MS>
           Maximum page download time including fallback, in milliseconds [default: 10000]
       --hedge-budget-percent <HEDGE_BUDGET_PERCENT>
