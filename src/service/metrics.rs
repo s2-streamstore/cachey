@@ -1,6 +1,7 @@
 use std::{sync::LazyLock, time::Duration};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use parking_lot::Mutex;
 use prometheus::{
     Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, TextEncoder, register_gauge_vec,
     register_histogram_vec, register_int_counter_vec, register_int_gauge,
@@ -101,8 +102,11 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     }
 }
 
-/// Advances counters to the cumulative totals of a bucket's statistics.
+/// Advances counters to the cumulative totals of a bucket's statistics. Concurrent
+/// scrapes take turns, or each would add the same difference.
 fn count_predictions(bucket: &BucketName, phase: &str, predictions: Predictions) {
+    static ADVANCING: Mutex<()> = Mutex::new(());
+
     static PREDICTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         register_int_counter_vec!(
             "cachey_bucket_latency_predictions_total",
@@ -135,6 +139,7 @@ fn count_predictions(bucket: &BucketName, phase: &str, predictions: Predictions)
             predictions.above_tail,
         ),
     ] {
+        let _advancing = ADVANCING.lock();
         counter.inc_by(total.saturating_sub(counter.get()));
     }
 }
