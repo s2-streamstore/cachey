@@ -20,6 +20,8 @@ use crate::{
 
 const ERROR_ALPHA: f64 = 0.015;
 const LATENCY_ALPHA: f64 = 0.1;
+/// Reads the routing factor averages; older ones would weigh under 3.5%.
+const RECENT_READS: usize = 32;
 /// Latency observations have a 15-second half-life of model time, which advances at most
 /// 150 ms per observation so that a half-life spans at least 100 observations.
 const LATENCY_DECAY: f64 = std::f64::consts::LN_2 / 15.0;
@@ -234,6 +236,13 @@ impl LatencyEstimates {
 /// An active copy with a predicted tail, ordered by when it becomes overdue.
 type TimedCopy = (Instant, Instant);
 
+#[derive(Debug, Clone, Copy)]
+struct RecentRead {
+    bytes: u64,
+    latency: Duration,
+    probe: bool,
+}
+
 #[derive(Debug)]
 struct BucketStats {
     last_outcome: Instant,
@@ -247,11 +256,8 @@ struct BucketStats {
     overload_until: Instant,
     active: usize,
     timed: BTreeMap<TimedCopy, usize>,
-    /// Moving average of request latency over the request model's median, which tracks a
-    /// shift in latency faster than the model.
-    routing_factor: f64,
-    /// Request size the routing factor was last measured at.
-    routing_bytes: Option<u64>,
+    /// Successful reads the routing factor is taken from.
+    recent: VecDeque<RecentRead>,
     /// Fraction by which canceled copies outlasted the scaled median.
     routing_excess: f64,
     routing_updated_at: Instant,
@@ -276,8 +282,7 @@ impl Default for BucketStats {
             overload_until: now,
             active: 0,
             timed: BTreeMap::new(),
-            routing_factor: 1.0,
-            routing_bytes: None,
+            recent: VecDeque::with_capacity(RECENT_READS),
             routing_excess: 0.0,
             routing_updated_at: now,
             unmeasured_latency: Duration::ZERO,
@@ -296,60 +301,53 @@ impl BucketStats {
             )
     }
 
-    /// Successes at sizes the request model has observed move the routing factor, and every
-    /// success eases the excess. The first measurement replaces both. A recovery probe
-    /// clears the excess and lowers the factor at once, restoring the bucket's preference,
-    /// but raises it only as any read does: one sample at a poorly fit size would otherwise
-    /// make every size look slow, and a bucket that looks slow gets no reads to correct it.
+    /// Every success eases the excess; the first measurement and recovery probes clear it.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
-        let median = self
-            .estimates
-            .request
-            .model()
-            .median(sample.requested_bytes);
-        let ratio = match median {
-            Some(Median::Predicted(median)) => {
-                self.routing_bytes = Some(sample.requested_bytes);
-                Some(sample.latency().div_duration_f64(median))
-            }
-            _ => None,
-        };
-        let restores = probe && ratio.unwrap_or(1.0) < self.routing_factor;
-        if median.is_none() || restores {
-            self.routing_factor = ratio.unwrap_or(1.0);
-        } else if let Some(ratio) = ratio {
-            self.routing_factor =
-                self.routing_factor * (1.0 - LATENCY_ALPHA) + ratio * LATENCY_ALPHA;
-        }
-        if probe || median.is_none() {
+        if probe || self.estimates.request.model().estimate().is_none() {
             self.routing_excess = 0.0;
             self.unmeasured_latency = Duration::ZERO;
         } else {
             self.routing_excess = self.routing_excess(now) * (1.0 - LATENCY_ALPHA);
         }
         self.routing_updated_at = now;
+        if self.recent.len() == RECENT_READS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(RecentRead {
+            bytes: sample.requested_bytes,
+            latency: sample.latency(),
+            probe,
+        });
         self.estimates.record(now, sample);
+    }
+
+    /// Moving average of recent reads' latency over the request model's current median,
+    /// which tracks a shift in latency faster than the model; taken against the current
+    /// median, it never counts a shift the model has absorbed. Only sizes the model has
+    /// observed count, since an extrapolated median can be far off. A recovery probe lowers
+    /// the average at once, restoring the bucket's preference, but raises it only as any
+    /// read does: one sample at a poorly fit size would otherwise make every size look slow,
+    /// and a bucket that looks slow gets no reads to correct it.
+    fn routing_factor(&self) -> f64 {
+        let model = self.estimates.request.model();
+        self.recent.iter().fold(1.0, |factor, read| {
+            let ratio = match model.median(read.bytes) {
+                Some(Median::Predicted(median)) => Some(read.latency.div_duration_f64(median)),
+                _ => None,
+            };
+            match ratio {
+                _ if read.probe && ratio.unwrap_or(1.0) < factor => ratio.unwrap_or(1.0),
+                Some(ratio) => factor * (1.0 - LATENCY_ALPHA) + ratio * LATENCY_ALPHA,
+                None => factor,
+            }
+        })
     }
 
     /// Routing latency from a median, or from canceled copies while unmeasured.
     fn routing_latency(&self, now: Instant, median: Option<Duration>) -> Duration {
         median.map_or(self.unmeasured_latency, |median| {
-            median.mul_f64(self.routing_factor * (1.0 + self.routing_excess(now)))
+            median.mul_f64(self.routing_factor() * (1.0 + self.routing_excess(now)))
         })
-    }
-
-    /// Keeps routing latency where the factor was measured continuous across a refit, so
-    /// the median does not count a shift the factor already tracks. A refit can only
-    /// explain the factor's deviation, so the factor moves toward 1 and never past it.
-    fn rescale_routing(&mut self, before: SizeModel) {
-        if let Some(bytes) = self.routing_bytes
-            && let Some(Median::Predicted(old)) = before.median(bytes)
-            && let Some(Median::Predicted(new)) = self.estimates.request.model().median(bytes)
-        {
-            let factor = self.routing_factor;
-            self.routing_factor =
-                (factor * old.div_duration_f64(new)).clamp(factor.min(1.0), factor.max(1.0));
-        }
     }
 
     fn succeed(&mut self, now: Instant, generation: u64, probe: bool) {
@@ -392,7 +390,7 @@ impl BucketStats {
         match self.estimates.request.model().median(requested_bytes) {
             Some(Median::Predicted(median)) => {
                 let excess = self.routing_excess(now);
-                let outlasted = elapsed.div_duration_f64(median) / self.routing_factor - 1.0;
+                let outlasted = elapsed.div_duration_f64(median) / self.routing_factor() - 1.0;
                 self.routing_excess = excess + (outlasted - excess).max(0.0) * LATENCY_ALPHA;
                 self.routing_updated_at = now;
             }
@@ -463,13 +461,11 @@ fn refit(stats: &mut MutexGuard<'_, BucketStats>, now: Instant, interval: bool) 
         return;
     }
     let fits = MutexGuard::unlocked(stats, || refits.map(|refit| refit.map(Refit::fit)));
-    let before = stats.estimates.request.model();
     for (histogram, fitted) in stats.estimates.histograms().into_iter().zip(fits) {
         if let Some(fitted) = fitted {
             histogram.store(fitted);
         }
     }
-    stats.rescale_routing(before);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -921,7 +917,7 @@ mod tests {
     use super::{
         BucketObservation, BucketStats, BucketedStats, LATENCY_SNAPSHOT_INTERVAL, Median,
         OBSERVATION_SPACING, Outcome, ProbePermit, RECOVERY_INTERVAL, RECOVERY_SUCCESSES,
-        RequestTimeline, RoutingSnapshot, Sample, TIMER_RESOLUTION,
+        RequestTimeline, RoutingSnapshot, Sample,
     };
     use crate::{
         object_store::DownloadLimits,
@@ -1110,6 +1106,26 @@ mod tests {
             assert_eq!(index, 0);
             assert!(probe.is_some());
         }
+    }
+
+    /// A slow recovery probe raises routing latency only as any read does, since a bucket
+    /// that looks slow gets no reads to correct it.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_probe_does_not_send_reads_away_at_once() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for (bucket, millis) in buckets.iter().zip([10, 30, 60]) {
+            for _ in 0..4 {
+                stats.seed_latency(bucket, millis);
+            }
+        }
+        assert_eq!(best(&stats, &buckets, Duration::from_secs(1)), Some(0));
+        stats.entry(&buckets[0]).lock().record(
+            Instant::now(),
+            &Sample::from_millis(100, 4, 0),
+            true,
+        );
+        assert_eq!(best(&stats, &buckets, Duration::from_secs(1)), Some(0));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1635,20 +1651,8 @@ mod tests {
             .latency
     }
 
-    /// Records a success, widening the range of observed-to-predicted ratios that the
-    /// routing factor averages.
-    fn record_success(
-        stats: &Mutex<BucketStats>,
-        bytes: u64,
-        latency: Duration,
-        probe: bool,
-        ratios: &mut (f64, f64),
-    ) {
+    fn record_success(stats: &Mutex<BucketStats>, bytes: u64, latency: Duration, probe: bool) {
         let mut stats = stats.lock();
-        if let Some(Median::Predicted(median)) = stats.estimates.request.model().median(bytes) {
-            let ratio = latency.max(TIMER_RESOLUTION).div_duration_f64(median);
-            *ratios = (ratios.0.min(ratio), ratios.1.max(ratio));
-        }
         let now = Instant::now();
         let generation = stats.generation;
         let sample = Sample {
@@ -1668,7 +1672,6 @@ mod tests {
         let stats = BucketedStats::default();
         let buckets = BucketNameSet::from(BucketName::new("bucket").unwrap());
         let entry = stats.entry(&buckets[0]);
-        let mut ratios = (1.0, 1.0);
         let mut successes = 0;
         // The range of latencies observed at each size, and which successes observed it.
         let mut observed: [(Duration, Duration, Vec<u64>); ROUTED_SIZES.len()] =
@@ -1689,7 +1692,21 @@ mod tests {
             let latency = route(&stats, &buckets, size);
             {
                 let stats = entry.lock();
-                let factor = stats.routing_factor;
+                // The factor averages recent reads against the current model, starting at 1.
+                let model = stats.estimates.request.model();
+                let ratios = stats
+                    .recent
+                    .iter()
+                    .filter_map(|read| match model.median(read.bytes) {
+                        Some(Median::Predicted(median)) => {
+                            Some(read.latency.div_duration_f64(median))
+                        }
+                        _ => None,
+                    })
+                    .fold((1.0_f64, 1.0_f64), |(low, high), ratio| {
+                        (low.min(ratio), high.max(ratio))
+                    });
+                let factor = stats.routing_factor();
                 prop_assert!(
                     ratios.0 - 1e-9 <= factor && factor <= ratios.1 + 1e-9,
                     "factor {factor} outside {ratios:?}"
@@ -1717,7 +1734,7 @@ mod tests {
                     *low = (*low).min(latency);
                     *high = (*high).max(latency);
                     seen.push(successes);
-                    record_success(&entry, ROUTED_SIZES[size], latency, probe, &mut ratios);
+                    record_success(&entry, ROUTED_SIZES[size], latency, probe);
                 }
                 Finish::Cancel { elapsed_percent } => {
                     let timeline = RequestTimeline::default();
@@ -1734,7 +1751,7 @@ mod tests {
                 advance(OBSERVATION_SPACING).await;
                 route(&stats, &buckets, size);
                 let latency = backend.latency(size, 100);
-                record_success(&entry, bytes, latency, false, &mut ratios);
+                record_success(&entry, bytes, latency, false);
             }
         }
         advance(Duration::from_secs(60)).await;
@@ -1752,8 +1769,9 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
-        /// The routing factor stays within the ratios it averages, routing latency stays
-        /// near what each size has observed, and both settle once the bucket does.
+        /// The routing factor stays within the ratios of recent reads to the current model,
+        /// routing latency stays near what each size has observed, and both settle once the
+        /// bucket does.
         #[test]
         fn routing_latency_follows_observed_latency(
             fixed_ms in 3.0_f64..50.0,

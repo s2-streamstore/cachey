@@ -13,10 +13,10 @@ affect health. A deprioritized bucket, or one without an outcome for 30 seconds,
 probed if it might beat the current choice, and the first bucket regardless.
 
 Buckets are ranked by routing latency at the read's size: the request model's
-median, scaled by a moving average of successful reads relative to it and by an
-excess from canceled copies. The moving average follows a shift in latency sooner
-than the model does; when a refit moves the median, the average is rescaled so the
-shift is not counted twice. Beyond the sizes its model can predict, a bucket is
+median, scaled by a moving average of the last 32 successful reads relative to it and
+by an excess from canceled copies. The moving average follows a shift in latency
+sooner than the model does, and since it is taken against the current median, a
+shift the model absorbs is not counted twice. Beyond the sizes its model can predict, a bucket is
 ranked by its median at the largest size it has seen, since latency grows with size.
 It never ranks ahead of the first bucket there. Only reads of sizes the model has
 observed move the moving average, since an extrapolated median can be far off.
