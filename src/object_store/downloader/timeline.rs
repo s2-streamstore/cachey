@@ -13,25 +13,25 @@ use tokio::{
 
 use crate::object_store::stats::{Headers, LatencyModel, RequestTimeline};
 
-/// A deadline shared by a page's copies to one bucket, starting at first admission.
+/// A deadline shared by a download's copies to one bucket, starting at first admission.
 #[derive(Debug)]
 pub(super) struct BucketDeadline {
-    page: Instant,
+    download: Instant,
     expires_at: OnceLock<Instant>,
     expiry_reported: AtomicBool,
 }
 
 impl BucketDeadline {
-    pub fn new(page: Instant) -> Self {
+    pub fn new(download: Instant) -> Self {
         Self {
-            page,
+            download,
             expires_at: OnceLock::new(),
             expiry_reported: AtomicBool::new(false),
         }
     }
 
-    pub fn page(&self) -> Instant {
-        self.page
+    pub fn download(&self) -> Instant {
+        self.download
     }
 
     /// Set once a copy is admitted.
@@ -39,11 +39,11 @@ impl BucketDeadline {
         self.expires_at.get().copied()
     }
 
-    /// First admission starts the bucket timeout, capped by the page deadline.
+    /// First admission starts the bucket timeout, capped by the download deadline.
     pub fn admit(&self, now: Instant, bucket_timeout: Duration) -> Instant {
         *self
             .expires_at
-            .get_or_init(|| now + bucket_timeout.min(self.page.saturating_duration_since(now)))
+            .get_or_init(|| now + bucket_timeout.min(self.download.saturating_duration_since(now)))
     }
 
     /// Whether this is the first report of the deadline's expiry.

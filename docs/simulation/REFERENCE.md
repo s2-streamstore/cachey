@@ -33,7 +33,7 @@ p99 is the largest per-run value. Completion counts every scheduled arrival.
 | Finite capacity with SDK retries | 5,421/9,000 | 5,421/9,000 | 448 ms |
 | Regional outage, 200 arrivals/s, full-page admission | 6,990/7,200 | 6,990/7,200 | 405 ms |
 | Healthy 4 s bodies, eight admission slots, 10 arrivals/s | 48/180 | 48/180 | 7.2 s |
-| Healthy distant copy cannot fit the page deadline | 1,792/1,800 | 1,792/1,800 | 70 ms |
+| Healthy distant copy cannot fit the download deadline | 1,792/1,800 | 1,792/1,800 | 70 ms |
 
 Reserving time for unmeasured replicas fixes cold failover and reduces its wire
 attempts from 108 to 78. The distant-copy case falls from 2,798 to 1,902 attempts.
@@ -43,7 +43,7 @@ p99. All 18 production-reservoir pairs preserve completion, latency, and backend
 ## Limits observed
 
 Admission saturation still prevents some healthy fallbacks. Correlated faults and
-copies beyond the page deadline also limit availability. Recovery during a peer
+copies beyond the download deadline also limit availability. Recovery during a peer
 outage completes every read but reaches 9.983 s against a 10 s deadline.
 
 In the cancellation-storm fixture, a 100 ms cancellation delay raises service work

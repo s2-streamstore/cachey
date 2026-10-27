@@ -181,7 +181,7 @@ pub struct DownloadOutput {
     pub piece: ObjectPiece,
     pub primary_bucket_idx: usize,
     pub used_bucket_idx: usize,
-    /// Time to validated page data, including SDK retries, hedging, and bucket fallback.
+    /// Time to validated data, including SDK retries, hedging, and bucket fallback.
     pub latency: Duration,
     /// Whether an overlapping request was started, including deadline or recovery probes.
     pub hedged: bool,
@@ -228,7 +228,7 @@ impl BucketOperation<'_> {
         } else {
             // A copy queues while it can still finish by the deadline. Only a bucket's first
             // copy queues, so no bucket deadline applies.
-            let deadline = self.deadline.page();
+            let deadline = self.deadline.download();
             let allowance = self.timeout_allowance();
             let latest_start = deadline.checked_sub(allowance).unwrap_or_else(Instant::now);
             self.downloader
@@ -885,14 +885,14 @@ mod tests {
     #[tokio::test]
     async fn constructor_rejects_invalid_limits_without_panicking() {
         let downloader = downloader([]);
-        for (max_inflight_bytes, page_timeout) in [
+        for (max_inflight_bytes, download_timeout) in [
             (0, Duration::from_secs(1)),
             (u64::MAX, Duration::from_secs(1)),
             (4, Duration::ZERO),
             (4, Duration::MAX),
         ] {
             let limits = DownloadLimits {
-                page_timeout,
+                download_timeout,
                 max_inflight_bytes,
                 ..DownloadLimits::default()
             };
@@ -1278,7 +1278,7 @@ mod tests {
         let downloader = downloader
             .with_test_limits(DownloadLimits {
                 bucket_timeout: Duration::from_millis(100),
-                page_timeout: Duration::from_secs(1),
+                download_timeout: Duration::from_secs(1),
                 ..DownloadLimits::default()
             })
             .unwrap();
@@ -1296,7 +1296,7 @@ mod tests {
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
-    /// An unmeasured body needs half the bucket's share of the page.
+    /// An unmeasured body needs half the bucket's share of the download timeout.
     #[tokio::test(start_paused = true)]
     async fn a_body_retry_shares_its_buckets_deadline() {
         for (bucket_timeout_ms, elapsed_ms, requests) in [(100, 86, 2), (400, 401, 3)] {
@@ -1309,7 +1309,7 @@ mod tests {
             let downloader = downloader
                 .with_test_limits(DownloadLimits {
                     bucket_timeout: Duration::from_millis(bucket_timeout_ms),
-                    page_timeout: Duration::from_secs(1),
+                    download_timeout: Duration::from_secs(1),
                     ..DownloadLimits::default()
                 })
                 .unwrap();
@@ -1360,7 +1360,7 @@ mod tests {
         let (downloader, script) = scripted_downloader(responses);
         let downloader = downloader
             .with_test_limits(DownloadLimits {
-                page_timeout: Duration::from_millis(150),
+                download_timeout: Duration::from_millis(150),
                 ..DownloadLimits::default()
             })
             .unwrap();
@@ -1428,7 +1428,7 @@ mod tests {
             script.service_errors.lock().insert(failed_copy, status);
             let downloader = downloader
                 .with_test_limits(DownloadLimits {
-                    page_timeout: Duration::from_millis(300),
+                    download_timeout: Duration::from_millis(300),
                     max_inflight_requests: 2,
                     ..DownloadLimits::default()
                 })
@@ -1542,14 +1542,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn page_deadline_caps_single_bucket_and_fallback() {
+    async fn download_deadline_caps_single_bucket_and_fallback() {
         for buckets in [&["primary"][..], &["primary", "fallback"][..]] {
             let (downloader, script) =
                 scripted_downloader(buckets.iter().map(|bucket| (*bucket, 10, 1_000, false)));
             let downloader = downloader
                 .with_test_limits(DownloadLimits {
                     bucket_timeout: Duration::from_millis(500),
-                    page_timeout: Duration::from_millis(300),
+                    download_timeout: Duration::from_millis(300),
                     ..DownloadLimits::default()
                 })
                 .unwrap();
@@ -1915,7 +1915,7 @@ mod tests {
         let downloader = downloader
             .with_test_limits(DownloadLimits {
                 bucket_timeout: Duration::from_millis(500),
-                page_timeout: Duration::from_millis(500),
+                download_timeout: Duration::from_millis(500),
                 hedge_budget_percent: 0,
                 ..DownloadLimits::default()
             })
@@ -1942,7 +1942,7 @@ mod tests {
             ]);
             let downloader = downloader
                 .with_test_limits(DownloadLimits {
-                    page_timeout: Duration::from_millis(400),
+                    download_timeout: Duration::from_millis(400),
                     hedge_budget_percent: 0,
                     ..DownloadLimits::default()
                 })
@@ -1991,7 +1991,7 @@ mod tests {
         let (downloader, script) = scripted_downloader([("local", 0, 10, false)]);
         let downloader = downloader
             .with_test_limits(DownloadLimits {
-                page_timeout: Duration::from_millis(100),
+                download_timeout: Duration::from_millis(100),
                 hedge_budget_percent: 0,
                 ..DownloadLimits::default()
             })
@@ -2040,7 +2040,7 @@ mod tests {
         script.service_errors.lock().insert(1, 404);
         let downloader = downloader
             .with_test_limits(DownloadLimits {
-                page_timeout: Duration::from_millis(100),
+                download_timeout: Duration::from_millis(100),
                 ..DownloadLimits::default()
             })
             .unwrap();
@@ -2060,7 +2060,7 @@ mod tests {
             scripted_downloader([("local", 0, 99, true), ("peer", 0, 5, false)]);
         let downloader = downloader
             .with_test_limits(DownloadLimits {
-                page_timeout: Duration::from_millis(100),
+                download_timeout: Duration::from_millis(100),
                 hedge_budget_percent: 0,
                 ..DownloadLimits::default()
             })
@@ -2083,7 +2083,7 @@ mod tests {
             .with_test_limits(DownloadLimits {
                 max_inflight_requests: 1,
                 max_inflight_bytes: 4,
-                page_timeout: Duration::from_millis(10),
+                download_timeout: Duration::from_millis(10),
                 ..DownloadLimits::default()
             })
             .unwrap();
@@ -2225,7 +2225,7 @@ mod tests {
             .with_test_limits(DownloadLimits {
                 max_inflight_requests: 1,
                 max_inflight_bytes: 4,
-                page_timeout: Duration::from_millis(100),
+                download_timeout: Duration::from_millis(100),
                 ..DownloadLimits::default()
             })
             .unwrap();
@@ -2243,7 +2243,7 @@ mod tests {
             scripted_downloader([("local", 0, 1000, false), ("peer", 0, 150, false)]);
         let downloader = downloader
             .with_test_limits(DownloadLimits {
-                page_timeout: Duration::from_millis(500),
+                download_timeout: Duration::from_millis(500),
                 bucket_timeout: Duration::from_millis(500),
                 hedge_budget_percent: 0,
                 ..DownloadLimits::default()
@@ -2328,11 +2328,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn denied_rescue_does_not_mask_the_active_copys_timeout() {
         let (downloader, script) = scripted_downloader([("local", 200, 0, false)]);
-        let page_timeout = Duration::from_millis(100);
+        let download_timeout = Duration::from_millis(100);
         let downloader = downloader
             .with_test_limits(DownloadLimits {
-                page_timeout,
-                bucket_timeout: page_timeout,
+                download_timeout,
+                bucket_timeout: download_timeout,
                 hedge_budget_percent: 0,
                 ..DownloadLimits::default()
             })
@@ -2346,16 +2346,16 @@ mod tests {
             fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
         assert!(
             matches!(result, Err(DownloadError::Timeout { ref bucket, timeout })
-                if &**bucket == "local" && timeout == page_timeout),
+                if &**bucket == "local" && timeout == download_timeout),
             "{result:?}"
         );
-        assert_eq!(start.elapsed(), page_timeout);
+        assert_eq!(start.elapsed(), download_timeout);
         assert_eq!(script.requests.load(Ordering::SeqCst), 1);
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn page_expiry_records_timeouts_for_copies_given_enough_time() {
+    async fn download_expiry_records_timeouts_for_copies_given_enough_time() {
         let (downloader, script) = scripted_downloader([
             ("local", 1000, 0, false),
             ("peer", 1000, 0, false),
@@ -2363,7 +2363,7 @@ mod tests {
         ]);
         let downloader = downloader
             .with_test_limits(DownloadLimits {
-                page_timeout: Duration::from_millis(100),
+                download_timeout: Duration::from_millis(100),
                 bucket_timeout: Duration::from_millis(100),
                 hedge_budget_percent: 0,
                 ..DownloadLimits::default()
@@ -2392,7 +2392,7 @@ mod tests {
                 scripted_downloader([("local", 0, 2, true), ("peer", 200, 0, false)]);
             let downloader = downloader
                 .with_test_limits(DownloadLimits {
-                    page_timeout: Duration::from_millis(100),
+                    download_timeout: Duration::from_millis(100),
                     hedge_budget_percent: 0,
                     ..DownloadLimits::default()
                 })
@@ -2418,7 +2418,7 @@ mod tests {
             scripted_downloader([("local", 0, 2, true), ("peer", 5, 0, false)]);
         let downloader = downloader
             .with_test_limits(DownloadLimits {
-                page_timeout: Duration::from_millis(100),
+                download_timeout: Duration::from_millis(100),
                 hedge_budget_percent: 0,
                 ..DownloadLimits::default()
             })
@@ -2437,8 +2437,8 @@ mod tests {
     /// against the same bucket does not wait.
     #[tokio::test(start_paused = true)]
     async fn fallback_admission_timeout_preserves_backend_failure_but_overrides_missing() {
-        let page_timeout = Duration::from_millis(100);
-        // The peer's 5 ms reads must start 5 ms before the page deadline.
+        let download_timeout = Duration::from_millis(100);
+        // The peer's 5 ms reads must start 5 ms before the download deadline.
         let latest_start = Duration::from_millis(95);
         for (buckets, missing, elapsed) in [
             (&["local", "peer"][..], false, latest_start),
@@ -2451,7 +2451,7 @@ mod tests {
             }
             let downloader = downloader
                 .with_test_limits(DownloadLimits {
-                    page_timeout,
+                    download_timeout,
                     max_inflight_requests: 1,
                     max_inflight_bytes: 4,
                     hedge_budget_percent: 0,
@@ -2471,10 +2471,10 @@ mod tests {
                 sleep(Duration::from_millis(1)).await;
                 let permit = downloader
                     .admission
-                    .acquire(4, start + page_timeout, page_timeout)
+                    .acquire(4, start + download_timeout, download_timeout)
                     .await
                     .unwrap();
-                sleep(page_timeout).await;
+                sleep(download_timeout).await;
                 drop(permit);
             };
             let (result, ()) = tokio::join!(read, competing_read);
@@ -2613,10 +2613,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hedges_skip_peers_that_cannot_finish_within_the_page_or_bucket_timeout() {
+    async fn hedges_skip_peers_that_cannot_finish_within_the_download_or_bucket_timeout() {
         for limits in [
             DownloadLimits {
-                page_timeout: Duration::from_millis(500),
+                download_timeout: Duration::from_millis(500),
                 ..DownloadLimits::default()
             },
             DownloadLimits {

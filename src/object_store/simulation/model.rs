@@ -118,7 +118,7 @@ pub struct Scenario {
     pub replicas: Vec<Replica>,
     pub faults: Vec<Fault>,
     pub bucket_timeout_ms: u64,
-    pub page_timeout_ms: u64,
+    pub download_timeout_ms: u64,
     pub hedge_percent: u8,
     pub max_inflight_requests: u32,
     pub max_inflight_bytes: u64,
@@ -154,7 +154,7 @@ impl Default for Scenario {
             ],
             faults: vec![],
             bucket_timeout_ms: 5000,
-            page_timeout_ms: 10_000,
+            download_timeout_ms: 10_000,
             hedge_percent: 0,
             max_inflight_requests: 1024,
             max_inflight_bytes: 1024 * 1024 * 1024,
@@ -216,7 +216,7 @@ impl Scenario {
     pub fn limits(&self) -> DownloadLimits {
         DownloadLimits {
             bucket_timeout: std::time::Duration::from_millis(self.bucket_timeout_ms),
-            page_timeout: std::time::Duration::from_millis(self.page_timeout_ms),
+            download_timeout: std::time::Duration::from_millis(self.download_timeout_ms),
             hedge_budget_percent: self.hedge_percent,
             max_inflight_requests: self.max_inflight_requests,
             max_inflight_bytes: self.max_inflight_bytes,

@@ -625,12 +625,12 @@ impl RoutingSnapshot {
 
     pub fn rescue_schedule(&self, primary: usize, probing: bool) -> VecDeque<(Duration, usize)> {
         let limits = self.limits;
-        let page_budget = limits.page_timeout;
+        let download_budget = limits.download_timeout;
         let unknown_latency = limits.bucket_share(self.buckets.len());
-        let reserve_budget = page_budget / 3 * 2;
+        let reserve_budget = download_budget / 3 * 2;
         let mut schedule = Vec::with_capacity(self.buckets.len());
         schedule.extend((0..self.buckets.len()).filter_map(|index| {
-            if index == primary || !self.feasible(index, page_budget) {
+            if index == primary || !self.feasible(index, download_budget) {
                 return None;
             }
             let reserve = self
@@ -642,17 +642,18 @@ impl RoutingSnapshot {
                 })
                 .max(Duration::from_millis(20))
                 .min(limits.bucket_timeout)
-                .min(page_budget);
+                .min(download_budget);
             Some((reserve, index))
         }));
-        schedule.sort_unstable_by(|(_, left), (_, right)| self.compare(*left, *right, page_budget));
+        schedule
+            .sort_unstable_by(|(_, left), (_, right)| self.compare(*left, *right, download_budget));
         let backup = schedule.first().filter(|_| probing).map(|(_, index)| {
             let grace = self
                 .tail(*index)
                 .unwrap_or(unknown_latency)
                 .saturating_mul(2)
                 .max(Duration::from_millis(1));
-            (grace.min(page_budget), *index)
+            (grace.min(download_budget), *index)
         });
         let total = schedule
             .iter()
@@ -667,16 +668,16 @@ impl RoutingSnapshot {
             .tail(primary)
             .unwrap_or_default()
             .min(limits.bucket_timeout)
-            .min(page_budget);
+            .min(download_budget);
         let overloaded = self.buckets.iter().any(|bucket| bucket.overloaded);
         let mut remaining = total.mul_f64(scale);
         // Convert reservations to launch delays in place, retaining each destination.
         for (after, index) in &mut schedule {
             let reserve = *after;
-            let latest_start = page_budget.saturating_sub(reserve);
-            let planned = page_budget.saturating_sub(remaining).max(primary_tail);
+            let latest_start = download_budget.saturating_sub(reserve);
+            let planned = download_budget.saturating_sub(remaining).max(primary_tail);
             let expected = self.tail(*index).unwrap_or(reserve);
-            *after = if !overloaded && planned.saturating_add(expected) >= page_budget {
+            *after = if !overloaded && planned.saturating_add(expected) >= download_budget {
                 planned.min(latest_start)
             } else {
                 planned

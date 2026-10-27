@@ -1,4 +1,5 @@
 use std::{
+    iter,
     net::SocketAddr,
     num::{NonZeroU32, NonZeroUsize},
     ops::{Range, RangeInclusive},
@@ -13,11 +14,12 @@ use bytes::Bytes;
 use eyre::Result;
 use foyer::Source;
 use futures::{Stream, StreamExt};
+use itertools::Either;
 use parking_lot::Mutex;
 
 mod metrics;
 mod throughput;
-pub use metrics::PageRequestType;
+pub use metrics::EntryRequestType;
 pub use throughput::SlidingThroughput;
 mod routes;
 
@@ -41,22 +43,26 @@ fn pagerange(byterange: &Range<u64>) -> RangeInclusive<PageId> {
     first_page..=last_page
 }
 
-fn slice_page_data(
-    page_id: PageId,
+fn page_byterange(page_id: PageId) -> Range<u64> {
+    let start = u64::from(page_id) * PAGE_SIZE;
+    start..start + PAGE_SIZE
+}
+
+fn slice_entry_data(
+    entry_start: u64,
     byterange: &Range<u64>,
     value: &CacheValue,
 ) -> Result<(Bytes, Range<u64>), ServiceError> {
-    let page_start = u64::from(page_id) * PAGE_SIZE;
     let range =
-        byterange.start.max(page_start)..byterange.end.min(page_start + value.data.len() as u64);
+        byterange.start.max(entry_start)..byterange.end.min(entry_start + value.data.len() as u64);
     if range.is_empty() {
         return Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
             requested: byterange.clone(),
             object_size: Some(value.object_size),
         }));
     }
-    let start_offset = (range.start - page_start) as usize;
-    let end_offset = (range.end - page_start) as usize;
+    let start_offset = (range.start - entry_start) as usize;
+    let end_offset = (range.end - entry_start) as usize;
     let data = value.data.slice(start_offset..end_offset);
     Ok((data, range))
 }
@@ -94,9 +100,11 @@ pub struct FetchRequest {
     pub object: ObjectKey,
     pub buckets: BucketNameSet,
     pub byterange: Range<u64>,
-    /// When known, pages are admitted and timed at the bytes the object holds, and every
-    /// page must report this size.
+    /// When known, reads are admitted and timed at the bytes the object holds, and every
+    /// response must report this size.
     pub object_size: Option<u64>,
+    /// Fetch and cache the byte range as one entry instead of as the pages it spans.
+    pub exact: bool,
     pub config: RequestConfig,
 }
 
@@ -166,12 +174,13 @@ impl CacheyService {
         self.egress_throughput.lock().bps(lookback)
     }
 
-    /// Fetches up to `concurrency` pages at a time. A range starting at or past a known
+    /// Fetches up to `concurrency` cache entries at a time. A range starting at or past a known
     /// object size fails without a download.
     ///
     /// # Panics
     ///
-    /// If `byterange.start >= byterange.end` or `byterange.end > MAX_RANGE_END`.
+    /// If `byterange.start >= byterange.end`, `byterange.end > MAX_RANGE_END`, or `exact` and the
+    /// byte range is longer than `PAGE_SIZE`.
     pub fn get(
         self,
         request: FetchRequest,
@@ -180,10 +189,17 @@ impl CacheyService {
         let byterange = request.byterange.clone();
         assert!(byterange.start < byterange.end);
         assert!(byterange.end <= MAX_RANGE_END);
+        assert!(!request.exact || byterange.end - byterange.start <= PAGE_SIZE);
 
         let end = byterange.end.min(request.object_size.unwrap_or(u64::MAX));
-        let pages = (byterange.start < end).then(|| pagerange(&(byterange.start..end)));
-        let past_end = pages.is_none().then(|| {
+        let entries = (byterange.start < end).then(|| {
+            if request.exact {
+                Either::Left(iter::once(byterange.clone()))
+            } else {
+                Either::Right(pagerange(&(byterange.start..end)).map(page_byterange))
+            }
+        });
+        let past_end = entries.is_none().then(|| {
             Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
                 requested: byterange.clone(),
                 object_size: request.object_size,
@@ -191,25 +207,25 @@ impl CacheyService {
         });
 
         metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
-        metrics::fetch_request_pages(
+        metrics::fetch_request_entries(
             &request.kind,
-            pages.as_ref().map_or(0, ExactSizeIterator::len),
+            entries.as_ref().map_or(0, ExactSizeIterator::len),
         );
 
         let mut expected_size = request.object_size;
-        let executor = Arc::new(PageGetExecutor {
+        let executor = Arc::new(EntryGetExecutor {
             downloader: self.downloader,
             request,
         });
 
         futures::stream::iter(past_end).chain(
-            futures::stream::iter(pages.into_iter().flatten())
-                .map(move |page_id| executor.clone().execute(page_id, self.cache.clone()))
+            futures::stream::iter(entries.into_iter().flatten())
+                .map(move |range| executor.clone().execute(range, self.cache.clone()))
                 .buffered(concurrency.get())
                 .map(move |result| {
-                    let (page_id, value) = result?;
+                    let (entry_start, value) = result?;
                     // A range past the object's end is unsatisfiable whatever size was expected.
-                    let (data, range) = slice_page_data(page_id, &byterange, &value)?;
+                    let (data, range) = slice_entry_data(entry_start, &byterange, &value)?;
                     let expected_size = *expected_size.get_or_insert(value.object_size);
                     if value.object_size != expected_size {
                         return Err(ServiceError::ObjectSizeInconsistency {
@@ -258,23 +274,23 @@ fn now() -> u32 {
 }
 
 #[derive(Debug)]
-struct PageGetExecutor {
+struct EntryGetExecutor {
     downloader: Downloader,
     request: FetchRequest,
 }
 
-impl PageGetExecutor {
+impl EntryGetExecutor {
     async fn execute(
         self: Arc<Self>,
-        page_id: PageId,
+        range: Range<u64>,
         cache: foyer::HybridCache<CacheKey, CacheValue>,
-    ) -> Result<(PageId, CacheValue), ServiceError> {
-        metrics::page_request_count(&self.request.kind, metrics::PageRequestType::Access);
+    ) -> Result<(u64, CacheValue), ServiceError> {
+        metrics::entry_request_count(&self.request.kind, metrics::EntryRequestType::Access);
 
         let cache_key = CacheKey {
             kind: self.request.kind.clone(),
             object: self.request.object.clone(),
-            page_id,
+            range: range.clone(),
         };
         let fetched_by_current_request = Arc::new(AtomicBool::new(false));
         let entry = cache
@@ -282,39 +298,38 @@ impl PageGetExecutor {
                 let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
                 move || async move {
                     fetched_by_current_request.store(true, Ordering::Relaxed);
-                    metrics::page_request_count(
+                    metrics::entry_request_count(
                         &self.request.kind,
-                        metrics::PageRequestType::Download,
+                        metrics::EntryRequestType::Download,
                     );
 
-                    let start = u64::from(page_id) * PAGE_SIZE;
                     let out = self
                         .downloader
                         .download(
                             &self.request.buckets,
                             self.request.object.clone(),
-                            &(start..start + PAGE_SIZE),
+                            &range,
                             self.request.object_size,
                             &self.request.config,
                         )
                         .await?;
-                    metrics::page_download_latency(&self.request.kind, out.latency);
+                    metrics::download_latency(&self.request.kind, out.latency);
                     if out.hedged {
-                        metrics::page_request_count(
+                        metrics::entry_request_count(
                             &self.request.kind,
-                            metrics::PageRequestType::Hedged,
+                            metrics::EntryRequestType::Hedged,
                         );
                     }
                     if out.primary_bucket_idx == 0 {
-                        metrics::page_request_count(
+                        metrics::entry_request_count(
                             &self.request.kind,
-                            metrics::PageRequestType::ClientPref,
+                            metrics::EntryRequestType::ClientPref,
                         );
                     }
                     if out.used_bucket_idx != out.primary_bucket_idx {
-                        metrics::page_request_count(
+                        metrics::entry_request_count(
                             &self.request.kind,
-                            metrics::PageRequestType::Fallback,
+                            metrics::EntryRequestType::Fallback,
                         );
                     }
                     Ok::<_, ServiceError>(CacheValue {
@@ -333,26 +348,26 @@ impl PageGetExecutor {
                     .unwrap_or(ServiceError::Cache(err))
             })?;
         let key = entry.key();
-        metrics::page_request_count(&key.kind, metrics::PageRequestType::Success);
+        metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Success);
 
         let mut value = entry.value().clone();
         match entry.source() {
             Source::Memory => {
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHitMemory);
+                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
+                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitMemory);
             }
             Source::Disk => {
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHitDisk);
+                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
+                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitDisk);
             }
             Source::Outer => {
                 value.cached_at = 0;
                 if !fetched_by_current_request.load(Ordering::Relaxed) {
-                    metrics::page_request_count(&key.kind, metrics::PageRequestType::Coalesced);
+                    metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Coalesced);
                 }
             }
         }
-        Ok((page_id, value))
+        Ok((cache_key.range.start, value))
     }
 }
 
@@ -537,6 +552,7 @@ mod tests {
                 buckets: BucketName::new("bucket").unwrap().into(),
                 byterange: 0..1 << 40,
                 object_size: None,
+                exact: false,
                 config: RequestConfig::default(),
             },
             NonZeroUsize::MIN,
@@ -545,7 +561,7 @@ mod tests {
         assert!(
             std::str::from_utf8(&snapshot)
                 .unwrap()
-                .contains("cachey_fetch_request_pages_sum{kind=\"full-address-space\"} 65536\n")
+                .contains("cachey_fetch_request_entries_sum{kind=\"full-address-space\"} 65536\n")
         );
     }
 
@@ -563,7 +579,7 @@ mod tests {
             CacheKey {
                 kind: kind.clone(),
                 object: object.clone(),
-                page_id: 1,
+                range: PAGE_SIZE..2 * PAGE_SIZE,
             },
             CacheValue {
                 bucket,
@@ -581,6 +597,7 @@ mod tests {
                     buckets: buckets.clone(),
                     byterange: range,
                     object_size: None,
+                    exact: false,
                     config: RequestConfig::default(),
                 },
                 const { NonZeroUsize::new(2).unwrap() },
@@ -633,6 +650,7 @@ mod tests {
                         buckets: bucket.clone().into(),
                         byterange: range,
                         object_size: Some(object_size),
+                        exact: false,
                         config: RequestConfig::default(),
                     },
                     NonZeroUsize::MIN,
@@ -668,6 +686,80 @@ mod tests {
         server_handle.abort();
     }
 
+    /// Reads share an entry only for the same range, so an exact read is cached apart from
+    /// the page holding it, while an exact read of a whole page shares the page's entry and
+    /// is checked against the size its bucket reported.
+    #[tokio::test]
+    async fn reads_share_an_entry_only_for_the_same_range() {
+        let kind = ObjectKind::new("exact-reads").unwrap();
+        let object = ObjectKey::new("object").unwrap();
+        let bucket = BucketName::new("bucket").unwrap();
+        let data = Bytes::from(
+            (0..4096)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (endpoint, request_count, server_handle) =
+            spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
+        let service = service(&endpoint, ByteSize::mib(16)).await;
+        let read = |range, object_size, exact| {
+            service
+                .clone()
+                .get(
+                    FetchRequest {
+                        kind: kind.clone(),
+                        object: object.clone(),
+                        buckets: bucket.clone().into(),
+                        byterange: range,
+                        object_size,
+                        exact,
+                        config: RequestConfig::default(),
+                    },
+                    NonZeroUsize::MIN,
+                )
+                .try_collect::<Vec<_>>()
+        };
+
+        for _ in 0..2 {
+            let chunks = read(100..200, None, true).await.expect("exact read");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].data, data.slice(100..200));
+        }
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        let cached = service
+            .cache
+            .get(&CacheKey {
+                kind: kind.clone(),
+                object: object.clone(),
+                range: 100..200,
+            })
+            .await
+            .expect("cache")
+            .expect("exact entry");
+        assert_eq!(cached.value().data, data.slice(100..200));
+
+        let chunks = read(100..200, None, false).await.expect("page read");
+        assert_eq!(chunks[0].data, data.slice(100..200));
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+
+        let chunks = read(0..PAGE_SIZE, Some(4096), true)
+            .await
+            .expect("exact read of the page");
+        assert_eq!(
+            (chunks[0].range.clone(), chunks[0].data.clone()),
+            (0..4096, data)
+        );
+        assert!(matches!(
+            read(0..PAGE_SIZE, Some(1024), true).await,
+            Err(ServiceError::ObjectSizeInconsistency {
+                prev: 1024,
+                new: 4096
+            })
+        ));
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+        server_handle.abort();
+    }
+
     #[tokio::test]
     async fn concurrent_service_reads_share_one_download() {
         let kind = ObjectKind::new("coalesced-reads").unwrap();
@@ -699,6 +791,7 @@ mod tests {
                         buckets: buckets.clone(),
                         byterange: range,
                         object_size: None,
+                        exact: false,
                         config: RequestConfig::default(),
                     },
                     NonZeroUsize::MIN,
@@ -728,7 +821,7 @@ mod tests {
             ("coalesced", 1),
             ("cache_hit", 0),
         ] {
-            let prefix = format!("cachey_page_requests_total{{kind=\"{kind}\",type=\"{typ}\"}} ");
+            let prefix = format!("cachey_entry_requests_total{{kind=\"{kind}\",type=\"{typ}\"}} ");
             let value = text
                 .lines()
                 .find_map(|line| line.strip_prefix(&prefix))

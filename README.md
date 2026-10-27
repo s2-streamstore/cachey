@@ -7,7 +7,8 @@ High-performance read-through cache for object storage.
 - Designed for caching immutable blobs
 - Works with any S3-compatible backend, but has its own `/fetch` API requiring a precise `Range`
 - Fixed page size (16 MiB) – maps requested byte range to page-aligned lookups
-- Coalesces concurrent requests for the same page
+- Exact-range mode for small reads of large objects – caches just the requested range
+- Coalesces concurrent requests for the same cache entry
 - Makes hedged requests to manage tail latency of object storage
 - Can attempt redundant buckets for a given object
 
@@ -32,6 +33,7 @@ HEAD|GET /fetch/{kind}/{object}
 | `C0-Bucket` | no | Bucket(s) containing the object |
 | `C0-Config` | no | Override S3 request config |
 | `C0-Object-Size` | no | Size of the object in bytes |
+| `C0-Exact` | no | `true` to fetch and cache exactly the requested range, up to 16 MiB |
 
 `C0-Bucket` behavior:
 - Multiple headers specify redundant buckets, with the preferred bucket first
@@ -41,12 +43,16 @@ HEAD|GET /fetch/{kind}/{object}
 - A page of a small object is admitted and timed at its own size, though the whole page is still requested
 - Admission trusts the size, so one that understates the object lets a read hold more than it reserved
 - A range starting at or past the size returns 416 without contacting a bucket
-- A bucket reporting a different size returns 409, or 416 for a range past the object's actual end; other readers of the page are unaffected
+- A bucket reporting a different size returns 409, or 416 for a range past the object's actual end; other readers of the entry are unaffected
+
+`C0-Exact` behavior:
+- The range is downloaded and cached as one entry instead of as the 16 MiB pages it spans
+- Only a request for the same range hits that entry, so use it when an object's ranges are always read whole
 
 See [replica reads](docs/replica-reads.md) for selection, fallback, hedging, and download limits.
 
 `C0-Config` overrides:
-Space-separated key-value pairs to override S3 request configuration per page miss.
+Space-separated key-value pairs to override S3 request configuration per cache miss.
 - `ct=<ms>` Connect timeout (in case an existing connection could not be reused)
 - `rt=<ms>` Read timeout (time-to-first-byte)
 - `ot=<ms>` Operation timeout (across retries)
@@ -70,24 +76,24 @@ C0-Config: ct=1000 oat=1500 ma=5 ib=10 mb=100
 
 #### Response
 
-The service maps requests to 16 MiB page-aligned ranges and the response has standard HTTP semantics (`206 Partial Content`, `404 Not Found` etc.)
+The service maps requests to 16 MiB page-aligned ranges, or with `C0-Exact` to the exact range, and the response has standard HTTP semantics (`206 Partial Content`, `404 Not Found` etc.)
 
 | Header | Description |
 |--------|-------------|
 | `Content-Range` | Actual byte range served |
 | `Content-Length` | Number of bytes in response |
-| `Last-Modified` | Timestamp from first page |
+| `Last-Modified` | Timestamp from first cache entry |
 | `Content-Type` | Always `application/octet-stream` |
-| `C0-Status` | Status for first page |
+| `C0-Status` | Status for first cache entry |
 
 `C0-Status` format: `{first}-{last}; {bucket}; {cached_at}`
 - Byte range and which bucket was used
 - `cached_at` is Unix timestamp with 0 implying a cache miss
-- First page status is sent as a header over both HTTP/1.1 and HTTP/2
-- Multi-page GET responses include subsequent page statuses as trailers over HTTP/2 only
+- The first entry's status is sent as a header over both HTTP/1.1 and HTTP/2
+- GET responses spanning several pages include later pages' statuses as trailers over HTTP/2 only
 
-Use HTTP/2 when you need per-page status for a multi-page read. HTTP/1.1 responses
-include `Content-Length` and only the first page's status.
+Use HTTP/2 when you need each page's status for a multi-page read. HTTP/1.1 responses
+include `Content-Length` and only the first entry's status.
 
 #### Example Response
 
@@ -126,11 +132,11 @@ Options:
       --iouring
           Use `io_uring` (if available) for disk IO
       --bucket-timeout-ms <BUCKET_TIMEOUT_MS>
-          Maximum time for a page's downloads from one bucket, from first admission through body validation, in milliseconds [default: 5000]
-      --page-timeout-ms <PAGE_TIMEOUT_MS>
-          Maximum page download time including fallback, in milliseconds [default: 10000]
+          Maximum time for a download's copies to one bucket, from first admission through body validation, in milliseconds [default: 5000]
+      --download-timeout-ms <DOWNLOAD_TIMEOUT_MS>
+          Maximum download time including fallback, in milliseconds [default: 10000]
       --hedge-budget-percent <HEDGE_BUDGET_PERCENT>
-          Hedge allowance per successful page fetch, as a percentage (0 disables early hedging) [default: 5]
+          Hedge allowance per successful download, as a percentage (0 disables early hedging) [default: 5]
       --max-download-memory <MAX_DOWNLOAD_MEMORY>
           Body memory reserved by active downloads, separate from the cache [default: 1GiB]
       --tls-self

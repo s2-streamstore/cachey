@@ -159,7 +159,7 @@ struct ReplicaRequest<'a> {
     range: &'a Range<u64>,
     bytes: u64,
     config: &'a RequestConfig,
-    page_deadline: Instant,
+    download_deadline: Instant,
     primary: usize,
     deadlines: Vec<BucketDeadline>,
     primary_timeline: RequestTimeline,
@@ -185,7 +185,8 @@ impl ReplicaRequest<'_> {
             .or_else(|| self.finished_body_bytes.get().copied())
     }
 
-    /// Allow each unmeasured phase half of a bucket's share of the page, within its timeout.
+    /// Allow each unmeasured phase half of a bucket's share of the download timeout, within
+    /// its own timeout.
     fn unmeasured(&self) -> Duration {
         let limits = self.downloader.limits;
         limits
@@ -317,7 +318,7 @@ impl Followups<'_> {
     }
 
     /// Prefer untried buckets. Retry a failed body only after other copies finish,
-    /// at most once per page and within the retry budget.
+    /// at most once per download and within the retry budget.
     fn next(&mut self, trigger: Trigger, idle: bool) -> Option<CopyAttempt> {
         if let Trigger::Rescue(index) = trigger
             && self.states.buckets[index].tried
@@ -325,7 +326,10 @@ impl Followups<'_> {
             return None;
         }
         let now = Instant::now();
-        let remaining = self.request.page_deadline.saturating_duration_since(now);
+        let remaining = self
+            .request
+            .download_deadline
+            .saturating_duration_since(now);
         if remaining.is_zero() {
             return None;
         }
@@ -407,7 +411,7 @@ impl Followups<'_> {
 }
 
 impl Downloader {
-    /// Conclusive errors settle a bucket, so its remaining copies cannot keep the page waiting.
+    /// Conclusive errors settle a bucket, so its remaining copies cannot keep the download waiting.
     pub(super) async fn download_replicas(
         &self,
         buckets: &BucketNameSet,
@@ -417,9 +421,13 @@ impl Downloader {
         config: &RequestConfig,
     ) -> Result<DownloadOutput, DownloadError> {
         let start = Instant::now();
-        let deadline = start.checked_add(self.limits.page_timeout).ok_or_else(|| {
-            DownloadError::Unknown("Page timeout exceeds the clock's supported range".to_owned())
-        })?;
+        let deadline = start
+            .checked_add(self.limits.download_timeout)
+            .ok_or_else(|| {
+                DownloadError::Unknown(
+                    "Download timeout exceeds the clock's supported range".to_owned(),
+                )
+            })?;
         let routing = self.bucketed_stats.snapshot(buckets, bytes, self.limits);
         let (primary_copy, backup_admission) = self.prepare_primary(
             bytes,
@@ -435,7 +443,7 @@ impl Downloader {
             range,
             bytes,
             config,
-            page_deadline: deadline,
+            download_deadline: deadline,
             primary,
             deadlines: (0..buckets.len())
                 .map(|_| BucketDeadline::new(deadline))

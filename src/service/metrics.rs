@@ -182,11 +182,11 @@ pub fn fetch_request_bytes(kind: &ObjectKind, bytes: u64) {
         .observe(bytes as f64);
 }
 
-pub fn fetch_request_pages(kind: &ObjectKind, pages: usize) {
+pub fn fetch_request_entries(kind: &ObjectKind, entries: usize) {
     static HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec!(
-            "cachey_fetch_request_pages",
-            "Number of pages requested",
+            "cachey_fetch_request_entries",
+            "Number of cache entries a fetch spans: pages, or one exact range",
             &["kind"],
             vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
         )
@@ -195,22 +195,22 @@ pub fn fetch_request_pages(kind: &ObjectKind, pages: usize) {
 
     HISTOGRAM
         .with_label_values(&[&**kind])
-        .observe(pages as f64);
+        .observe(entries as f64);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageRequestType {
-    /// Total page requests observed by the service.
+pub enum EntryRequestType {
+    /// Total cache entry requests observed by the service.
     Access,
-    /// Page requests that fetched bytes from object storage.
+    /// Entry requests that fetched bytes from object storage.
     Download,
-    /// Successful page downloads that started overlapping requests.
+    /// Successful entry downloads that started overlapping requests.
     Hedged,
-    /// Fetches whose primary attempt used the client-preferred bucket.
+    /// Downloads whose primary attempt used the client-preferred bucket.
     ClientPref,
-    /// Fetches that succeeded using a copy other than the initially selected one.
+    /// Downloads that succeeded using a copy other than the initially selected one.
     Fallback,
-    /// Page requests that completed successfully, regardless of hit/miss path.
+    /// Entry requests that completed successfully, regardless of hit/miss path.
     Success,
     /// Aggregate cache-hit count (includes both memory and disk hits).
     CacheHit,
@@ -218,11 +218,11 @@ pub enum PageRequestType {
     CacheHitMemory,
     /// Cache hits served from disk cache.
     CacheHitDisk,
-    /// Requests that waited on another in-flight miss for the same page instead of downloading.
+    /// Requests that waited on another in-flight miss for the same entry instead of downloading.
     Coalesced,
 }
 
-impl PageRequestType {
+impl EntryRequestType {
     const fn as_label(self) -> &'static str {
         match self {
             Self::Access => "access",
@@ -239,11 +239,11 @@ impl PageRequestType {
     }
 }
 
-pub fn page_request_count(kind: &ObjectKind, typ: PageRequestType) {
+pub fn entry_request_count(kind: &ObjectKind, typ: EntryRequestType) {
     static COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
         register_int_counter_vec!(
-            "cachey_page_requests_total",
-            "Page requests",
+            "cachey_entry_requests_total",
+            "Cache entry requests: pages, or exact ranges",
             &["kind", "type"]
         )
         .unwrap()
@@ -252,11 +252,11 @@ pub fn page_request_count(kind: &ObjectKind, typ: PageRequestType) {
     COUNTER.with_label_values(&[&**kind, typ.as_label()]).inc();
 }
 
-pub fn page_download_latency(kind: &ObjectKind, latency: std::time::Duration) {
+pub fn download_latency(kind: &ObjectKind, latency: std::time::Duration) {
     static HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec!(
-            "cachey_page_download_latency_seconds",
-            "Successful page download latency, including retries, hedging, and bucket fallback",
+            "cachey_download_latency_seconds",
+            "Successful download latency of a cache entry, including retries, hedging, and bucket fallback",
             &["kind"],
             vec![
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0

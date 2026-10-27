@@ -167,7 +167,7 @@
     "warmup_per_replica": 2,
     "max_inflight_requests": 1,
     "bucket_timeout_ms": 300,
-    "page_timeout_ms": 600,
+    "download_timeout_ms": 600,
     "replicas": [
       {
         "headers_ms": 25,
@@ -196,7 +196,7 @@
   },
   {
     "name": "s3_standard_cross_region_deadline",
-    "page_timeout_ms": 500,
+    "download_timeout_ms": 500,
     "bucket_timeout_ms": 500,
     "replicas": [
       {
@@ -224,7 +224,7 @@
   },
   {
     "name": "s3_standard_cross_region_deadline_page_admission",
-    "page_timeout_ms": 500,
+    "download_timeout_ms": 500,
     "bucket_timeout_ms": 500,
     "replicas": [
       {
@@ -255,7 +255,7 @@
   },
   {
     "name": "s3_standard_distant_region_cannot_fit",
-    "page_timeout_ms": 100,
+    "download_timeout_ms": 100,
     "bucket_timeout_ms": 100,
     "replicas": [
       {
@@ -289,7 +289,7 @@
     "interval_ms": 1000,
     "warmup_per_replica": 0,
     "bucket_timeout_ms": 500,
-    "page_timeout_ms": 500,
+    "download_timeout_ms": 500,
     "replicas": [
       {
         "headers_ms": 25,
@@ -821,7 +821,7 @@
   {
     "name": "s3_express_overload_sdk_retries",
     "interval_ms": 4,
-    "page_timeout_ms": 500,
+    "download_timeout_ms": 500,
     "bucket_timeout_ms": 500,
     "replicas": [
       {
@@ -862,7 +862,7 @@
     "interval_ms": 1,
     "max_inflight_requests": 2,
     "bucket_timeout_ms": 100,
-    "page_timeout_ms": 100,
+    "download_timeout_ms": 100,
     "faults": [
       {
         "start_ms": 0,
@@ -1126,7 +1126,7 @@
   {
     "name": "capacitor_overload",
     "interval_ms": 4,
-    "page_timeout_ms": 500,
+    "download_timeout_ms": 500,
     "bucket_timeout_ms": 500,
     "replicas": [
       {
@@ -1166,7 +1166,7 @@
   {
     "name": "capacitor_overload_delayed_cancel",
     "interval_ms": 4,
-    "page_timeout_ms": 500,
+    "download_timeout_ms": 500,
     "bucket_timeout_ms": 500,
     "cancellation_lag_ms": 100,
     "replicas": [

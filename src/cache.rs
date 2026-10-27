@@ -1,4 +1,5 @@
 use std::{
+    ops::Range,
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -12,7 +13,7 @@ use foyer::{
 };
 use mixtrics::registry::prometheus_0_14::PrometheusMetricsRegistry;
 
-use crate::types::{BucketName, ObjectKey, ObjectKind, PageId};
+use crate::types::{BucketName, ObjectKey, ObjectKind};
 
 #[derive(Debug)]
 pub struct CacheConfig {
@@ -111,11 +112,12 @@ fn io_engine_config(iouring: bool) -> Box<dyn IoEngineConfig> {
 pub struct CacheKey {
     pub kind: ObjectKind,
     pub object: ObjectKey,
-    pub page_id: PageId,
+    /// The requested byte range; the entry's data stops early at the object's end.
+    pub range: Range<u64>,
 }
 
 impl CacheKey {
-    const VERSION: u8 = 3;
+    const VERSION: u8 = 4;
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -123,17 +125,11 @@ struct CacheKeyHeader(
     /// 8 bits version
     /// 6 bits object kind length
     /// 10 bits object key length minus one
-    /// 16 bits page ID
-    [u8; 5],
+    [u8; 3],
 );
 
 impl CacheKeyHeader {
-    fn new(
-        version: u8,
-        kind_len: usize,
-        key_len: usize,
-        page_id: PageId,
-    ) -> Result<Self, &'static str> {
+    fn new(version: u8, kind_len: usize, key_len: usize) -> Result<Self, &'static str> {
         if kind_len == 0 {
             return Err("Kind length cannot be zero");
         }
@@ -147,7 +143,7 @@ impl CacheKeyHeader {
             return Err("Key length exceeds 10 bits");
         }
 
-        let mut bytes = [0u8; 5];
+        let mut bytes = [0u8; 3];
         let key_len_minus_one = key_len - 1;
 
         bytes[0] = version;
@@ -157,8 +153,6 @@ impl CacheKeyHeader {
 
         // Byte 2: key_len_minus_one bits 7-0 (8 bits)
         bytes[2] = (key_len_minus_one & 0xFF) as u8;
-
-        bytes[3..].copy_from_slice(&page_id.to_be_bytes());
 
         Ok(Self(bytes))
     }
@@ -177,11 +171,7 @@ impl CacheKeyHeader {
         (high_bits | low_bits) + 1
     }
 
-    fn page_id(self) -> PageId {
-        u16::from_be_bytes([self.0[3], self.0[4]])
-    }
-
-    fn to_bytes(self) -> [u8; 5] {
+    fn to_bytes(self) -> [u8; 3] {
         self.0
     }
 }
@@ -190,19 +180,17 @@ impl CacheKeyHeader {
 /// - header
 /// - object kind
 /// - object key
+/// - range start and end
 impl foyer::Code for CacheKey {
     fn encode(&self, writer: &mut impl std::io::Write) -> foyer::Result<()> {
-        let flag = CacheKeyHeader::new(
-            Self::VERSION,
-            self.kind.len(),
-            self.object.len(),
-            self.page_id,
-        )
-        .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+        let flag = CacheKeyHeader::new(Self::VERSION, self.kind.len(), self.object.len())
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
 
         writer.write_all(&flag.to_bytes())?;
         writer.write_all(self.kind.as_bytes())?;
         writer.write_all(self.object.as_bytes())?;
+        writer.write_all(&self.range.start.to_be_bytes())?;
+        writer.write_all(&self.range.end.to_be_bytes())?;
         Ok(())
     }
 
@@ -211,7 +199,7 @@ impl foyer::Code for CacheKey {
         Self: Sized,
     {
         let header = {
-            let mut buf = [0u8; 5];
+            let mut buf = [0u8; 3];
             reader.read_exact(&mut buf)?;
             CacheKeyHeader(buf)
         };
@@ -250,17 +238,22 @@ impl foyer::Code for CacheKey {
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?
         };
 
-        let page_id = header.page_id();
+        let mut offset = || -> std::io::Result<u64> {
+            let mut buf = [0u8; size_of::<u64>()];
+            reader.read_exact(&mut buf)?;
+            Ok(u64::from_be_bytes(buf))
+        };
+        let range = offset()?..offset()?;
 
         Ok(Self {
             kind,
             object,
-            page_id,
+            range,
         })
     }
 
     fn estimated_size(&self) -> usize {
-        size_of::<CacheKeyHeader>() + self.kind.len() + self.object.len()
+        size_of::<CacheKeyHeader>() + self.kind.len() + self.object.len() + 2 * size_of::<u64>()
     }
 }
 
@@ -422,7 +415,7 @@ impl foyer::Code for CacheValue {
 #[cfg(test)]
 mod tests {
     use foyer::Code;
-    use proptest::{collection, prop_assert_eq, proptest};
+    use proptest::{arbitrary::any, collection, prop_assert_eq, proptest};
 
     use super::{CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader};
     use crate::{
@@ -432,13 +425,13 @@ mod tests {
 
     #[test]
     fn test_cache_key_header() {
-        let header = CacheKeyHeader::new(255, 63, 1024, 65535).unwrap();
-        assert_eq!(header.to_bytes(), [0xff, 0xfb, 0xff, 0xff, 0xff]);
+        let header = CacheKeyHeader::new(255, 63, 1024).unwrap();
+        assert_eq!(header.to_bytes(), [0xff, 0xfb, 0xff]);
 
-        assert!(CacheKeyHeader::new(0, 0, 0, 0).is_err());
-        assert!(CacheKeyHeader::new(0, 65, 0, 0).is_err());
-        assert!(CacheKeyHeader::new(0, 1, 0, 0).is_err());
-        assert!(CacheKeyHeader::new(0, 1, 1025, 0).is_err());
+        assert!(CacheKeyHeader::new(0, 0, 0).is_err());
+        assert!(CacheKeyHeader::new(0, 65, 0).is_err());
+        assert!(CacheKeyHeader::new(0, 1, 0).is_err());
+        assert!(CacheKeyHeader::new(0, 1, 1025).is_err());
     }
 
     #[test]
@@ -483,7 +476,7 @@ mod tests {
         let cache_key = CacheKey {
             kind: ObjectKind::new("b".repeat(64)).unwrap(),
             object: ObjectKey::new("c".repeat(1024)).unwrap(),
-            page_id: 42,
+            range: u64::MAX - 1..u64::MAX,
         };
 
         let mut encoded_key = Vec::new();
@@ -514,14 +507,12 @@ mod tests {
         fn prop_cache_key_header_preserves_fields(
             version in 0u8..=255,
             kind_len in 1usize..=64,
-            key_len in 1usize..=1024,
-            page_id in 0u16..=u16::MAX
+            key_len in 1usize..=1024
         ) {
-            let header = CacheKeyHeader::new(version, kind_len, key_len, page_id).unwrap();
+            let header = CacheKeyHeader::new(version, kind_len, key_len).unwrap();
             prop_assert_eq!(header.version(), version);
             prop_assert_eq!(header.kind_len(), kind_len);
             prop_assert_eq!(header.key_len(), key_len);
-            prop_assert_eq!(header.page_id(), page_id);
         }
 
         #[test]
@@ -547,12 +538,13 @@ mod tests {
         fn prop_cache_key_roundtrip(
             kind in "[a-z0-9.-]{1,64}",
             object in "[a-zA-Z0-9/_.-]{1,1024}",
-            page_id in 0u16..=u16::MAX
+            start in any::<u64>(),
+            end in any::<u64>()
         ) {
             let key = CacheKey {
                 kind: ObjectKind::new(kind).unwrap(),
                 object: ObjectKey::new(object).unwrap(),
-                page_id,
+                range: start..end,
             };
 
             let mut encoded = Vec::new();
@@ -601,8 +593,8 @@ mod tests {
             (CacheKey::VERSION, b"\xff\xff\xff\xff", b"test"),
             (CacheKey::VERSION, b"kind", b"\xff\xff\xff\xff"),
         ] {
-            let header = CacheKeyHeader::new(version, kind.len(), object.len(), 0).unwrap();
-            let data = [header.to_bytes().as_slice(), kind, object].concat();
+            let header = CacheKeyHeader::new(version, kind.len(), object.len()).unwrap();
+            let data = [header.to_bytes().as_slice(), kind, object, &[0; 16]].concat();
             assert!(CacheKey::decode(&mut data.as_slice()).is_err());
         }
     }

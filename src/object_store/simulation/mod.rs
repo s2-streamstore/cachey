@@ -174,7 +174,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                     let calibration = downloader
                         .clone()
                         .with_test_limits(super::DownloadLimits {
-                            page_timeout: Duration::from_secs(60),
+                            download_timeout: Duration::from_secs(60),
                             bucket_timeout: Duration::from_secs(60),
                             hedge_budget_percent: 0,
                             ..scenario.limits()
