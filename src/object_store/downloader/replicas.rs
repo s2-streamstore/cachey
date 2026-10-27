@@ -463,7 +463,7 @@ impl Downloader {
         };
         followups.started(primary);
         let mut hedge = HedgeTimer::new(
-            primary_copy.model,
+            primary_copy.model.clone(),
             &request.primary_timeline,
             bytes,
             self.limits.hedge_budget_percent > 0 && !probing,

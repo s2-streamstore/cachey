@@ -175,7 +175,7 @@ mod tests {
         );
         for (bytes, delay) in [(64 * 1024, 1), (4 * MIB, 5)] {
             let timeline = RequestTimeline::default();
-            let mut timer = timer(model, &timeline, bytes);
+            let mut timer = timer(model.clone(), &timeline, bytes);
             timeline.start();
             assert_eq!(
                 due_after(&mut timer).await,

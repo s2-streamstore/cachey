@@ -34,6 +34,7 @@ pub struct Transport {
     pub delivered_bytes: u64,
     pub fault: Option<FaultKind>,
     pub capacity_rejected: bool,
+    pub cold: bool,
 }
 
 #[derive(Debug)]
@@ -42,6 +43,8 @@ pub struct State {
     pub transports: Vec<Transport>,
     invocations: HashMap<(u64, usize, String), (u32, u32)>,
     invocation_counts: HashMap<(u64, usize), u32>,
+    /// When each cold object a replica is fetching turns warm.
+    warm_at: HashMap<(u64, usize), Instant>,
     outstanding: Vec<usize>,
     pub client_active: usize,
     pub peak_client: usize,
@@ -59,6 +62,7 @@ impl State {
             transports: vec![],
             invocations: HashMap::new(),
             invocation_counts: HashMap::new(),
+            warm_at: HashMap::new(),
             outstanding: vec![0; replicas],
             client_active: 0,
             peak_client: 0,
@@ -316,6 +320,7 @@ impl HttpConnector for Backend {
             delivered_bytes: 0,
             fault: fault.map(|value| value.0),
             capacity_rejected: rejected,
+            cold: false,
         });
         state.client_active += 1;
         state.peak_client = state.peak_client.max(state.client_active);
@@ -455,17 +460,34 @@ impl Backend {
         };
         let mut headers_ms = jitter(replica.headers_ms(body_bytes), 1000);
         let mut body_ms = jitter(replica.body_ms(body_bytes), 1001);
+        let mut header_fault = false;
         if let Some((kind, duration)) = fault {
             match kind {
                 FaultKind::HeaderStall
                 | FaultKind::ServiceError
                 | FaultKind::Missing
-                | FaultKind::Overload => headers_ms = duration,
+                | FaultKind::Overload => {
+                    headers_ms = duration;
+                    header_fault = true;
+                }
                 FaultKind::BodyStall | FaultKind::BodyError | FaultKind::Slow => body_ms = duration,
             }
         }
+        let mut headers_at = Instant::now() + Duration::from_millis(headers_ms);
+        let age_ms = self.scenario.read_age_ms(self.seed, transport.read);
+        if !header_fault && replica.is_cold(age_ms, body_bytes) {
+            let mut state = self.state.lock();
+            state.transports[index].cold = true;
+            let warm_at = *state
+                .warm_at
+                .entry((transport.read, transport.replica))
+                .or_insert_with(|| {
+                    headers_at + Duration::from_millis(jitter(replica.cold_headers_ms, 1002))
+                });
+            headers_at = headers_at.max(warm_at);
+        }
         let response = Response {
-            headers_at: Instant::now() + Duration::from_millis(headers_ms),
+            headers_at,
             error: match fault.map(|value| value.0) {
                 Some(FaultKind::ServiceError) => Some((500, "InternalError")),
                 Some(FaultKind::Missing) => Some((404, "NoSuchKey")),

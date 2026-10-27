@@ -17,10 +17,11 @@ median, scaled by a moving average of the last 32 successful reads relative to i
 by an excess from canceled copies. The moving average follows a shift in latency
 sooner than the model does, and since it is taken against the current median, a
 shift the model absorbs is not counted twice. Outside the range of sizes its model has
-observed, a bucket is ranked by the model's estimate: its line where the cost per byte
-is measurable, or else its median at the largest size it has seen, since latency grows
-with size. An estimate can be far off, so there a peer never ranks ahead of the first
-bucket, and reads of those sizes leave the moving average alone.
+observed, a bucket is ranked by the model's estimate: its last segment extended where
+latency grows measurably with size, or else its median at the largest size it has
+seen, since latency grows with size. An estimate can be far off, so there a peer never
+ranks ahead of the first bucket, and reads of those sizes leave the moving average
+alone.
 
 Canceled copies raise the excess toward how far they outlasted their routing
 latency, as a fraction, so a slow large read slows small ones only in proportion.
@@ -54,30 +55,32 @@ admission and the models count a read at the bytes the object holds within it, w
 is what it receives. Without it, the models of page reads describe whatever response
 sizes pages return.
 
-Each model fits one line to the median:
+Each model groups samples into size bands four times apart. A band is a point at its
+median size and median latency. Its p95 and p99 are its median times those quantiles
+of each sample's latency relative to the median at the sample's size, so where
+latency grows with size, the band's largest sizes do not set its tail. Each band's
+quantiles come only from its own samples, so a stall or slow mode at one size never
+stretches another's. Each quantile is made nondecreasing across bands by pooling
+adjacent violators into their weighted mean, and a band's p95 and p99 are raised to
+at least its median and p95.
 
-```text
-median = fixed cost + bytes × cost per byte
-```
+Between points, quantiles are interpolated linearly. Below the smallest point, body
+time falls toward 1 ms at zero bytes, as transfer cost, and the other intervals hold
+flat, as fixed cost. Beyond the largest point, quantiles extend along the last
+segment, so sizes beyond every retained observation are predicted only where latency
+grows measurably with size. Predictions have a 1 ms floor.
 
-Both coefficients are nonnegative. A line minimizing absolute deviations sets the
-trend; the fixed cost is then refit to residuals relative to the trend's prediction at
-each size, and the cost per byte to absolute deviations at that fixed cost. Absolute
-deviations at small sizes stay small even when they are many times the latency, so
-where no line fits every size, as during a change in speed, the trend can drop the
-fixed cost. Relative residuals let small sizes set it, while large sizes still decide
-the cost per byte. Predictions have a 1 ms floor. A single tail
-ratio scales the median to p99 for every size, so p99 needs as much data as one
-quantile rather than a second line. Observations weigh into the ratio by their
-predicted median, so constant stalls on small reads do not scale large ones. Sizes
-beyond every retained observation are predicted only from a measurable cost per
-byte. With one observed size, body time is treated as transfer cost and the other
-intervals as fixed cost.
+Latency need not grow in proportion to size. S3 Standard serves objects from a cache
+while their age times their size stays under about 50 MiB·s, with a first byte in
+about 30 ms, and adds about 80 ms when they are cold, regardless of size. A large
+object goes cold within seconds, so in a band of large reads most are cold, while
+small reads stay warm. A line through every size predicts seconds for 16 MiB from
+that step; quantiles by band follow it.
 
 Observations have a 15-second half-life of model time. Model time advances at most
 150 ms per observation, so a half-life spans at least 100 observations when traffic
 is light, and idle buckets keep their history. Each model retains up to 1,024
-samples, split evenly across size bands four times apart, so rare sizes survive.
+samples, split evenly across size bands, so rare sizes survive.
 Priority sampling keeps weights unbiased. Samples are dropped once they weigh under
 0.4% of a new observation.
 
@@ -100,8 +103,13 @@ starting at its first admission, whose expiry counts against health once. Up to 
 copies can run per download; the first validated result wins and cancels the others.
 
 Early hedges use the first-byte model at the requested size, then the body model at
-the announced size. Each delay is p99 capped at 1.5 times the median. Health,
-rescue, and retry decisions use uncapped estimates.
+the announced size. Each delay is p99 capped at 1.25 times the p95. Where stalls
+exceed 1% of reads they set the p99, and the cap keeps hedges early; with ±20% jitter
+it is about 1.5 times the median. The cap follows the p95 rather than the median
+because reads of one size can split between fast and slow objects, like S3 Standard's
+warm and cold ones. Every copy of a cold read waits for the same fetch from storage,
+so hedging it only spends the budget that stalls need. Health, rescue, and retry
+decisions use uncapped estimates.
 
 Early hedges use one SDK attempt, skip overloaded buckets, and never wait for
 admission. They prefer an untried bucket expected to finish within its timeout and
@@ -164,9 +172,7 @@ contacting a backend.
 
 | Measurement | Meaning |
 |-------------|---------|
-| `cachey_bucket_latency_base_seconds` | Median latency of a zero-byte request |
-| `cachey_bucket_latency_seconds_per_byte` | Median latency added per byte |
-| `cachey_bucket_latency_tail_ratio` | p99 latency as a multiple of the median |
+| `cachey_bucket_latency_seconds` | Median, p95, or p99 (`quantile`) of a size band, labeled by its smallest size (`bytes`) |
 | `cachey_bucket_latency_model_bytes` | Largest size retained by the model |
 | `cachey_bucket_latency_predictions_total` | Observations at sizes the model predicted |
 | `cachey_bucket_latency_predictions_exceeded_total` | Those slower than the predicted median (`quantile="0.5"`) or p99 (`quantile="0.99"`) |
@@ -176,9 +182,10 @@ contacting a backend.
 | `cachey_first_chunk_latency_seconds` | Handler time to first chunk, including cache lookup and coalescing |
 
 Latency gauges have a `phase` label: `first_byte`, `body`, or `request`. They are
-absent until measured. A hedge delay is the median at the read's size times the
-smaller of the tail ratio and 1.5. Buffered-only history reports zero cost per byte.
-Latencies exclude transmission to the client.
+absent until measured, and a band's series only while it retains samples. A band's
+quantiles are those at its median size, after pooling across bands. A hedge delay is
+the p99 at the read's size capped at 1.25 times the p95. Latencies exclude
+transmission to the client.
 
 Prediction counters compare each observation that trains a model with the fit in use
 when it arrives. For an accurate model, half exceed the median and 1% exceed p99.

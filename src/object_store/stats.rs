@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, MutexGuard};
 use tokio::{sync::SetOnce, time::Instant};
 
-pub use self::model::{LatencyEstimate, Predictions};
+pub use self::model::{BandLatency, LatencyEstimate, Predictions, QUANTILES};
 use self::model::{Median, Refit, SizeHistogram, SizeModel, TIMER_RESOLUTION};
 use crate::{
     object_store::DownloadLimits,
@@ -155,7 +155,7 @@ impl Sample {
 
 /// Per-bucket latency by size. Time to first byte and complete requests are modeled by
 /// requested bytes, bodies by the length announced in headers.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct LatencyModel {
     pub first_byte: SizeModel,
     pub body: SizeModel,
@@ -728,7 +728,7 @@ impl RoutingSnapshot {
     }
 
     pub fn model(&self, index: usize) -> LatencyModel {
-        self.buckets[index].model
+        self.buckets[index].model.clone()
     }
 
     pub fn overloaded(&self, index: usize) -> bool {
@@ -805,6 +805,7 @@ impl BucketedStats {
                     refit(&mut stats, now, Some(index) == oldest);
                     let model = stats.estimates.model();
                     let median = model.request.median(requested_bytes);
+                    let tail = model.request.tail(requested_bytes);
                     let current = stats.routing_latency(now, median.map(Median::value));
                     if index == 0 {
                         preferred_latency = current;
@@ -817,7 +818,7 @@ impl BucketedStats {
                         stats: state.clone(),
                         model,
                         median: median.map(Median::value),
-                        tail: model.request.tail(requested_bytes),
+                        tail,
                         latency: locality_adjusted(latency, index),
                         deprioritized: stats.deprioritized,
                         error_rate: stats.error_rate(now),
@@ -1376,7 +1377,10 @@ mod tests {
         let mut exported = 0;
         stats.export_bucket_metrics(|bucket, metrics| {
             assert_eq!(
-                metrics.request.map(|estimate| estimate.base),
+                metrics
+                    .request
+                    .as_ref()
+                    .map(|estimate| estimate.bands[0].quantiles[0]),
                 Some(Duration::from_millis(3))
             );
             let entry = stats

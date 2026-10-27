@@ -37,6 +37,12 @@ resolved configuration, seed, sampling mode, Git revision, and dirty-tree flag.
 Replicas have limited service slots and queues. Queue overflow returns `SlowDown`;
 cancellation can leave work running for a configurable delay.
 
+A replica with `hot_mib_ms` models S3 Standard's cache: an object is cold once its age
+in milliseconds times its size in MiB exceeds it, and a cold read adds
+`cold_headers_ms` before headers. Every copy of a cold read waits for the first
+copy's fetch, so a hedge gets headers no sooner. Fixtures with such replicas set
+`object_ages`, sampled log-uniformly per read.
+
 Fixtures cover errors, missing objects, stalls, overload, cancellation, and recovery.
 Warmup reads establish latency history; zero warmup tests cold starts. Admission
 reservations are independent of response size.
@@ -53,6 +59,7 @@ before headers, then serves it from memory.
 | Profile | Replicas | Before headers | After headers |
 |---------|----------|----------------|---------------|
 | S3 Standard | one bucket in the region | 25 ms | 11 ms per MiB |
+| S3 Standard, cold objects | one bucket in the region, objects 1 s to 1 h old | 27 ms, plus 80 ms when cold | 6 ms per MiB |
 | S3 Standard, cross-region | the local bucket and replicas in two other regions | 25, 85, 165 ms | 11 ms per MiB |
 | S3 Express One Zone | a directory bucket per AZ, the first local | 3, 4, 5 ms | 4 ms per MiB |
 | Capacitor | a deployment per AZ, the first local, chunks up to 4 MiB | 1, 2, 2 ms plus 1 ms per MiB | 1 ms per MiB |
@@ -60,7 +67,16 @@ before headers, then serves it from memory.
 Exact-range fixtures read sizes log-uniformly from 1 KiB to each profile's largest
 response, starting cold. A sparse Express fixture reads once per second. Admission
 burst fixtures send groups of simultaneous reads to one bucket through eight
-admission slots.
+admission slots. The cold-object fixtures read 16 KiB to 16 MiB log-uniformly, one
+with 1% of reads stalling before headers and 1% slowed.
+
+Measured in us-east-1 from EC2 in 2026, S3 Standard's first byte took about 30 ms
+for a warm object and 100–120 ms for a cold one, at any size. An object stayed warm
+while its age times its size was under about 50 MiB·s: 16 MiB cooled within 5 s and
+256 KiB within 120 s, while 16 KiB stayed warm past 10 minutes. Reading it again
+warmed it. A second copy sent within 10 ms of a cold read was just as cold, and later
+copies finished no sooner than the first. S3 Express One Zone took 5–8 ms at every
+size and age.
 
 ## Interpreting results
 

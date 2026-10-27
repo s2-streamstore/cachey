@@ -1346,6 +1346,80 @@
     ]
   },
   {
+    "name": "s3_standard_cold_objects",
+    "duration_ms": 60000,
+    "interval_ms": 20,
+    "body_bytes": 16777216,
+    "short_body": {
+      "bytes": 16384,
+      "max_bytes": 16777216,
+      "log_uniform": true,
+      "probability_ppm": 1000000
+    },
+    "object_ages": {
+      "min_ms": 1000,
+      "max_ms": 3600000
+    },
+    "jitter_percent": 20,
+    "hedge_percent": 5,
+    "replicas": [
+      {
+        "headers_ms": 27,
+        "body_ms_per_mib": 6,
+        "hot_mib_ms": 50000,
+        "cold_headers_ms": 80
+      }
+    ]
+  },
+  {
+    "name": "s3_standard_cold_objects_stalls",
+    "duration_ms": 60000,
+    "interval_ms": 20,
+    "body_bytes": 16777216,
+    "short_body": {
+      "bytes": 16384,
+      "max_bytes": 16777216,
+      "log_uniform": true,
+      "probability_ppm": 1000000
+    },
+    "object_ages": {
+      "min_ms": 1000,
+      "max_ms": 3600000
+    },
+    "jitter_percent": 20,
+    "hedge_percent": 5,
+    "replicas": [
+      {
+        "headers_ms": 27,
+        "body_ms_per_mib": 6,
+        "hot_mib_ms": 50000,
+        "cold_headers_ms": 80
+      }
+    ],
+    "faults": [
+      {
+        "replicas": [
+          0
+        ],
+        "kind": "header_stall",
+        "start_ms": 1000,
+        "end_ms": 60000,
+        "probability_ppm": 10000,
+        "duration_ms": 1000
+      },
+      {
+        "replicas": [
+          0
+        ],
+        "kind": "slow",
+        "start_ms": 1000,
+        "end_ms": 60000,
+        "probability_ppm": 10000,
+        "duration_ms": 1500
+      }
+    ]
+  },
+  {
     "name": "s3_express_exact_ranges_healthy",
     "duration_ms": 12000,
     "interval_ms": 20,

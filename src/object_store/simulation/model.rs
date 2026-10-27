@@ -5,6 +5,7 @@ use crate::{object_store::DownloadLimits, service::PAGE_SIZE};
 
 const SHORT_BODY_DOMAIN: u64 = 2000;
 const SHORT_BODY_LENGTH_DOMAIN: u64 = 2001;
+const OBJECT_AGE_DOMAIN: u64 = 2002;
 const PPM: u32 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +18,12 @@ pub struct Replica {
     pub body_ms_per_mib: u64,
     pub slots: u32,
     pub queue: u32,
+    /// An object stays hot while its age times its size in MiB is below this, as S3
+    /// Standard's cache keeps large objects for less time. Without it, objects never cool.
+    pub hot_mib_ms: Option<u64>,
+    /// Time a cold object adds before headers. Every copy of a cold read waits for the
+    /// first copy's fetch, so a later copy gets headers no sooner.
+    pub cold_headers_ms: u64,
 }
 
 impl Default for Replica {
@@ -28,11 +35,21 @@ impl Default for Replica {
             body_ms_per_mib: 0,
             slots: 1024,
             queue: 1024,
+            hot_mib_ms: None,
+            cold_headers_ms: 0,
         }
     }
 }
 
 impl Replica {
+    pub fn is_cold(&self, age_ms: Option<u64>, body_bytes: usize) -> bool {
+        self.hot_mib_ms
+            .zip(age_ms)
+            .is_some_and(|(hot_mib_ms, age_ms)| {
+                u128::from(age_ms) * body_bytes as u128 > u128::from(hot_mib_ms) * u128::from(MIB)
+            })
+    }
+
     pub fn headers_ms(&self, body_bytes: usize) -> u64 {
         self.headers_ms + self.headers_ms_per_mib * body_bytes as u64 / MIB
     }
@@ -57,6 +74,14 @@ pub struct ShortBody {
     #[serde(default)]
     pub log_uniform: bool,
     pub probability_ppm: u32,
+}
+
+/// Ages of the objects that reads target, sampled uniformly in log space.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectAges {
+    pub min_ms: u64,
+    pub max_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +138,7 @@ pub struct Scenario {
     pub body_bytes: usize,
     pub short_body: Option<ShortBody>,
     pub request_bytes: Option<u64>,
+    pub object_ages: Option<ObjectAges>,
     pub chunks: u32,
     pub jitter_percent: u32,
     pub replicas: Vec<Replica>,
@@ -139,6 +165,7 @@ impl Default for Scenario {
             body_bytes: 1024,
             short_body: None,
             request_bytes: None,
+            object_ages: None,
             chunks: 4,
             jitter_percent: 0,
             replicas: vec![
@@ -191,6 +218,17 @@ impl Scenario {
             "invalid replica capacity"
         );
         eyre::ensure!(
+            self.object_ages
+                .as_ref()
+                .is_none_or(|ages| ages.min_ms > 0 && ages.max_ms > ages.min_ms)
+                && (self.object_ages.is_some()
+                    || self
+                        .replicas
+                        .iter()
+                        .all(|replica| replica.hot_mib_ms.is_none())),
+            "a replica with a hot cache needs object ages"
+        );
+        eyre::ensure!(
             self.sdk_attempts > 0 && self.jitter_percent <= 100,
             "invalid SDK or latency configuration"
         );
@@ -234,10 +272,8 @@ impl Scenario {
                 short.max_bytes.map_or(short.bytes, |max| {
                     let value = draw(seed, read, 0, 0, 0, SHORT_BODY_LENGTH_DOMAIN);
                     if short.log_uniform {
-                        let fraction = (value >> 11) as f64 / (1_u64 << 53) as f64;
-                        let bytes =
-                            short.bytes as f64 * (max as f64 / short.bytes as f64).powf(fraction);
-                        (bytes as usize).clamp(short.bytes, max - 1)
+                        (log_uniform(value, short.bytes as f64, max as f64) as usize)
+                            .clamp(short.bytes, max - 1)
                     } else {
                         short.bytes + (value % (max - short.bytes) as u64) as usize
                     }
@@ -245,6 +281,13 @@ impl Scenario {
             }
             _ => self.body_bytes,
         }
+    }
+
+    pub fn read_age_ms(&self, seed: u64, read: u64) -> Option<u64> {
+        self.object_ages.as_ref().map(|ages| {
+            let value = draw(seed, read, 0, 0, 0, OBJECT_AGE_DOMAIN);
+            log_uniform(value, ages.min_ms as f64, ages.max_ms as f64) as u64
+        })
     }
 
     /// A fixed page when `request_bytes` is set, otherwise exactly the response.
@@ -288,6 +331,11 @@ pub fn draw(
         ^ mix(u64::from(invocation) + 200)
         ^ mix(u64::from(attempt) + 300)
         ^ mix(domain))
+}
+
+fn log_uniform(draw: u64, low: f64, high: f64) -> f64 {
+    let fraction = (draw >> 11) as f64 / (1_u64 << 53) as f64;
+    low * (high / low).powf(fraction)
 }
 
 /// Whether a draw falls within a probability given in parts per million.

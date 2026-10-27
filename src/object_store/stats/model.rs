@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, btree_map::Entry},
+    sync::Arc,
     time::Duration,
 };
 
@@ -9,32 +10,79 @@ use super::{OBSERVATION_SPACING, reservoir::Reservoir};
 
 pub(super) const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MICROS: f64 = TIMER_RESOLUTION.as_micros() as f64;
-const FIT_PRECISION_MICROS: f64 = 0.25;
-const TAIL_QUANTILE: f64 = 0.99;
-const HEDGE_TAIL_CAP: f64 = 1.5;
+/// The median, p95, and p99.
+pub const QUANTILES: [f64; 3] = [0.5, 0.95, 0.99];
+const HEDGE_TAIL_CAP: f64 = 1.25;
 /// Samples a histogram retains, split evenly across its size bands.
 const SAMPLES: usize = 1024;
 
-/// Median latency by size; never below timer resolution.
-#[derive(Debug, Clone, Copy)]
-struct Line {
-    fixed: f64,
-    per_byte: f64,
+/// Size bands are four times apart.
+fn band(bytes: u64) -> u32 {
+    bytes.ilog2() / 2
 }
 
-impl Line {
-    fn micros(self, bytes: u64) -> f64 {
-        (self.fixed + self.per_byte * bytes as f64).max(TIMER_MICROS)
-    }
+/// Latency quantiles of one size band, at the band's median size.
+#[derive(Debug, Clone, Copy, Default)]
+struct Point {
+    band: u32,
+    bytes: f64,
+    micros: [f64; 3],
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Estimate {
-    median: Line,
-    /// p99 latency as a multiple of the median, at least 1.
-    tail_ratio: f64,
+/// Latency quantiles by size: each band's quantiles, nondecreasing with size and joined by
+/// straight segments.
+#[derive(Debug, Clone)]
+struct Curve {
+    points: Arc<[Point]>,
+    /// One observed size fits a transfer cost rather than a fixed cost.
+    proportional: bool,
     smallest_bytes: u64,
     largest_bytes: u64,
+}
+
+impl Curve {
+    /// Quantiles at a size. Beyond the largest observed size, the last segment's slope
+    /// predicts larger reads, and none are predicted where it measures no cost per byte.
+    fn micros(&self, bytes: u64) -> Option<[f64; 3]> {
+        let points = &self.points[..];
+        let size = bytes as f64;
+        let first = points[0];
+        let last = points[points.len() - 1];
+        // A proportional curve of one size runs from the timer resolution at zero bytes.
+        let origin = Point {
+            micros: [TIMER_MICROS; 3],
+            ..Point::default()
+        };
+        let (from, to) = match points {
+            [_] if self.proportional => (origin, first),
+            [_] => (first, first),
+            _ if size <= first.bytes && self.proportional => (origin, first),
+            _ if size <= first.bytes => (first, first),
+            _ => points
+                .windows(2)
+                .find(|pair| size <= pair[1].bytes)
+                .map_or((points[points.len() - 2], last), |pair| (pair[0], pair[1])),
+        };
+        let span = to.bytes - from.bytes;
+        let slope = |quantile: usize| {
+            if span > 0.0 {
+                (to.micros[quantile] - from.micros[quantile]) / span
+            } else {
+                0.0
+            }
+        };
+        if bytes > self.largest_bytes && slope(0) * self.largest_bytes as f64 <= TIMER_MICROS {
+            return None;
+        }
+        let along = (size - to.bytes).max(from.bytes - to.bytes);
+        let mut micros: [f64; 3] = std::array::from_fn(|quantile| {
+            (to.micros[quantile] + slope(quantile) * along).max(TIMER_MICROS)
+        });
+        // Quantiles extrapolated along their own slopes must not cross.
+        micros[1] = micros[1].max(micros[0]);
+        micros[2] = micros[2].max(micros[1]);
+        Some(micros)
+    }
 }
 
 /// How observations compared with the model in use when each arrived.
@@ -46,15 +94,19 @@ pub struct Predictions {
     pub above_tail: u64,
 }
 
+/// A size band's fitted latency quantiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandLatency {
+    /// The smallest size in the band; bands are four times apart.
+    pub bytes: u64,
+    /// The median, p95, and p99, as [`QUANTILES`] lists them.
+    pub quantiles: [Duration; 3],
+}
+
 /// A fitted latency model, exported as metrics.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LatencyEstimate {
-    /// Median latency of a zero-byte request.
-    pub base: Duration,
-    /// Median latency added per byte, in seconds.
-    pub seconds_per_byte: f64,
-    /// p99 latency as a multiple of the median.
-    pub tail_ratio: f64,
+    pub bands: Vec<BandLatency>,
     /// Largest retained size; larger sizes are predicted only from a measurable per-byte cost.
     pub largest_bytes: u64,
     pub predictions: Predictions,
@@ -69,7 +121,7 @@ fn duration(micros: f64) -> Duration {
 pub(in crate::object_store) enum Median {
     /// Within the range of retained sizes.
     Observed(Duration),
-    /// Outside it: along the median line where the cost per byte is measurable, or else the
+    /// Outside it: along the last segment where the cost per byte is measurable, or else the
     /// median at the largest retained size, a lower bound since latency grows with size.
     /// Either way an estimate that can be far off, so it is not evidence about the bucket.
     Unobserved(Duration),
@@ -83,45 +135,41 @@ impl Median {
     }
 }
 
-/// Latency by size: a median line and a tail ratio shared by all sizes.
-#[derive(Debug, Clone, Copy, Default)]
-pub(in crate::object_store) struct SizeModel(Option<Estimate>);
+/// Latency quantiles by size band.
+#[derive(Debug, Clone, Default)]
+pub(in crate::object_store) struct SizeModel(Option<Curve>);
 
 impl SizeModel {
-    fn micros(&self, bytes: u64) -> Option<(f64, f64)> {
-        let estimate = self.0?;
-        if bytes > estimate.largest_bytes
-            && estimate.median.per_byte * estimate.largest_bytes as f64 <= TIMER_MICROS
-        {
-            return None;
-        }
-        let median = estimate.median.micros(bytes);
-        Some((median, median * estimate.tail_ratio))
-    }
-
     /// None until measured.
     pub fn median(&self, bytes: u64) -> Option<Median> {
-        let estimate = self.0?;
-        Some(match self.micros(bytes) {
-            Some((median, _))
-                if (estimate.smallest_bytes..=estimate.largest_bytes).contains(&bytes) =>
-            {
-                Median::Observed(duration(median))
+        let curve = self.0.as_ref()?;
+        Some(match curve.micros(bytes) {
+            Some(micros) if (curve.smallest_bytes..=curve.largest_bytes).contains(&bytes) => {
+                Median::Observed(duration(micros[0]))
             }
-            Some((median, _)) => Median::Unobserved(duration(median)),
-            None => Median::Unobserved(duration(estimate.median.micros(estimate.largest_bytes))),
+            Some(micros) => Median::Unobserved(duration(micros[0])),
+            None => Median::Unobserved(duration(curve.micros(curve.largest_bytes)?[0])),
         })
     }
 
     /// Uncapped p99.
     pub fn tail(&self, bytes: u64) -> Option<Duration> {
-        self.micros(bytes).map(|(_, tail)| duration(tail))
+        self.0
+            .as_ref()?
+            .micros(bytes)
+            .map(|micros| duration(micros[2]))
     }
 
-    /// p99, capped at 1.5 times the median.
+    /// p99, capped at 1.25 times the p95. Where stalls exceed 1% of reads they set the p99,
+    /// and the cap keeps hedges early; with ±20% jitter it is 1.5 times the median. It caps
+    /// the p95 rather than the median because reads of one size can split between fast and
+    /// slow objects, like S3 Standard's warm and cold ones, and a hedge cannot speed up the
+    /// slow mode once it is 5% of reads.
     pub fn hedge_delay(&self, bytes: u64) -> Option<Duration> {
-        self.micros(bytes)
-            .map(|(median, tail)| duration(tail.min(median * HEDGE_TAIL_CAP)))
+        self.0
+            .as_ref()?
+            .micros(bytes)
+            .map(|micros| duration(micros[2].min(micros[1] * HEDGE_TAIL_CAP)))
     }
 }
 
@@ -138,156 +186,106 @@ struct Observation {
     weight: f64,
 }
 
-struct Fit {
-    line: Line,
-    loss: f64,
-    gradient: f64,
-}
-
-impl Fit {
-    fn at(observations: &[Observation], per_byte: f64, values: &mut Vec<(f64, f64)>) -> Self {
-        values.clear();
-        values.extend(observations.iter().map(|sample| {
-            (
-                sample.micros - per_byte * sample.bytes as f64,
-                sample.weight,
-            )
-        }));
-        let fixed = quantile(values, 0.5).max(0.0);
-        let line = Line { fixed, per_byte };
-        let mut loss = 0.0;
-        let (mut below_weight, mut above_weight, mut tied_weight) = (0.0, 0.0, 0.0);
-        let (mut below_bytes, mut above_bytes, mut tied_bytes) = (0.0, 0.0, 0.0);
-        for sample in observations {
-            let bytes = sample.bytes as f64;
-            let residual = sample.micros - per_byte * bytes - fixed;
-            loss += sample.weight * residual.abs();
-            if residual < 0.0 {
-                below_weight += sample.weight;
-                below_bytes += sample.weight * bytes;
-            } else if residual > 0.0 {
-                above_weight += sample.weight;
-                above_bytes += sample.weight * bytes;
-            } else {
-                tied_weight += sample.weight;
-                tied_bytes += sample.weight * bytes;
-            }
-        }
-        // Balance the intercept's subgradient at tied samples, respecting the zero boundary.
-        let tied = if tied_weight > 0.0 {
-            ((above_weight - below_weight) / tied_weight).clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        Fit {
-            line,
-            loss,
-            gradient: below_bytes - above_bytes + tied * tied_bytes,
-        }
-    }
-}
-
-/// The least-absolute-deviations trend, with its fixed cost refit to residuals relative to
-/// the trend's prediction at each size, then its cost per byte refit to absolute deviations
-/// at that fixed cost. Where no line fits every size, absolute deviations at small sizes stay
-/// small even when they are many times the latency, so the trend can drop the fixed cost
-/// entirely. Relative residuals let small sizes set it, while large sizes still decide the
-/// cost per byte.
-fn median_line(
-    observations: &[Observation],
-    largest_bytes: u64,
-    proportional: bool,
-    values: &mut Vec<(f64, f64)>,
-) -> Line {
-    let trend = least_absolute_deviations(observations, largest_bytes, proportional, values);
-    values.clear();
-    values.extend(observations.iter().map(|sample| {
-        (
-            sample.micros - trend.per_byte * sample.bytes as f64,
-            sample.weight / trend.micros(sample.bytes),
-        )
-    }));
-    let fixed = quantile(values, 0.5).max(0.0);
-    values.clear();
-    values.extend(observations.iter().map(|sample| {
-        let bytes = sample.bytes as f64;
-        ((sample.micros - fixed) / bytes, sample.weight * bytes)
-    }));
-    Line {
-        fixed,
-        per_byte: quantile(values, 0.5).max(0.0),
-    }
-}
-
-/// Least absolute deviations with nonnegative coefficients. For each slope the optimal
-/// intercept is a weighted median of residuals, and the loss is convex in the slope.
-/// Nonnegative fixed cost bounds the slope by the zero-intercept fit.
-/// Supporting lines bracket the minimum; each step discards at least a quarter of the bracket.
-fn least_absolute_deviations(
-    observations: &[Observation],
-    largest_bytes: u64,
-    proportional: bool,
-    values: &mut Vec<(f64, f64)>,
-) -> Line {
-    values.clear();
-    values.extend(observations.iter().map(|sample| {
-        (
-            sample.micros / sample.bytes as f64,
-            sample.weight * sample.bytes as f64,
-        )
-    }));
-    let upper = quantile(values, 0.5);
-    let bytes = observations[0].bytes;
-    if observations.iter().all(|sample| sample.bytes == bytes) {
-        return if proportional {
-            Line {
-                fixed: TIMER_MICROS,
-                per_byte: (upper - TIMER_MICROS / bytes as f64).max(0.0),
-            }
-        } else {
-            Line {
-                fixed: upper * bytes as f64,
-                per_byte: 0.0,
-            }
-        };
-    }
-    let largest_bytes = largest_bytes as f64;
-    // Below this loss, every retained sample fits within the histogram's time precision.
-    let resolved_loss = FIT_PRECISION_MICROS
-        * observations
-            .iter()
-            .map(|sample| sample.weight)
-            .fold(f64::INFINITY, f64::min);
-    let mut evaluate = |per_byte| Fit::at(observations, per_byte, values);
-    let mut lower = evaluate(0.0);
-    if lower.gradient >= 0.0 {
-        return lower.line;
-    }
-    let mut upper = evaluate(upper);
-    if upper.gradient <= 0.0 {
-        return upper.line;
-    }
-    loop {
-        let width = upper.line.per_byte - lower.line.per_byte;
-        let fraction = (((lower.loss - upper.loss) / width + upper.gradient)
-            / (upper.gradient - lower.gradient))
-            .clamp(0.25, 0.75);
-        let per_byte = lower.line.per_byte + fraction * width;
-        let fitted = evaluate(per_byte);
-        if fitted.gradient == 0.0
-            || fitted.loss <= resolved_loss
-            || width * largest_bytes <= FIT_PRECISION_MICROS
-            || per_byte <= lower.line.per_byte
-            || per_byte >= upper.line.per_byte
+/// Makes values nondecreasing by pooling adjacent violators into their weighted mean.
+fn nondecreasing(values: &mut [f64], weights: &[f64]) {
+    let mut blocks: Vec<(f64, f64, usize)> = Vec::with_capacity(values.len());
+    for (&value, &weight) in values.iter().zip(weights) {
+        blocks.push((value, weight, 1));
+        while let [
+            ..,
+            (left, left_weight, left_len),
+            (right, right_weight, right_len),
+        ] = blocks[..]
+            && left > right
         {
-            return fitted.line;
-        }
-        if fitted.gradient > 0.0 {
-            upper = fitted;
-        } else {
-            lower = fitted;
+            blocks.truncate(blocks.len() - 2);
+            let weight = left_weight + right_weight;
+            blocks.push((
+                (left * left_weight + right * right_weight) / weight,
+                weight,
+                left_len + right_len,
+            ));
         }
     }
+    let mut index = 0;
+    for (value, _, len) in blocks {
+        values[index..index + len].fill(value);
+        index += len;
+    }
+}
+
+/// Each band's median, p95, and p99, made nondecreasing across bands. A band's quantiles
+/// come only from its own samples, so a slow mode at one size never stretches another's.
+/// Its sizes span a factor of four, so its p95 and p99 are taken as multiples of the
+/// median at each sample's size, lest the band's largest sizes set its tail.
+fn curve(observations: &[Observation], proportional: bool, values: &mut Vec<(f64, f64)>) -> Curve {
+    let bands: Vec<&[Observation]> = observations
+        .chunk_by(|left, right| band(left.bytes) == band(right.bytes))
+        .collect();
+    let weights: Vec<f64> = bands
+        .iter()
+        .map(|samples| samples.iter().map(|sample| sample.weight).sum())
+        .collect();
+    let mut medians: Vec<f64> = bands
+        .iter()
+        .map(|samples| {
+            values.clear();
+            values.extend(samples.iter().map(|sample| (sample.micros, sample.weight)));
+            quantile(values, QUANTILES[0])
+        })
+        .collect();
+    nondecreasing(&mut medians, &weights);
+    let mut curve = Curve {
+        points: bands
+            .iter()
+            .zip(&medians)
+            .map(|(samples, &median)| {
+                values.clear();
+                values.extend(
+                    samples
+                        .iter()
+                        .map(|sample| (sample.bytes as f64, sample.weight)),
+                );
+                Point {
+                    band: band(samples[0].bytes),
+                    bytes: quantile(values, 0.5),
+                    micros: [median; 3],
+                }
+            })
+            .collect(),
+        proportional,
+        smallest_bytes: observations[0].bytes,
+        largest_bytes: observations[observations.len() - 1].bytes,
+    };
+    let mut tails: [Vec<f64>; 2] = Default::default();
+    for (samples, median) in bands.iter().zip(&medians) {
+        values.clear();
+        values.extend(samples.iter().map(|sample| {
+            let expected = curve
+                .micros(sample.bytes)
+                .map_or(*median, |micros| micros[0]);
+            (sample.micros / expected, sample.weight)
+        }));
+        for (tail, q) in tails.iter_mut().zip(&QUANTILES[1..]) {
+            tail.push(median * quantile(values, *q));
+        }
+    }
+    for tail in &mut tails {
+        nondecreasing(tail, &weights);
+    }
+    curve.points = curve
+        .points
+        .iter()
+        .zip(tails[0].iter().zip(&tails[1]))
+        .map(|(point, (&p95, &p99))| {
+            let p95 = p95.max(point.micros[0]);
+            Point {
+                micros: [point.micros[0], p95, p99.max(p95)],
+                ..*point
+            }
+        })
+        .collect();
+    curve
 }
 
 /// Latency observations by size. Size strata retain rare sizes for one continuous model.
@@ -349,13 +347,14 @@ impl SizeHistogram {
                 .as_secs_f64();
         }
         self.observed_at = Some(now);
-        let band = bytes.ilog2() / 2;
+        let band = band(bytes);
         if let Entry::Vacant(entry) = self.bands.entry(band) {
             entry.insert(Reservoir::new(0));
             self.rebalance();
         }
         let micros = (latency.as_secs_f64() * 1_000_000.0).max(TIMER_MICROS);
-        if let Some((median, tail)) = self.model.micros(bytes) {
+        if let Some([median, _, tail]) = self.model.0.as_ref().and_then(|curve| curve.micros(bytes))
+        {
             self.predictions.observations += 1;
             self.predictions.above_median += u64::from(micros > median);
             self.predictions.above_tail += u64::from(micros > tail);
@@ -409,15 +408,20 @@ impl SizeHistogram {
     }
 
     pub fn model(&self) -> SizeModel {
-        self.model
+        self.model.clone()
     }
 
     pub fn estimate(&self) -> Option<LatencyEstimate> {
-        self.model.0.map(|estimate| LatencyEstimate {
-            base: duration(estimate.median.fixed),
-            seconds_per_byte: estimate.median.per_byte / 1_000_000.0,
-            tail_ratio: estimate.tail_ratio,
-            largest_bytes: estimate.largest_bytes,
+        self.model.0.as_ref().map(|curve| LatencyEstimate {
+            bands: curve
+                .points
+                .iter()
+                .map(|point| BandLatency {
+                    bytes: 1 << (2 * point.band),
+                    quantiles: point.micros.map(duration),
+                })
+                .collect(),
+            largest_bytes: curve.largest_bytes,
             predictions: self.predictions,
         })
     }
@@ -435,7 +439,7 @@ impl SizeHistogram {
         if let Some(refit) = self.refit(due) {
             self.store(refit.fit());
         }
-        self.model
+        self.model.clone()
     }
 }
 
@@ -446,15 +450,13 @@ pub(super) struct Refit {
     updates: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub(super) struct Fitted {
     model: SizeModel,
     updates: u64,
 }
 
 impl Refit {
-    /// The tail ratio is the p99 quantile regression of latency on the median line. Weighting
-    /// ratios by their median keeps small requests' constant stalls from scaling large ones.
     pub fn fit(self) -> Fitted {
         let Self {
             mut observations,
@@ -462,32 +464,15 @@ impl Refit {
             updates,
         } = self;
         // Reservoirs return samples in random order; a fixed order makes rounding depend
-        // only on which samples were kept.
+        // only on which samples were kept, and groups each size band's samples.
         observations.sort_unstable_by(|left, right| {
             left.bytes
                 .cmp(&right.bytes)
                 .then(left.micros.total_cmp(&right.micros))
                 .then(left.weight.total_cmp(&right.weight))
         });
-        let model = observations
-            .first()
-            .zip(observations.last())
-            .map(|(smallest, largest)| (smallest.bytes, largest.bytes))
-            .map(|(smallest_bytes, largest_bytes)| {
-                let mut values = Vec::with_capacity(observations.len());
-                let median = median_line(&observations, largest_bytes, proportional, &mut values);
-                values.clear();
-                values.extend(observations.iter().map(|sample| {
-                    let median = median.micros(sample.bytes);
-                    (sample.micros / median, sample.weight * median)
-                }));
-                Estimate {
-                    median,
-                    tail_ratio: quantile(&mut values, TAIL_QUANTILE).max(1.0),
-                    smallest_bytes,
-                    largest_bytes,
-                }
-            });
+        let model =
+            (!observations.is_empty()).then(|| curve(&observations, proportional, &mut Vec::new()));
         Fitted {
             model: SizeModel(model),
             updates,
@@ -524,8 +509,8 @@ mod tests {
     use tokio::time::{Instant, advance};
 
     use super::{
-        Line, Median, Observation, Predictions, SizeHistogram, TIMER_MICROS, TIMER_RESOLUTION,
-        least_absolute_deviations, median_line, quantile,
+        Median, Observation, Predictions, SizeHistogram, TIMER_RESOLUTION, curve, nondecreasing,
+        quantile,
     };
 
     fn body() -> SizeHistogram {
@@ -561,7 +546,7 @@ mod tests {
         update(&mut histogram, MIB, 101);
         let model = histogram.summary(true);
         assert_eq!(model.tail(MIB), Some(Duration::from_millis(101)));
-        assert_eq!(model.hedge_delay(MIB), Some(Duration::from_micros(16_500)));
+        assert_eq!(model.hedge_delay(MIB), Some(Duration::from_micros(13_750)));
         advance(Duration::from_secs(300)).await;
         update(&mut histogram, MIB, 21);
         assert_eq!(
@@ -684,8 +669,10 @@ mod tests {
         assert!(histogram.summary(true).tail(u64::MAX).is_some());
     }
 
+    /// A stall at a rarely read size holds that size's estimate, not smaller sizes', until
+    /// more reads of the size arrive or it ages out.
     #[tokio::test(start_paused = true)]
-    async fn isolated_large_stalls_borrow_history_and_age_out_with_other_sizes() {
+    async fn a_stall_at_a_rare_size_holds_only_that_size_until_it_ages_out() {
         let mut histogram = body();
         for _ in 0..50 {
             update(&mut histogram, MIB, 11);
@@ -696,15 +683,17 @@ mod tests {
             model.median(MIB),
             Some(Median::Observed(Duration::from_millis(11)))
         );
-        // With a nonnegative intercept, extrapolation grows no faster than response size.
-        assert!(model.hedge_delay(16 * MIB).unwrap() <= Duration::from_millis(265));
+        assert_eq!(model.hedge_delay(MIB), Some(Duration::from_millis(11)));
+        assert_eq!(model.tail(16 * MIB), Some(Duration::from_millis(1001)));
         for _ in 0..800 {
             advance(Duration::from_secs(1)).await;
             update(&mut histogram, MIB, 11);
         }
+        let model = histogram.summary(true);
+        assert_eq!(model.tail(MIB), Some(Duration::from_millis(11)));
         assert_eq!(
-            histogram.summary(true).tail(MIB),
-            Some(Duration::from_millis(11))
+            model.median(16 * MIB),
+            Some(Median::Unobserved(Duration::from_millis(161)))
         );
     }
 
@@ -731,10 +720,11 @@ mod tests {
             1
         ));
         assert!(near(model.tail(16 * MIB), Duration::from_millis(800), 1));
+        // With two reads at this size, one stalled, its p95 is the stall.
         assert!(near(
             model.hedge_delay(16 * MIB),
-            Duration::from_millis(270),
-            2
+            Duration::from_millis(800),
+            1
         ));
     }
 
@@ -803,68 +793,112 @@ mod tests {
         assert_eq!(quantile(&mut [(1.0, 0.3), (2.0, 0.1)], 0.75), 1.0);
     }
 
+    fn fitted(samples: &[(u64, u64)], proportional: bool) -> super::SizeModel {
+        let mut histogram = SizeHistogram::new(proportional);
+        for &(bytes, millis) in samples {
+            update(&mut histogram, bytes, millis);
+        }
+        histogram.summary(true)
+    }
+
+    /// Latency that steps up with size and then levels off, as S3 Standard's cold objects
+    /// do, is not extended as a line through the step.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_in_latency_is_not_extrapolated_as_a_line() {
+        let samples = [
+            (64 * 1024, 30),
+            (256 * 1024, 32),
+            (MIB, 110),
+            (4 * MIB, 112),
+        ]
+        .repeat(30);
+        let model = fitted(&samples, false);
+        let median = |bytes| model.median(bytes).unwrap().value();
+        assert!(median(64 * 1024) <= Duration::from_millis(31));
+        assert!(median(4 * MIB) <= Duration::from_millis(113));
+        assert!(
+            median(16 * MIB) <= Duration::from_millis(120),
+            "{:?}",
+            median(16 * MIB)
+        );
+    }
+
+    /// When reads of one size split between warm and cold objects, a hedge cannot speed up
+    /// the cold ones, so it waits past them.
+    #[tokio::test(start_paused = true)]
+    async fn sizes_split_between_warm_and_cold_hedge_after_the_cold_mode() {
+        let samples = [(MIB, 30); 60]
+            .into_iter()
+            .chain([(MIB, 110); 40])
+            .chain([(64 * 1024, 30); 100])
+            .collect::<Vec<_>>();
+        let model = fitted(&samples, false);
+        assert!(model.hedge_delay(MIB).unwrap() >= Duration::from_millis(110));
+        assert!(model.hedge_delay(64 * 1024).unwrap() <= Duration::from_millis(45));
+    }
+
+    /// Capacitor reads a range before sending headers, so its time to first byte grows with
+    /// size. A band spans sizes four times apart, and where latency is set by size alone,
+    /// its tail follows its median rather than its largest sizes.
+    #[tokio::test(start_paused = true)]
+    async fn latency_set_by_size_alone_has_no_tail() {
+        let samples: Vec<_> = (4..=64)
+            .map(|quarters| (quarters * MIB / 4, 1 + quarters))
+            .collect();
+        let model = fitted(&samples, false);
+        for bytes in [2 * MIB, 6 * MIB, 10 * MIB, 16 * MIB] {
+            let median = model.median(bytes).unwrap().value();
+            assert!(
+                model.tail(bytes).unwrap() <= median.mul_f64(1.05),
+                "{bytes}: {:?} over a {median:?} median",
+                model.tail(bytes)
+            );
+        }
+        assert_eq!(
+            model.median(16 * MIB),
+            Some(Median::Observed(Duration::from_millis(65)))
+        );
+    }
+
     proptest! {
         #[test]
-        fn median_lines_recover_lines_that_fit_every_sample(
-            fixed in 1_000.0_f64..100_000.0,
-            per_byte in 0.0_f64..0.05,
-            samples in collection::vec((1_u64..=16 * MIB, 1_u8..=20), 2..12),
-            proportional: bool,
+        fn pooling_makes_values_nondecreasing_and_keeps_their_weighted_mean(
+            samples in collection::vec((0.0_f64..1_000.0, 0.1_f64..10.0), 1..20),
         ) {
-            let observations: Vec<_> = samples.iter().map(|&(bytes, weight)| Observation {
-                bytes,
-                micros: fixed + per_byte * bytes as f64,
-                weight: f64::from(weight),
-            }).collect();
-            let largest_bytes = observations.iter().map(|sample| sample.bytes).max().unwrap();
-            let fitted = median_line(&observations, largest_bytes, proportional, &mut Vec::new());
-            for sample in &observations {
-                prop_assert!(
-                    (fitted.micros(sample.bytes) - sample.micros).abs() <= 1.0,
-                    "{fitted:?} at {} bytes: {}", sample.bytes, sample.micros
-                );
-            }
+            let (mut values, weights): (Vec<_>, Vec<_>) = samples.into_iter().unzip();
+            let mean = |values: &[f64]| {
+                values.iter().zip(&weights).map(|(value, weight)| value * weight).sum::<f64>()
+            };
+            let before = mean(&values);
+            nondecreasing(&mut values, &weights);
+            prop_assert!(values.windows(2).all(|pair| pair[0] <= pair[1] + 1e-9), "{values:?}");
+            prop_assert!((mean(&values) - before).abs() <= 1e-6 * before.max(1.0));
         }
 
         #[test]
-        fn median_lines_match_exhaustive_least_absolute_deviations(
-            samples in collection::vec((1_u64..=16 * MIB, 0_u32..=1_000_000, 1_u8..=20, 0_u8..=10), 2..12),
+        fn quantiles_never_decrease_with_size_or_cross(
+            samples in collection::vec((1_u64..=16 * MIB, 1_000_u32..=1_000_000, 1_u8..=20), 1..60),
+            sizes in collection::vec(1_u64..=32 * MIB, 1..20),
             proportional: bool,
         ) {
-            let observations: Vec<_> = samples.iter().map(|&(bytes, micros, weight, age)| Observation {
-                bytes: if age % 2 == 0 { bytes.next_power_of_two() } else { bytes },
-                micros: f64::from(micros).max(TIMER_MICROS),
-                weight: f64::from(weight) * 2.0_f64.powi(-i32::from(age)),
+            let mut observations: Vec<_> = samples.iter().map(|&(bytes, micros, weight)| Observation {
+                bytes,
+                micros: f64::from(micros),
+                weight: f64::from(weight),
             }).collect();
-            // A piecewise-linear loss attains a minimum where two sample lines intersect,
-            // or where one sample line meets a nonnegative coefficient boundary.
-            let mut candidates = Vec::new();
-            for (index, left) in observations.iter().enumerate() {
-                candidates.extend([
-                    Line { fixed: left.micros, per_byte: 0.0 },
-                    Line { fixed: 0.0, per_byte: left.micros / left.bytes as f64 },
-                ]);
-                for right in &observations[index + 1..] {
-                    if left.bytes != right.bytes {
-                        let per_byte = (right.micros - left.micros)
-                            / (right.bytes as f64 - left.bytes as f64);
-                        let fixed = left.micros - per_byte * left.bytes as f64;
-                        if fixed >= 0.0 && per_byte >= 0.0 {
-                            candidates.push(Line { fixed, per_byte });
-                        }
-                    }
+            observations.sort_unstable_by_key(|sample| sample.bytes);
+            let curve = curve(&observations, proportional, &mut Vec::new());
+            let mut sizes = sizes;
+            sizes.sort_unstable();
+            let mut previous = [0.0; 3];
+            for bytes in sizes {
+                let Some(micros) = curve.micros(bytes) else { break };
+                prop_assert!(micros[0] <= micros[1] && micros[1] <= micros[2], "{micros:?} at {bytes}");
+                for (value, before) in micros.iter().zip(previous) {
+                    prop_assert!(*value + 1e-6 >= before, "{micros:?} after {previous:?} at {bytes}");
                 }
+                previous = micros;
             }
-            let loss = |line: Line| observations.iter().map(|sample| {
-                sample.weight * (sample.micros - line.fixed - line.per_byte * sample.bytes as f64).abs()
-            }).sum::<f64>();
-            let optimal = candidates.iter().copied().map(loss).fold(f64::INFINITY, f64::min);
-            let tolerance: f64 = observations.iter().map(|sample| sample.weight).sum();
-            let largest_bytes = observations.iter().map(|sample| sample.bytes).max().unwrap();
-            let fitted = least_absolute_deviations(&observations, largest_bytes, proportional, &mut Vec::new());
-            prop_assert!(fitted.fixed.is_finite() && fitted.fixed >= 0.0);
-            prop_assert!(fitted.per_byte.is_finite() && fitted.per_byte >= 0.0);
-            prop_assert!(loss(fitted) <= optimal + tolerance, "{fitted:?}, loss={}, optimal={optimal}", loss(fitted));
         }
     }
 }
