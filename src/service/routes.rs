@@ -80,10 +80,14 @@ fn on_chunk_error(
     (status_code, headers)
 }
 
+/// The `Range` header's byte range, and whether `C0-Exact` asks for exactly that range.
 #[derive(Debug)]
-pub struct RangeHeader(pub Range<u64>);
+pub struct ReadRange {
+    pub byterange: Range<u64>,
+    pub exact: bool,
+}
 
-impl<S> FromRequestParts<S> for RangeHeader
+impl<S> FromRequestParts<S> for ReadRange
 where
     S: Send + Sync,
 {
@@ -107,15 +111,36 @@ where
             ));
         }
 
-        match (parsed.ranges[0].start, parsed.ranges[0].end) {
+        let byterange = match (parsed.ranges[0].start, parsed.ranges[0].end) {
             (
                 http_range_header::StartPosition::Index(first_byte),
                 http_range_header::EndPosition::Index(last_byte),
             ) if first_byte <= last_byte && last_byte < super::MAX_RANGE_END => {
-                Ok(Self(first_byte..(last_byte + 1)))
+                first_byte..(last_byte + 1)
             }
-            _ => Err((StatusCode::RANGE_NOT_SATISFIABLE, "Unsupported range")),
+            _ => return Err((StatusCode::RANGE_NOT_SATISFIABLE, "Unsupported range")),
+        };
+
+        let exact = parts
+            .headers
+            .get(&C0_EXACT_HEADER)
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or((StatusCode::BAD_REQUEST, "Invalid C0-Exact header"))
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if exact && byterange.end - byterange.start > PAGE_SIZE {
+            return Err((
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "Exact range exceeds the page size",
+            ));
         }
+
+        Ok(Self { byterange, exact })
     }
 }
 
@@ -231,49 +256,18 @@ where
     }
 }
 
-#[derive(Debug)]
-pub struct ExactHeader(pub bool);
-
-impl<S> FromRequestParts<S> for ExactHeader
-where
-    S: Send + Sync,
-{
-    type Rejection = (StatusCode, &'static str);
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let Some(header_value) = parts.headers.get(&C0_EXACT_HEADER) else {
-            return Ok(Self(false));
-        };
-        header_value
-            .to_str()
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .map(Self)
-            .ok_or((StatusCode::BAD_REQUEST, "Invalid C0-Exact header"))
-    }
-}
-
 #[instrument(skip(service))]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 pub async fn fetch(
     State(service): State<CacheyService>,
     Path((kind, object)): Path<(ObjectKind, ObjectKey)>,
     method: axum::http::Method,
-    RangeHeader(byterange): RangeHeader,
+    ReadRange { byterange, exact }: ReadRange,
     ObjectSizeHeader(object_size): ObjectSizeHeader,
-    ExactHeader(exact): ExactHeader,
     BucketHeaders(buckets): BucketHeaders,
     req_config: RequestConfig,
 ) -> Response {
     let start = Instant::now();
-
-    if exact && byterange.end - byterange.start > PAGE_SIZE {
-        return (
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            "Exact range exceeds the page size",
-        )
-            .into_response();
-    }
 
     let buckets = if buckets.is_empty() {
         BucketName::from(kind.clone()).into()
@@ -503,7 +497,7 @@ mod tests {
         http::{HeaderValue, Method, Request, StatusCode, header},
     };
 
-    use super::{C0_CONFIG_HEADER, RangeHeader, on_chunk_error};
+    use super::{C0_CONFIG_HEADER, C0_EXACT_HEADER, ReadRange, on_chunk_error};
     use crate::{
         object_store::{DownloadError, RequestConfig},
         service::{PAGE_SIZE, ServiceError, metrics},
@@ -539,9 +533,9 @@ mod tests {
                 .body(())
                 .unwrap();
             let (mut parts, ()) = request.into_parts();
-            let result = RangeHeader::from_request_parts(&mut parts, &())
+            let result = ReadRange::from_request_parts(&mut parts, &())
                 .await
-                .map(|header| header.0)
+                .map(|read| read.byterange)
                 .map_err(|(status, _)| status);
             assert_eq!(
                 result,
@@ -551,6 +545,48 @@ mod tests {
                     Err(StatusCode::RANGE_NOT_SATISFIABLE)
                 }
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn c0_exact_reads_at_most_a_page() {
+        for (exact, length, expected) in [
+            (None, PAGE_SIZE + 1, Ok(false)),
+            (
+                Some(HeaderValue::from_static("false")),
+                PAGE_SIZE + 1,
+                Ok(false),
+            ),
+            (Some(HeaderValue::from_static("true")), PAGE_SIZE, Ok(true)),
+            (
+                Some(HeaderValue::from_static("true")),
+                PAGE_SIZE + 1,
+                Err(StatusCode::RANGE_NOT_SATISFIABLE),
+            ),
+            (
+                Some(HeaderValue::from_static("1")),
+                1,
+                Err(StatusCode::BAD_REQUEST),
+            ),
+            (
+                Some(HeaderValue::from_bytes(&[0xff]).unwrap()),
+                1,
+                Err(StatusCode::BAD_REQUEST),
+            ),
+        ] {
+            let mut request = Request::builder()
+                .header(header::RANGE, format!("bytes=0-{}", length - 1))
+                .body(())
+                .unwrap();
+            if let Some(value) = exact {
+                request.headers_mut().insert(&C0_EXACT_HEADER, value);
+            }
+            let (mut parts, ()) = request.into_parts();
+            let result = ReadRange::from_request_parts(&mut parts, &())
+                .await
+                .map(|read| read.exact)
+                .map_err(|(status, _)| status);
+            assert_eq!(result, expected, "{length}");
         }
     }
 

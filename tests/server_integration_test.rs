@@ -198,6 +198,38 @@ async fn test_fetch_metrics_record_success_for_ranged_get() {
     );
 }
 
+/// An exact read caches its range apart from the page holding it.
+#[tokio::test]
+async fn exact_reads_are_cached_apart_from_pages() {
+    let ctx = setup_test_server().await;
+    let data = Bytes::from_static(b"0123456789abcdefghijklmnopqrstuvwxyz");
+    let key = "exact-object";
+    upload_test_object(
+        &ctx.rustfs.client,
+        &ctx.rustfs.bucket_name,
+        key,
+        data.clone(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/fetch/{}/{key}", ctx.server_url, ctx.rustfs.bucket_name);
+
+    for (exact, cached) in [(true, false), (true, true), (false, false), (false, true)] {
+        let response = client
+            .get(&url)
+            .header("Range", "bytes=4-9")
+            .header("C0-Exact", exact.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 206);
+        let status = response.headers()["c0-status"].to_str().unwrap().to_owned();
+        let cached_at: u32 = status.rsplit("; ").next().unwrap().parse().unwrap();
+        assert_eq!(cached_at != 0, cached, "exact: {exact}, status: {status}");
+        assert_eq!(response.bytes().await.unwrap(), data.slice(4..10));
+    }
+}
+
 #[tokio::test]
 async fn cached_object_serves_ranges_after_backend_deletion() {
     let ctx = setup_test_server().await;
