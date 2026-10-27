@@ -1052,6 +1052,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.21",
  "tikv-jemalloc-ctl",
