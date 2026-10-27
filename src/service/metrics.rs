@@ -239,31 +239,25 @@ impl PageRequestType {
     }
 }
 
-fn flag(value: bool) -> &'static str {
-    if value { "1" } else { "0" }
-}
-
-pub fn page_request_count(kind: &ObjectKind, exact: bool, typ: PageRequestType) {
+pub fn page_request_count(kind: &ObjectKind, typ: PageRequestType) {
     static COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
         register_int_counter_vec!(
             "cachey_page_requests_total",
             "Page requests",
-            &["kind", "exact", "type"]
+            &["kind", "type"]
         )
         .unwrap()
     });
 
-    COUNTER
-        .with_label_values(&[&**kind, flag(exact), typ.as_label()])
-        .inc();
+    COUNTER.with_label_values(&[&**kind, typ.as_label()]).inc();
 }
 
-pub fn page_download_latency(kind: &ObjectKind, exact: bool, latency: std::time::Duration) {
+pub fn page_download_latency(kind: &ObjectKind, latency: std::time::Duration) {
     static HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec!(
             "cachey_page_download_latency_seconds",
             "Successful page download latency, including retries, hedging, and bucket fallback",
-            &["kind", "exact"],
+            &["kind"],
             vec![
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
             ]
@@ -272,7 +266,7 @@ pub fn page_download_latency(kind: &ObjectKind, exact: bool, latency: std::time:
     });
 
     HISTOGRAM
-        .with_label_values(&[&**kind, flag(exact)])
+        .with_label_values(&[&**kind])
         .observe(latency.as_secs_f64());
 }
 
@@ -298,12 +292,12 @@ pub fn set_connection_count(count: usize) {
     CONNECTION_COUNT.set(count as i64);
 }
 
-pub fn first_chunk_latency(kind: &ObjectKind, exact: bool, hit: bool, latency: Duration) {
+pub fn first_chunk_latency(kind: &ObjectKind, hit: bool, latency: Duration) {
     static HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec!(
             "cachey_first_chunk_latency_seconds",
             "Time to first chunk",
-            &["kind", "exact", "hit"],
+            &["kind", "hit"],
             vec![
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
             ]
@@ -311,8 +305,9 @@ pub fn first_chunk_latency(kind: &ObjectKind, exact: bool, hit: bool, latency: D
         .unwrap()
     });
 
+    let hit_str = if hit { "1" } else { "0" };
     HISTOGRAM
-        .with_label_values(&[&**kind, flag(exact), flag(hit)])
+        .with_label_values(&[&**kind, hit_str])
         .observe(latency.as_secs_f64());
 }
 

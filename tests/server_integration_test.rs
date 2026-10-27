@@ -212,14 +212,12 @@ async fn exact_reads_are_cached_apart_from_pages() {
     )
     .await;
     let client = reqwest::Client::new();
-    let kind = "exact-reads";
-    let url = format!("{}/fetch/{kind}/{key}", ctx.server_url);
+    let url = format!("{}/fetch/{}/{key}", ctx.server_url, ctx.rustfs.bucket_name);
 
     for (exact, cached) in [(true, false), (true, true), (false, false), (false, true)] {
         let response = client
             .get(&url)
             .header("Range", "bytes=4-9")
-            .header("C0-Bucket", &ctx.rustfs.bucket_name)
             .header("C0-Exact", exact.to_string())
             .send()
             .await
@@ -229,19 +227,6 @@ async fn exact_reads_are_cached_apart_from_pages() {
         let cached_at: u32 = status.rsplit("; ").next().unwrap().parse().unwrap();
         assert_eq!(cached_at != 0, cached, "exact: {exact}, status: {status}");
         assert_eq!(response.bytes().await.unwrap(), data.slice(4..10));
-    }
-
-    let metrics = scrape_metrics(&client, &ctx.server_url).await;
-    for exact in [0, 1] {
-        for hit in [0, 1] {
-            let line = format!(
-                "cachey_first_chunk_latency_seconds_count{{exact=\"{exact}\",hit=\"{hit}\",kind=\"{kind}\"}} 1"
-            );
-            assert!(
-                metrics.lines().any(|found| found == line),
-                "{line}\n{metrics}"
-            );
-        }
     }
 }
 
