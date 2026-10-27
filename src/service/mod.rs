@@ -747,6 +747,53 @@ mod tests {
         server_handle.abort();
     }
 
+    /// An exact read of a whole page shares the page's entry whatever size either read
+    /// expected, and is checked against the size its bucket reported.
+    #[tokio::test]
+    async fn an_exact_read_of_a_whole_page_shares_its_entry() {
+        let kind = ObjectKind::new("exact-page").unwrap();
+        let object = ObjectKey::new("object").unwrap();
+        let bucket = BucketName::new("bucket").unwrap();
+        let data = Bytes::from(vec![7; 4096]);
+        let (endpoint, request_count, server_handle) =
+            spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
+        let service = service(&endpoint, ByteSize::mib(16)).await;
+        let read = |range, object_size, exact| {
+            service
+                .clone()
+                .get(
+                    FetchRequest {
+                        kind: kind.clone(),
+                        object: object.clone(),
+                        buckets: bucket.clone().into(),
+                        byterange: range,
+                        object_size,
+                        exact,
+                        config: RequestConfig::default(),
+                    },
+                    NonZeroUsize::MIN,
+                )
+                .try_collect::<Vec<_>>()
+        };
+
+        let chunks = read(100..200, None, false).await.unwrap();
+        assert_eq!(chunks[0].data, data.slice(100..200));
+        let chunks = read(0..PAGE_SIZE, Some(4096), true).await.unwrap();
+        assert_eq!(
+            (chunks[0].range.clone(), chunks[0].data.clone()),
+            (0..4096, data)
+        );
+        assert!(matches!(
+            read(0..PAGE_SIZE, Some(1024), true).await,
+            Err(ServiceError::ObjectSizeInconsistency {
+                prev: 1024,
+                new: 4096
+            })
+        ));
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        server_handle.abort();
+    }
+
     #[tokio::test]
     async fn concurrent_service_reads_share_one_download() {
         let kind = ObjectKind::new("coalesced-reads").unwrap();
