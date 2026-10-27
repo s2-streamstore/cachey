@@ -233,7 +233,6 @@ impl CacheyService {
                             prev: expected_size,
                         });
                     }
-                    self.egress_throughput.lock().record(data.len());
                     Ok(Chunk {
                         bucket: value.bucket,
                         mtime: value.mtime,
