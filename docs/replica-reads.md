@@ -16,10 +16,11 @@ Buckets are ranked by routing latency at the read's size: the request model's
 median, scaled by a moving average of the last 32 successful reads relative to it and
 by an excess from canceled copies. The moving average follows a shift in latency
 sooner than the model does, and since it is taken against the current median, a
-shift the model absorbs is not counted twice. Beyond the sizes its model can predict, a bucket is
-ranked by its median at the largest size it has seen, since latency grows with size.
-It never ranks ahead of the first bucket there. Only reads of sizes the model has
-observed move the moving average, since an extrapolated median can be far off.
+shift the model absorbs is not counted twice. Outside the range of sizes its model has
+observed, a bucket is ranked by the model's estimate: its line where the cost per byte
+is measurable, or else its median at the largest size it has seen, since latency grows
+with size. An estimate can be far off, so there a peer never ranks ahead of the first
+bucket, and reads of those sizes leave the moving average alone.
 
 Canceled copies raise the excess toward how far they outlasted their routing
 latency, as a fraction, so a slow large read slows small ones only in proportion.

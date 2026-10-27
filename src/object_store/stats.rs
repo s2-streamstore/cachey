@@ -332,7 +332,7 @@ impl BucketStats {
         let model = self.estimates.request.model();
         self.recent.iter().fold(1.0, |factor, read| {
             let ratio = match model.median(read.bytes) {
-                Some(Median::Predicted(median)) => Some(read.latency.div_duration_f64(median)),
+                Some(Median::Observed(median)) => Some(read.latency.div_duration_f64(median)),
                 _ => None,
             };
             match ratio {
@@ -388,13 +388,13 @@ impl BucketStats {
     /// bucket's copy of a size its model has not observed is not judged.
     fn raise_routing_latency(&mut self, now: Instant, elapsed: Duration, requested_bytes: u64) {
         match self.estimates.request.model().median(requested_bytes) {
-            Some(Median::Predicted(median)) => {
+            Some(Median::Observed(median)) => {
                 let excess = self.routing_excess(now);
                 let outlasted = elapsed.div_duration_f64(median) / self.routing_factor() - 1.0;
                 self.routing_excess = excess + (outlasted - excess).max(0.0) * LATENCY_ALPHA;
                 self.routing_updated_at = now;
             }
-            Some(Median::Extrapolated(_) | Median::AtLeast(_)) => {}
+            Some(Median::Unobserved(_)) => {}
             None => {
                 self.unmeasured_latency += elapsed
                     .saturating_sub(self.unmeasured_latency)
@@ -809,7 +809,7 @@ impl BucketedStats {
                         preferred_latency = current;
                     }
                     let mut latency = stats.stalled_latency(now, current);
-                    if index > 0 && matches!(median, None | Some(Median::AtLeast(_))) {
+                    if index > 0 && !matches!(median, Some(Median::Observed(_))) {
                         latency = latency.max(preferred_latency);
                     }
                     BucketSnapshot {
@@ -1698,7 +1698,7 @@ mod tests {
                     .recent
                     .iter()
                     .filter_map(|read| match model.median(read.bytes) {
-                        Some(Median::Predicted(median)) => {
+                        Some(Median::Observed(median)) => {
                             Some(read.latency.div_duration_f64(median))
                         }
                         _ => None,

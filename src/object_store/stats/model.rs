@@ -58,19 +58,17 @@ fn duration(micros: f64) -> Duration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::object_store) enum Median {
     /// Within the range of retained sizes.
-    Predicted(Duration),
-    /// Outside the range of retained sizes, along the median line: an estimate that can be
-    /// far off, so it is not evidence about the bucket.
-    Extrapolated(Duration),
-    /// Beyond the model's reach, the median at its largest retained size: latency grows
-    /// with size, so this bounds it from below.
-    AtLeast(Duration),
+    Observed(Duration),
+    /// Outside it: along the median line where the cost per byte is measurable, or else the
+    /// median at the largest retained size, a lower bound since latency grows with size.
+    /// Either way an estimate that can be far off, so it is not evidence about the bucket.
+    Unobserved(Duration),
 }
 
 impl Median {
     pub fn value(self) -> Duration {
         match self {
-            Self::Predicted(median) | Self::Extrapolated(median) | Self::AtLeast(median) => median,
+            Self::Observed(median) | Self::Unobserved(median) => median,
         }
     }
 }
@@ -98,10 +96,10 @@ impl SizeModel {
             Some((median, _))
                 if (estimate.smallest_bytes..=estimate.largest_bytes).contains(&bytes) =>
             {
-                Median::Predicted(duration(median))
+                Median::Observed(duration(median))
             }
-            Some((median, _)) => Median::Extrapolated(duration(median)),
-            None => Median::AtLeast(duration(estimate.median.micros(estimate.largest_bytes))),
+            Some((median, _)) => Median::Unobserved(duration(median)),
+            None => Median::Unobserved(duration(estimate.median.micros(estimate.largest_bytes))),
         })
     }
 
@@ -536,7 +534,7 @@ mod tests {
         assert_eq!(model.tail(1), Some(TIMER_RESOLUTION));
         assert_eq!(
             model.median(4 * MIB),
-            Some(Median::Predicted(Duration::from_millis(41)))
+            Some(Median::Observed(Duration::from_millis(41)))
         );
         assert!(model.tail(16 * MIB).unwrap() <= Duration::from_millis(162));
     }
@@ -564,7 +562,7 @@ mod tests {
         let model = histogram.summary(true);
         assert_eq!(
             model.median(MIB),
-            Some(Median::Predicted(Duration::from_millis(21)))
+            Some(Median::Observed(Duration::from_millis(21)))
         );
         assert_eq!(model.tail(MIB), Some(Duration::from_millis(21)));
     }
@@ -583,7 +581,7 @@ mod tests {
         let model = histogram.summary(true);
         assert_eq!(
             model.median(MIB),
-            Some(Median::Predicted(Duration::from_millis(21)))
+            Some(Median::Observed(Duration::from_millis(21)))
         );
     }
 
@@ -600,7 +598,7 @@ mod tests {
         histogram.store(older.fit());
         assert_eq!(
             histogram.model().median(MIB),
-            Some(Median::Predicted(Duration::from_millis(30)))
+            Some(Median::Observed(Duration::from_millis(30)))
         );
     }
 
@@ -630,15 +628,15 @@ mod tests {
         let model = histogram.summary(false);
         assert_eq!(
             model.median(4096),
-            Some(Median::Extrapolated(Duration::from_millis(25)))
+            Some(Median::Unobserved(Duration::from_millis(25)))
         );
         assert_eq!(
             model.median(16 * MIB),
-            Some(Median::Predicted(Duration::from_millis(25)))
+            Some(Median::Observed(Duration::from_millis(25)))
         );
         assert_eq!(
             model.median(32 * MIB),
-            Some(Median::AtLeast(Duration::from_millis(25)))
+            Some(Median::Unobserved(Duration::from_millis(25)))
         );
     }
 
@@ -683,7 +681,7 @@ mod tests {
         let model = histogram.summary(true);
         assert_eq!(
             model.median(MIB),
-            Some(Median::Predicted(Duration::from_millis(11)))
+            Some(Median::Observed(Duration::from_millis(11)))
         );
         // With a nonnegative intercept, extrapolation grows no faster than response size.
         assert!(model.hedge_delay(16 * MIB).unwrap() <= Duration::from_millis(265));
