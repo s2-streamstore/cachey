@@ -1108,6 +1108,25 @@ mod tests {
         }
     }
 
+    /// Before a bucket has a median, canceled copies raise its routing latency directly, or
+    /// a bucket that never completes a read would keep looking instant.
+    #[tokio::test(start_paused = true)]
+    async fn canceled_copies_slow_a_bucket_with_no_measurements() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for bucket in buckets.iter().skip(1) {
+            stats.seed_latency(bucket, 100);
+        }
+        assert_eq!(best(&stats, &buckets, Duration::from_secs(10)), Some(0));
+        let timeline = RequestTimeline::default();
+        for _ in 0..10 {
+            let canceled = begin(&stats, &buckets[0], None, &timeline);
+            advance(Duration::from_millis(500)).await;
+            drop(canceled);
+        }
+        assert_eq!(best(&stats, &buckets, Duration::from_secs(10)), Some(1));
+    }
+
     /// A slow recovery probe raises routing latency only as any read does, since a bucket
     /// that looks slow gets no reads to correct it.
     #[tokio::test(start_paused = true)]
