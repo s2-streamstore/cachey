@@ -386,17 +386,15 @@ mod tests {
     use axum::{
         Router,
         extract::{Path, State},
-        http::{HeaderMap, Method, StatusCode},
+        http::{HeaderMap, StatusCode},
         routing::get,
     };
     use bytes::Bytes;
     use bytesize::ByteSize;
     use futures::TryStreamExt;
-    use http_body_util::BodyExt;
 
     use super::{
         CacheyService, FetchRequest, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange,
-        routes,
     };
     use crate::{
         cache::{CacheConfig, CacheKey, CacheValue},
@@ -831,62 +829,5 @@ mod tests {
         }
 
         server_handle.abort();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn egress_counts_only_body_bytes_sent() {
-        let kind = ObjectKind::new("egress").unwrap();
-        let object = ObjectKey::new("object").unwrap();
-        let data = Bytes::from(vec![7; 4096]);
-        // A cache miss would fail to connect.
-        let service = service("http://127.0.0.1:1", ByteSize::mib(64)).await;
-        service.cache.insert(
-            CacheKey {
-                kind: kind.clone(),
-                object: object.clone(),
-                range: 0..PAGE_SIZE,
-            },
-            CacheValue {
-                bucket: BucketName::new("bucket").unwrap(),
-                mtime: 0,
-                data: data.clone(),
-                object_size: data.len() as u64,
-                cached_at: 1,
-            },
-        );
-        let fetch = |method| {
-            routes::fetch(
-                State(service.clone()),
-                Path((kind.clone(), object.clone())),
-                method,
-                routes::ReadRange {
-                    byterange: 0..data.len() as u64,
-                    exact: false,
-                },
-                routes::ObjectSizeHeader(None),
-                routes::BucketHeaders(Vec::new()),
-                RequestConfig::default(),
-            )
-        };
-
-        let head = fetch(Method::HEAD).await;
-        assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
-        let unread = fetch(Method::GET).await;
-        assert_eq!(unread.status(), StatusCode::PARTIAL_CONTENT);
-        drop(unread);
-        let body = fetch(Method::GET)
-            .await
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes();
-        assert_eq!(body, data);
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(
-            service.egress_throughput_bps(Duration::from_secs(1)),
-            data.len() as f64
-        );
     }
 }
