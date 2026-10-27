@@ -13,7 +13,24 @@ use foyer::{
 };
 use mixtrics::registry::prometheus_0_14::PrometheusMetricsRegistry;
 
-use crate::types::{BucketName, ObjectKey, ObjectKind};
+use crate::{
+    service::PAGE_SIZE,
+    types::{BucketName, ObjectKey, ObjectKind},
+};
+
+/// A full page in foyer's write buffer and disk blocks: the page plus key, value header and
+/// foyer's entry framing (under 1.3 KiB), aligned up to 4 KiB.
+const DISK_PAGE_ENTRY_BYTES: usize = PAGE_SIZE as usize + 4 * 1024;
+
+/// Full pages that can wait for a disk write while the previous one is in progress. foyer drops
+/// evicted entries that do not fit.
+const DISK_WRITE_BUFFER_PAGES: usize = 4;
+
+/// foyer starts each disk block with an index of the entries in it.
+const DISK_BLOB_INDEX_BYTES: usize = 4 * 1024;
+
+/// Full pages per disk block, the unit foyer reclaims. The block fits exactly this many.
+const DISK_BLOCK_PAGES: usize = 4;
 
 #[derive(Debug)]
 pub struct CacheConfig {
@@ -89,7 +106,12 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
                 fs_device.build()?
             }
         };
-        let engine = BlockEngineConfig::new(device).with_block_size(64 * 1024 * 1024);
+        let write_buffer_bytes = DISK_WRITE_BUFFER_PAGES * DISK_PAGE_ENTRY_BYTES;
+        let engine = BlockEngineConfig::new(device)
+            .with_block_size(DISK_BLOB_INDEX_BYTES + DISK_BLOCK_PAGES * DISK_PAGE_ENTRY_BYTES)
+            .with_blob_index_size(DISK_BLOB_INDEX_BYTES)
+            .with_buffer_pool_size(write_buffer_bytes)
+            .with_submit_queue_size_threshold(write_buffer_bytes);
         builder = builder
             .with_engine_config(engine)
             .with_io_engine_config(io_engine_config(disk_config.iouring));
@@ -414,14 +436,107 @@ impl foyer::Code for CacheValue {
 
 #[cfg(test)]
 mod tests {
-    use foyer::Code;
+    use bytes::Bytes;
+    use bytesize::ByteSize;
+    use foyer::{Code, HybridCache};
     use proptest::{arbitrary::any, collection, prop_assert_eq, proptest};
+    use tempfile::TempDir;
 
-    use super::{CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader};
+    use super::{
+        CacheConfig, CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader, DISK_BLOCK_PAGES,
+        DISK_WRITE_BUFFER_PAGES, DiskCacheConfig, DiskCacheKind, build_cache,
+    };
     use crate::{
         service::PAGE_SIZE,
         types::{BucketName, ObjectKey, ObjectKind},
     };
+
+    async fn disk_backed_cache(
+        metrics_registry: Option<prometheus::Registry>,
+    ) -> (TempDir, HybridCache<CacheKey, CacheValue>) {
+        let disk_dir = tempfile::tempdir().unwrap();
+        let cache = build_cache(CacheConfig {
+            memory_size: ByteSize::gib(1),
+            disk_cache: Some(DiskCacheConfig {
+                path: disk_dir.path().to_owned(),
+                kind: DiskCacheKind::FileSystem,
+                capacity: Some(ByteSize::mib(512)),
+                iouring: false,
+            }),
+            metrics_registry,
+        })
+        .await
+        .unwrap();
+        (disk_dir, cache)
+    }
+
+    /// Full pages with the longest names, so each entry carries the most framing.
+    fn full_pages(count: usize) -> Vec<(CacheKey, CacheValue)> {
+        let count = count as u64;
+        (0..count)
+            .map(|page_id| {
+                let key = CacheKey {
+                    kind: ObjectKind::new("k".repeat(64)).unwrap(),
+                    object: ObjectKey::new("o".repeat(1024)).unwrap(),
+                    range: page_id * PAGE_SIZE..(page_id + 1) * PAGE_SIZE,
+                };
+                let value = CacheValue {
+                    bucket: BucketName::new("b".repeat(64)).unwrap(),
+                    mtime: 1_700_000_000,
+                    data: Bytes::from(vec![page_id as u8; PAGE_SIZE as usize]),
+                    object_size: count * PAGE_SIZE,
+                    cached_at: 1_700_000_000,
+                };
+                (key, value)
+            })
+            .collect()
+    }
+
+    async fn assert_evicted_together_reach_disk(
+        cache: &HybridCache<CacheKey, CacheValue>,
+        pages: &[(CacheKey, CacheValue)],
+    ) {
+        for (key, value) in pages {
+            cache.insert(key.clone(), value.clone());
+        }
+
+        cache.memory().evict_all();
+        cache.storage().wait().await;
+
+        for (key, value) in pages {
+            assert!(!cache.memory().contains(key));
+            let entry = cache.get(key).await.unwrap();
+            assert!(
+                entry.is_some_and(|entry| entry.value() == value),
+                "page {:?} was not read back from disk",
+                key.range
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_pages_evicted_together_reach_disk() {
+        let (_disk_dir, cache) = disk_backed_cache(None).await;
+        assert_evicted_together_reach_disk(&cache, &full_pages(DISK_WRITE_BUFFER_PAGES)).await;
+    }
+
+    #[tokio::test]
+    async fn disk_block_fits_its_full_pages() {
+        let registry = prometheus::Registry::new();
+        let (_disk_dir, cache) = disk_backed_cache(Some(registry.clone())).await;
+        assert_evicted_together_reach_disk(&cache, &full_pages(DISK_BLOCK_PAGES)).await;
+
+        // foyer makes a block evictable once writes move on to the next block.
+        let metrics = prometheus::TextEncoder::new()
+            .encode_to_string(&registry.gather())
+            .unwrap();
+        assert!(
+            metrics.contains(
+                "foyer_storage_block_engine_block{name=\"foyer\",type=\"evictable\"} 0\n"
+            ),
+            "{DISK_BLOCK_PAGES} full pages spilled past the first disk block"
+        );
+    }
 
     #[test]
     fn test_cache_key_header() {
