@@ -37,6 +37,15 @@ struct Estimate {
     largest_bytes: u64,
 }
 
+/// How observations compared with the model in use when each arrived.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Predictions {
+    /// Observations at sizes the model predicted.
+    pub observations: u64,
+    pub above_median: u64,
+    pub above_tail: u64,
+}
+
 /// A fitted latency model, exported as metrics.
 #[derive(Debug, Clone, Copy)]
 pub struct LatencyEstimate {
@@ -48,6 +57,7 @@ pub struct LatencyEstimate {
     pub tail_ratio: f64,
     /// Largest retained size; larger sizes are predicted only from a measurable per-byte cost.
     pub largest_bytes: u64,
+    pub predictions: Predictions,
 }
 
 fn duration(micros: f64) -> Duration {
@@ -112,15 +122,6 @@ impl SizeModel {
     pub fn hedge_delay(&self, bytes: u64) -> Option<Duration> {
         self.micros(bytes)
             .map(|(median, tail)| duration(tail.min(median * HEDGE_TAIL_CAP)))
-    }
-
-    pub fn estimate(&self) -> Option<LatencyEstimate> {
-        self.0.map(|estimate| LatencyEstimate {
-            base: duration(estimate.median.fixed),
-            seconds_per_byte: estimate.median.per_byte / 1_000_000.0,
-            tail_ratio: estimate.tail_ratio,
-            largest_bytes: estimate.largest_bytes,
-        })
     }
 }
 
@@ -304,6 +305,7 @@ pub(super) struct SizeHistogram {
     summarized_updates: u64,
     model: SizeModel,
     fitted_updates: u64,
+    predictions: Predictions,
 }
 
 impl SizeHistogram {
@@ -317,6 +319,7 @@ impl SizeHistogram {
             summarized_updates: 0,
             model: SizeModel::default(),
             fitted_updates: 0,
+            predictions: Predictions::default(),
         }
     }
 
@@ -351,14 +354,14 @@ impl SizeHistogram {
             entry.insert(Reservoir::new(0));
             self.rebalance();
         }
+        let micros = (latency.as_secs_f64() * 1_000_000.0).max(TIMER_MICROS);
+        if let Some((median, tail)) = self.model.micros(bytes) {
+            self.predictions.observations += 1;
+            self.predictions.above_median += u64::from(micros > median);
+            self.predictions.above_tail += u64::from(micros > tail);
+        }
         if let Some(reservoir) = self.bands.get_mut(&band) {
-            reservoir.update(
-                self.clock,
-                Measurement {
-                    bytes,
-                    micros: (latency.as_secs_f64() * 1_000_000.0).max(TIMER_MICROS),
-                },
-            );
+            reservoir.update(self.clock, Measurement { bytes, micros });
         }
         self.updates += 1;
     }
@@ -407,6 +410,16 @@ impl SizeHistogram {
 
     pub fn model(&self) -> SizeModel {
         self.model
+    }
+
+    pub fn estimate(&self) -> Option<LatencyEstimate> {
+        self.model.0.map(|estimate| LatencyEstimate {
+            base: duration(estimate.median.fixed),
+            seconds_per_byte: estimate.median.per_byte / 1_000_000.0,
+            tail_ratio: estimate.tail_ratio,
+            largest_bytes: estimate.largest_bytes,
+            predictions: self.predictions,
+        })
     }
 
     /// Keeps the fit of the most observations when refits finish out of order.
@@ -511,7 +524,7 @@ mod tests {
     use tokio::time::{Instant, advance};
 
     use super::{
-        Line, Median, Observation, SizeHistogram, TIMER_MICROS, TIMER_RESOLUTION,
+        Line, Median, Observation, Predictions, SizeHistogram, TIMER_MICROS, TIMER_RESOLUTION,
         least_absolute_deviations, median_line, quantile,
     };
 
@@ -742,6 +755,27 @@ mod tests {
             model.median(4096)
         );
         assert!(model.median(16 * MIB).unwrap().value() >= Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observations_count_against_the_predictions_in_use() {
+        let mut histogram = SizeHistogram::new(false);
+        for millis in [10; 98].into_iter().chain([30; 2]) {
+            update(&mut histogram, MIB, millis);
+        }
+        let model = histogram.summary(true);
+        assert_eq!(model.tail(MIB), Some(Duration::from_millis(30)));
+        for (bytes, millis) in [(MIB, 5), (MIB, 20), (MIB, 40), (16 * MIB, 40)] {
+            update(&mut histogram, bytes, millis);
+        }
+        assert_eq!(
+            histogram.estimate().unwrap().predictions,
+            Predictions {
+                observations: 3,
+                above_median: 2,
+                above_tail: 1,
+            }
+        );
     }
 
     #[test]

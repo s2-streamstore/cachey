@@ -1114,8 +1114,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let request = model(&downloader, "local").request.estimate().unwrap();
-        assert_eq!(request.largest_bytes, 4);
+        let request = model(&downloader, "local").request;
+        assert!(request.tail(4).is_some());
+        assert_eq!(request.tail(16 * MIB), None);
     }
 
     /// Once headers announce a small object, a page read is overdue by the standard of

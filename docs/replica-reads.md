@@ -162,6 +162,8 @@ contacting a backend.
 | `cachey_bucket_latency_seconds_per_byte` | Median latency added per byte |
 | `cachey_bucket_latency_tail_ratio` | p99 latency as a multiple of the median |
 | `cachey_bucket_latency_model_bytes` | Largest size retained by the model |
+| `cachey_bucket_latency_predictions_total` | Observations at sizes the model predicted |
+| `cachey_bucket_latency_predictions_exceeded_total` | Those slower than the predicted median (`quantile="0.5"`) or p99 (`quantile="0.99"`) |
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |
@@ -171,6 +173,11 @@ Latency gauges have a `phase` label: `first_byte`, `body`, or `request`. They ar
 absent until measured. A hedge delay is the median at the read's size times the
 smaller of the tail ratio and 1.5. Buffered-only history reports zero cost per byte.
 Latencies exclude transmission to the client.
+
+Prediction counters compare each observation that trains a model with the fit in use
+when it arrives. For an accurate model, half exceed the median and 1% exceed p99.
+Sizes beyond the model's reach are not counted, nor are stalls a hedge superseded,
+since unfinished copies train nothing past their headers.
 
 `DownloadOutput` identifies the initial and winning buckets. `hedged` means copies
 overlapped, including rescue and recovery probes; `fallback` counts wins from

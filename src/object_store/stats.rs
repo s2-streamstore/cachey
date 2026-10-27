@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, MutexGuard};
 use tokio::{sync::SetOnce, time::Instant};
 
-pub use self::model::LatencyEstimate;
+pub use self::model::{LatencyEstimate, Predictions};
 use self::model::{Median, Refit, SizeHistogram, SizeModel, TIMER_RESOLUTION};
 use crate::{
     object_store::DownloadLimits,
@@ -303,7 +303,7 @@ impl BucketStats {
 
     /// Every success eases the excess; the first measurement and recovery probes clear it.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
-        if probe || self.estimates.request.model().estimate().is_none() {
+        if probe || self.estimates.request.estimate().is_none() {
             self.routing_excess = 0.0;
             self.unmeasured_latency = Duration::ZERO;
         } else {
@@ -874,15 +874,14 @@ impl BucketedStats {
             .iter()
             .map(|entry| {
                 let stats = entry.value().lock();
-                let model = stats.estimates.model();
                 let metrics = BucketMetrics {
                     error_rate: stats.error_rate(now),
                     deprioritized: stats.deprioritized,
                     consecutive_failures: stats.consecutive_failures,
                     recovery_successes: stats.recovery_successes,
-                    first_byte: model.first_byte.estimate(),
-                    body: model.body.estimate(),
-                    request: model.request.estimate(),
+                    first_byte: stats.estimates.first_byte.estimate(),
+                    body: stats.estimates.body.estimate(),
+                    request: stats.estimates.request.estimate(),
                 };
                 (entry.key().clone(), metrics)
             })

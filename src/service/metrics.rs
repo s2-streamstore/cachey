@@ -7,7 +7,7 @@ use prometheus::{
 };
 
 use crate::{
-    object_store::{BucketMetrics, LatencyEstimate},
+    object_store::{BucketMetrics, LatencyEstimate, Predictions},
     types::{BucketName, ObjectKind},
 };
 
@@ -95,6 +95,47 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
                 }
             }
         }
+        if let Some(estimate) = estimate {
+            count_predictions(bucket, phase, estimate.predictions);
+        }
+    }
+}
+
+/// Advances counters to the cumulative totals of a bucket's statistics.
+fn count_predictions(bucket: &BucketName, phase: &str, predictions: Predictions) {
+    static PREDICTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "cachey_bucket_latency_predictions_total",
+            "Latency observations at sizes the model predicted",
+            &["bucket", "phase"]
+        )
+        .unwrap()
+    });
+
+    static PREDICTIONS_EXCEEDED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "cachey_bucket_latency_predictions_exceeded_total",
+            "Latency observations slower than the model's predicted quantile",
+            &["bucket", "phase", "quantile"]
+        )
+        .unwrap()
+    });
+
+    for (counter, total) in [
+        (
+            PREDICTIONS.with_label_values(&[&**bucket, phase]),
+            predictions.observations,
+        ),
+        (
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, "0.5"]),
+            predictions.above_median,
+        ),
+        (
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, "0.99"]),
+            predictions.above_tail,
+        ),
+    ] {
+        counter.inc_by(total.saturating_sub(counter.get()));
     }
 }
 
