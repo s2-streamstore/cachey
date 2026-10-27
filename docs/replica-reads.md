@@ -130,7 +130,8 @@ budget still permits fallback and deadline rescue.
 Server reads reserve the bytes they expect: 16 MiB per page or an exact range's
 length, less any part past the end of an object of known size. Admission trusts that
 size, so a read whose size is understated can hold up to the rest of its range beyond
-its reservation. By default, 64 full pages fit. This limit is separate from cache capacity and total process memory.
+its reservation. By default, 64 full pages fit. This limit is separate from cache
+capacity and total process memory.
 
 Copies other than early hedges and body retries wait for admission while they can
 still finish by the deadline. A queue that formed within the last 100 ms is

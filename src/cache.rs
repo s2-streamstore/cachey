@@ -13,7 +13,7 @@ use foyer::{
 };
 use mixtrics::registry::prometheus_0_14::PrometheusMetricsRegistry;
 
-use crate::types::{BucketName, ObjectKey, ObjectKind, PageId};
+use crate::types::{BucketName, ObjectKey, ObjectKind};
 
 #[derive(Debug)]
 pub struct CacheConfig {
@@ -112,70 +112,8 @@ fn io_engine_config(iouring: bool) -> Box<dyn IoEngineConfig> {
 pub struct CacheKey {
     pub kind: ObjectKind,
     pub object: ObjectKey,
-    pub span: Span,
-}
-
-/// What a cache entry holds of the object: a whole page, or exactly a requested byte range.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub enum Span {
-    Page(PageId),
-    Exact(Range<u64>),
-}
-
-impl Span {
-    const PAGE_TAG: u8 = 0;
-    const EXACT_TAG: u8 = 1;
-
-    fn encoded_len(&self) -> usize {
-        match self {
-            Self::Page(_) => 1 + size_of::<PageId>(),
-            Self::Exact(_) => 1 + 2 * size_of::<u64>(),
-        }
-    }
-
-    fn encode(&self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
-        match self {
-            Self::Page(page_id) => {
-                writer.write_all(&[Self::PAGE_TAG])?;
-                writer.write_all(&page_id.to_be_bytes())
-            }
-            Self::Exact(range) => {
-                writer.write_all(&[Self::EXACT_TAG])?;
-                writer.write_all(&range.start.to_be_bytes())?;
-                writer.write_all(&range.end.to_be_bytes())
-            }
-        }
-    }
-
-    fn decode(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
-        let mut tag = [0u8; 1];
-        reader.read_exact(&mut tag)?;
-        match tag[0] {
-            Self::PAGE_TAG => {
-                let mut buf = [0u8; size_of::<PageId>()];
-                reader.read_exact(&mut buf)?;
-                Ok(Self::Page(PageId::from_be_bytes(buf)))
-            }
-            Self::EXACT_TAG => {
-                let mut start = [0u8; size_of::<u64>()];
-                let mut end = [0u8; size_of::<u64>()];
-                reader.read_exact(&mut start)?;
-                reader.read_exact(&mut end)?;
-                let range = u64::from_be_bytes(start)..u64::from_be_bytes(end);
-                if range.is_empty() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Empty exact range",
-                    ));
-                }
-                Ok(Self::Exact(range))
-            }
-            tag => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Unknown span tag {tag}"),
-            )),
-        }
-    }
+    /// The bytes of the object the entry holds: a page, or exactly a requested range.
+    pub range: Range<u64>,
 }
 
 impl CacheKey {
@@ -242,7 +180,7 @@ impl CacheKeyHeader {
 /// - header
 /// - object kind
 /// - object key
-/// - span
+/// - range start and end
 impl foyer::Code for CacheKey {
     fn encode(&self, writer: &mut impl std::io::Write) -> foyer::Result<()> {
         let flag = CacheKeyHeader::new(Self::VERSION, self.kind.len(), self.object.len())
@@ -251,7 +189,8 @@ impl foyer::Code for CacheKey {
         writer.write_all(&flag.to_bytes())?;
         writer.write_all(self.kind.as_bytes())?;
         writer.write_all(self.object.as_bytes())?;
-        self.span.encode(writer)?;
+        writer.write_all(&self.range.start.to_be_bytes())?;
+        writer.write_all(&self.range.end.to_be_bytes())?;
         Ok(())
     }
 
@@ -299,13 +238,27 @@ impl foyer::Code for CacheKey {
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?
         };
 
-        let span = Span::decode(reader)?;
+        let mut offset = || -> std::io::Result<u64> {
+            let mut buf = [0u8; size_of::<u64>()];
+            reader.read_exact(&mut buf)?;
+            Ok(u64::from_be_bytes(buf))
+        };
+        let range = offset()?..offset()?;
+        if range.is_empty() {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Empty byte range").into(),
+            );
+        }
 
-        Ok(Self { kind, object, span })
+        Ok(Self {
+            kind,
+            object,
+            range,
+        })
     }
 
     fn estimated_size(&self) -> usize {
-        size_of::<CacheKeyHeader>() + self.kind.len() + self.object.len() + self.span.encoded_len()
+        size_of::<CacheKeyHeader>() + self.kind.len() + self.object.len() + 2 * size_of::<u64>()
     }
 }
 
@@ -467,9 +420,9 @@ impl foyer::Code for CacheValue {
 #[cfg(test)]
 mod tests {
     use foyer::Code;
-    use proptest::{collection, prop_assert_eq, prop_oneof, proptest, strategy::Strategy};
+    use proptest::{collection, prop_assert_eq, proptest, strategy::Strategy};
 
-    use super::{CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader, Span};
+    use super::{CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader};
     use crate::{
         service::PAGE_SIZE,
         types::{BucketName, ObjectKey, ObjectKind},
@@ -528,7 +481,7 @@ mod tests {
         let cache_key = CacheKey {
             kind: ObjectKind::new("b".repeat(64)).unwrap(),
             object: ObjectKey::new("c".repeat(1024)).unwrap(),
-            span: Span::Exact(u64::MAX - 1..u64::MAX),
+            range: u64::MAX - 1..u64::MAX,
         };
 
         let mut encoded_key = Vec::new();
@@ -590,16 +543,13 @@ mod tests {
         fn prop_cache_key_roundtrip(
             kind in "[a-z0-9.-]{1,64}",
             object in "[a-zA-Z0-9/_.-]{1,1024}",
-            span in prop_oneof![
-                (0u16..=u16::MAX).prop_map(Span::Page),
-                (0u64..u64::MAX, 1u64..=u64::MAX)
-                    .prop_map(|(start, len)| Span::Exact(start..start.saturating_add(len))),
-            ]
+            range in (0u64..u64::MAX, 1u64..=u64::MAX)
+                .prop_map(|(start, len)| start..start.saturating_add(len))
         ) {
             let key = CacheKey {
                 kind: ObjectKind::new(kind).unwrap(),
                 object: ObjectKey::new(object).unwrap(),
-                span,
+                range,
             };
 
             let mut encoded = Vec::new();
@@ -649,18 +599,13 @@ mod tests {
             (CacheKey::VERSION, b"kind", b"\xff\xff\xff\xff"),
         ] {
             let header = CacheKeyHeader::new(version, kind.len(), object.len()).unwrap();
-            let data = [header.to_bytes().as_slice(), kind, object, &[0, 0, 0]].concat();
+            let data = [header.to_bytes().as_slice(), kind, object, &[0; 16]].concat();
             assert!(CacheKey::decode(&mut data.as_slice()).is_err());
         }
 
         let header = CacheKeyHeader::new(CacheKey::VERSION, 4, 4).unwrap();
-        let unknown_tag = [2u8; 17];
-        let mut empty_exact_range = [0u8; 17];
-        empty_exact_range[0] = 1;
-        for span in [unknown_tag, empty_exact_range] {
-            let data = [header.to_bytes().as_slice(), b"kind", b"test", &span].concat();
-            assert!(CacheKey::decode(&mut data.as_slice()).is_err());
-        }
+        let empty_range = [header.to_bytes().as_slice(), b"kind", b"test", &[0; 16]].concat();
+        assert!(CacheKey::decode(&mut empty_range.as_slice()).is_err());
     }
 
     #[test]
