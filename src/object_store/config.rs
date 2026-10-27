@@ -4,11 +4,12 @@ use aws_sdk_s3::config::{retry::RetryConfig, timeout::TimeoutConfig};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadLimits {
-    /// Shared timeout for a page's copies to one bucket, from first admission through validation.
+    /// Shared timeout for a download's copies to one bucket, from first admission through
+    /// validation.
     pub bucket_timeout: Duration,
-    /// Maximum duration across bucket selection and fallback.
-    pub page_timeout: Duration,
-    /// Hedge credits earned per successful page fetch, as a percentage (0–100).
+    /// Maximum duration of a download across bucket selection and fallback.
+    pub download_timeout: Duration,
+    /// Hedge credits earned per successful download, as a percentage (0–100).
     pub hedge_budget_percent: u8,
     /// Request-count guard for arbitrary ranges; fixed-size server pages are normally
     /// memory-limited.
@@ -21,7 +22,7 @@ impl Default for DownloadLimits {
     fn default() -> Self {
         Self {
             bucket_timeout: Duration::from_secs(5),
-            page_timeout: Duration::from_secs(10),
+            download_timeout: Duration::from_secs(10),
             hedge_budget_percent: 5,
             max_inflight_requests: 1024,
             max_inflight_bytes: 1024 * 1024 * 1024,
@@ -31,7 +32,7 @@ impl Default for DownloadLimits {
 
 impl DownloadLimits {
     pub(super) fn bucket_share(self, buckets: usize) -> Duration {
-        self.page_timeout / u32::try_from(buckets).unwrap_or(u32::MAX)
+        self.download_timeout / u32::try_from(buckets).unwrap_or(u32::MAX)
     }
 
     pub(crate) fn validate(self) -> eyre::Result<()> {
@@ -50,8 +51,8 @@ impl DownloadLimits {
             "bucket timeout must be positive"
         );
         eyre::ensure!(
-            !self.page_timeout.is_zero(),
-            "page timeout must be positive"
+            !self.download_timeout.is_zero(),
+            "download timeout must be positive"
         );
         eyre::ensure!(
             self.hedge_budget_percent <= 100,
@@ -59,9 +60,9 @@ impl DownloadLimits {
         );
         eyre::ensure!(
             std::time::Instant::now()
-                .checked_add(self.page_timeout)
+                .checked_add(self.download_timeout)
                 .is_some(),
-            "page timeout exceeds the clock's supported range"
+            "download timeout exceeds the clock's supported range"
         );
         Ok(())
     }

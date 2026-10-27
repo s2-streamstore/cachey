@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 
 mod metrics;
 mod throughput;
-pub use metrics::PageRequestType;
+pub use metrics::EntryRequestType;
 pub use throughput::SlidingThroughput;
 mod routes;
 
@@ -174,7 +174,7 @@ impl CacheyService {
         self.egress_throughput.lock().bps(lookback)
     }
 
-    /// Fetches up to `concurrency` pages at a time. A range starting at or past a known
+    /// Fetches up to `concurrency` cache entries at a time. A range starting at or past a known
     /// object size fails without a download.
     ///
     /// # Panics
@@ -207,13 +207,13 @@ impl CacheyService {
         });
 
         metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
-        metrics::fetch_request_pages(
+        metrics::fetch_request_entries(
             &request.kind,
             entries.as_ref().map_or(0, ExactSizeIterator::len),
         );
 
         let mut expected_size = request.object_size;
-        let executor = Arc::new(PageGetExecutor {
+        let executor = Arc::new(EntryGetExecutor {
             downloader: self.downloader,
             request,
         });
@@ -274,18 +274,18 @@ fn now() -> u32 {
 }
 
 #[derive(Debug)]
-struct PageGetExecutor {
+struct EntryGetExecutor {
     downloader: Downloader,
     request: FetchRequest,
 }
 
-impl PageGetExecutor {
+impl EntryGetExecutor {
     async fn execute(
         self: Arc<Self>,
         range: Range<u64>,
         cache: foyer::HybridCache<CacheKey, CacheValue>,
     ) -> Result<(u64, CacheValue), ServiceError> {
-        metrics::page_request_count(&self.request.kind, metrics::PageRequestType::Access);
+        metrics::entry_request_count(&self.request.kind, metrics::EntryRequestType::Access);
 
         let cache_key = CacheKey {
             kind: self.request.kind.clone(),
@@ -298,9 +298,9 @@ impl PageGetExecutor {
                 let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
                 move || async move {
                     fetched_by_current_request.store(true, Ordering::Relaxed);
-                    metrics::page_request_count(
+                    metrics::entry_request_count(
                         &self.request.kind,
-                        metrics::PageRequestType::Download,
+                        metrics::EntryRequestType::Download,
                     );
 
                     let out = self
@@ -313,23 +313,23 @@ impl PageGetExecutor {
                             &self.request.config,
                         )
                         .await?;
-                    metrics::page_download_latency(&self.request.kind, out.latency);
+                    metrics::download_latency(&self.request.kind, out.latency);
                     if out.hedged {
-                        metrics::page_request_count(
+                        metrics::entry_request_count(
                             &self.request.kind,
-                            metrics::PageRequestType::Hedged,
+                            metrics::EntryRequestType::Hedged,
                         );
                     }
                     if out.primary_bucket_idx == 0 {
-                        metrics::page_request_count(
+                        metrics::entry_request_count(
                             &self.request.kind,
-                            metrics::PageRequestType::ClientPref,
+                            metrics::EntryRequestType::ClientPref,
                         );
                     }
                     if out.used_bucket_idx != out.primary_bucket_idx {
-                        metrics::page_request_count(
+                        metrics::entry_request_count(
                             &self.request.kind,
-                            metrics::PageRequestType::Fallback,
+                            metrics::EntryRequestType::Fallback,
                         );
                     }
                     Ok::<_, ServiceError>(CacheValue {
@@ -348,22 +348,22 @@ impl PageGetExecutor {
                     .unwrap_or(ServiceError::Cache(err))
             })?;
         let key = entry.key();
-        metrics::page_request_count(&key.kind, metrics::PageRequestType::Success);
+        metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Success);
 
         let mut value = entry.value().clone();
         match entry.source() {
             Source::Memory => {
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHitMemory);
+                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
+                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitMemory);
             }
             Source::Disk => {
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHitDisk);
+                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
+                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitDisk);
             }
             Source::Outer => {
                 value.cached_at = 0;
                 if !fetched_by_current_request.load(Ordering::Relaxed) {
-                    metrics::page_request_count(&key.kind, metrics::PageRequestType::Coalesced);
+                    metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Coalesced);
                 }
             }
         }
@@ -561,7 +561,7 @@ mod tests {
         assert!(
             std::str::from_utf8(&snapshot)
                 .unwrap()
-                .contains("cachey_fetch_request_pages_sum{kind=\"full-address-space\"} 65536\n")
+                .contains("cachey_fetch_request_entries_sum{kind=\"full-address-space\"} 65536\n")
         );
     }
 
@@ -855,7 +855,7 @@ mod tests {
             ("coalesced", 1),
             ("cache_hit", 0),
         ] {
-            let prefix = format!("cachey_page_requests_total{{kind=\"{kind}\",type=\"{typ}\"}} ");
+            let prefix = format!("cachey_entry_requests_total{{kind=\"{kind}\",type=\"{typ}\"}} ");
             let value = text
                 .lines()
                 .find_map(|line| line.strip_prefix(&prefix))

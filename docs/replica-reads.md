@@ -3,7 +3,7 @@
 ## Selection and recovery
 
 Replica selection uses backend health, recent latency, and the time a new copy has:
-the remaining page deadline, within the bucket timeout.
+the remaining download deadline, within the bucket timeout.
 The first client-supplied bucket gets a locality preference; all buckets remain
 eligible for fallback.
 
@@ -94,10 +94,10 @@ fitted outside it. Metrics report the latest fit.
 
 ## Deadlines and hedging
 
-The page deadline includes admission, SDK retries, and body validation. Copies to
-one bucket share a deadline starting at its first admission, whose expiry counts
-against health once. Up to three copies can run
-per page; the first validated result wins and cancels the others.
+A download fetches one cache entry: a page, or an exact range. Its deadline includes
+admission, SDK retries, and body validation. Copies to one bucket share a deadline
+starting at its first admission, whose expiry counts against health once. Up to three
+copies can run per download; the first validated result wins and cancels the others.
 
 Early hedges use the first-byte model at the requested size, then the body model at
 the announced size. Each delay is p99 capped at 1.5 times the median. Health,
@@ -105,25 +105,25 @@ rescue, and retry decisions use uncapped estimates.
 
 Early hedges use one SDK attempt, skip overloaded buckets, and never wait for
 admission. They prefer an untried bucket expected to finish within its timeout and
-the page deadline, or else use the primary's bucket. A failed body can be retried
+the download deadline, or else use the primary's bucket. A failed body can be retried
 once when no other copy or untried bucket remains, without waiting for admission.
 
 A copy's timeout allowance is the p99 of each interval, or half the bucket's share
-of the page timeout for each unmeasured interval. A later copy to a bucket needs
+of the download timeout for each unmeasured interval. A later copy to a bucket needs
 that much of the bucket's deadline left. A missing object, unsatisfied range, or
 invalid object state cancels all remaining copies to that bucket immediately,
 releasing their admission capacity.
 
 Hedges and body retries have separate budgets funded by successful reads. The
-default allows one startup hedge and one per 20 successful pages. A zero hedge
+default allows one startup hedge and one per 20 successful downloads. A zero hedge
 budget still permits fallback and deadline rescue.
 
 ## Limits
 
 | Server option | Default |
 |---------------|---------|
-| `--bucket-timeout-ms` | 5,000 ms per bucket, per page |
-| `--page-timeout-ms` | 10,000 ms per page |
+| `--bucket-timeout-ms` | 5,000 ms per bucket, per download |
+| `--download-timeout-ms` | 10,000 ms per download |
 | `--max-download-memory` | 1 GiB of reserved body bytes |
 | `--hedge-budget-percent` | 5% |
 
@@ -136,7 +136,7 @@ capacity and total process memory.
 Copies other than early hedges and body retries wait for admission while they can
 still finish by the deadline. A queue that formed within the last 100 ms is
 absorbing a burst, which capacity will reach. Once it has stood longer, waiting only
-delays reads without filling more pages, so a copy joining it waits no longer than
+delays reads without filling more entries, so a copy joining it waits no longer than
 its timeout allowance or 100 ms, whichever is longer. A copy that fails admission
 does not fall back to another bucket, whose copy would wait in the same queue. A
 copy fails at once if it would not be admitted in time: each copy ahead of it, then
@@ -168,7 +168,7 @@ contacting a backend.
 | `cachey_bucket_latency_predictions_exceeded_total` | Those slower than the predicted median (`quantile="0.5"`) or p99 (`quantile="0.99"`) |
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
-| `cachey_page_download_latency_seconds` | Successful page latency, including admission and fallback |
+| `cachey_download_latency_seconds` | Successful download latency, including admission and fallback |
 | `cachey_first_chunk_latency_seconds` | Handler time to first chunk, including cache lookup and coalescing |
 
 Latency gauges have a `phase` label: `first_byte`, `body`, or `request`. They are

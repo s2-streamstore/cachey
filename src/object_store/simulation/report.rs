@@ -239,7 +239,7 @@ impl Report {
             completed_before_deadline: reads
                 .iter()
                 .filter(|read| {
-                    read.error.is_none() && read.latency_us() < scenario.page_timeout_ms * 1000
+                    read.error.is_none() && read.latency_us() < scenario.download_timeout_ms * 1000
                 })
                 .count(),
             errors,

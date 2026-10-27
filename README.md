@@ -52,7 +52,7 @@ HEAD|GET /fetch/{kind}/{object}
 See [replica reads](docs/replica-reads.md) for selection, fallback, hedging, and download limits.
 
 `C0-Config` overrides:
-Space-separated key-value pairs to override S3 request configuration per page miss.
+Space-separated key-value pairs to override S3 request configuration per cache miss.
 - `ct=<ms>` Connect timeout (in case an existing connection could not be reused)
 - `rt=<ms>` Read timeout (time-to-first-byte)
 - `ot=<ms>` Operation timeout (across retries)
@@ -132,11 +132,11 @@ Options:
       --iouring
           Use `io_uring` (if available) for disk IO
       --bucket-timeout-ms <BUCKET_TIMEOUT_MS>
-          Maximum time for a page's downloads from one bucket, from first admission through body validation, in milliseconds [default: 5000]
-      --page-timeout-ms <PAGE_TIMEOUT_MS>
-          Maximum page download time including fallback, in milliseconds [default: 10000]
+          Maximum time for a download's copies to one bucket, from first admission through body validation, in milliseconds [default: 5000]
+      --download-timeout-ms <DOWNLOAD_TIMEOUT_MS>
+          Maximum download time including fallback, in milliseconds [default: 10000]
       --hedge-budget-percent <HEDGE_BUDGET_PERCENT>
-          Hedge allowance per successful page fetch, as a percentage (0 disables early hedging) [default: 5]
+          Hedge allowance per successful download, as a percentage (0 disables early hedging) [default: 5]
       --max-download-memory <MAX_DOWNLOAD_MEMORY>
           Body memory reserved by active downloads, separate from the cache [default: 1GiB]
       --tls-self
