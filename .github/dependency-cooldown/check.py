@@ -75,7 +75,7 @@ def main() -> None:
         base_lockfile.stdout
     )
     exceptions = {
-        (entry["crate"], entry["version"]): entry["advisory"]
+        (entry["crate"], entry["version"]): entry.get("advisory") or entry["reason"]
         for entry in tomllib.loads(EXCEPTIONS.read_text()).get("exception", [])
     }
     age_text, age = min_publish_age()
@@ -86,8 +86,8 @@ def main() -> None:
         published = publish_time(name, version)
         if published is None or published <= cutoff:
             continue
-        if advisory := exceptions.get((name, version)):
-            print(f"{name} {version} is inside the cooldown but allowed: {advisory}")
+        if justification := exceptions.get((name, version)):
+            print(f"{name} {version} is inside the cooldown but allowed: {justification}")
         else:
             too_new.append(f"{name} {version} (published {published:%Y-%m-%d %H:%M} UTC)")
 
@@ -95,7 +95,7 @@ def main() -> None:
         sys.exit(
             f"crates.io versions added since {base} are newer than {age_text}:\n  "
             + "\n  ".join(too_new)
-            + f"\nreviewed security releases can be allowed in {EXCEPTIONS}"
+            + f"\nreviewed releases can be allowed in {EXCEPTIONS}"
         )
     print(f"checked {len(added)} crates.io versions added since {base} against the {age_text} cooldown")
 

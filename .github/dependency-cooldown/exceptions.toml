@@ -2,9 +2,55 @@
 # Select one with:
 #   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo +nightly update -p <crate> --precise <version>
 # A full `cargo update` reverts these until they age out, so re-run the targeted update after it.
+# Each entry names the `advisory` it fixes, or a `reason`.
 # Remove entries once they are older than the cooldown.
 
 [[exception]]
 crate = "ctutils"
 version = "0.4.4"
 advisory = "RUSTSEC-2026-0385"
+
+[[exception]]
+crate = "aws-config"
+version = "1.13.0"
+reason = "AWS SDK release on aws-smithy-schema 1.0, matching aws-smithy-runtime 1.16.1"
+
+[[exception]]
+crate = "aws-credential-types"
+version = "1.3.1"
+reason = "AWS SDK release on aws-smithy-schema 1.0, matching aws-smithy-runtime 1.16.1"
+
+[[exception]]
+crate = "aws-runtime"
+version = "1.10.2"
+reason = "AWS SDK release on aws-smithy-schema 1.0, matching aws-smithy-runtime 1.16.1"
+
+[[exception]]
+crate = "aws-sdk-s3"
+version = "1.153.0"
+reason = "AWS SDK release on aws-smithy-schema 1.0, matching aws-smithy-runtime 1.16.1"
+
+[[exception]]
+crate = "aws-sdk-sso"
+version = "1.115.0"
+reason = "AWS SDK release on aws-smithy-schema 1.0, matching aws-smithy-runtime 1.16.1"
+
+[[exception]]
+crate = "aws-sdk-ssooidc"
+version = "1.117.0"
+reason = "AWS SDK release on aws-smithy-schema 1.0, matching aws-smithy-runtime 1.16.1"
+
+[[exception]]
+crate = "aws-sdk-sts"
+version = "1.120.0"
+reason = "AWS SDK release on aws-smithy-schema 1.0, matching aws-smithy-runtime 1.16.1"
+
+[[exception]]
+crate = "aws-sigv4"
+version = "1.6.2"
+reason = "AWS SDK release on aws-smithy-schema 1.0, matching aws-smithy-runtime 1.16.1"
+
+[[exception]]
+crate = "aws-types"
+version = "1.7.0"
+reason = "AWS SDK release on aws-smithy-schema 1.0, matching aws-smithy-runtime 1.16.1"
