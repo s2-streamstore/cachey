@@ -48,7 +48,6 @@ HEAD|GET /fetch/{kind}/{object}
 `C0-Exact` behavior:
 - The range is downloaded and cached as one entry instead of as the 16 MiB pages it spans
 - Only a request for the same range hits that entry, so use it when an object's ranges are always read whole
-- `cachey_page_requests_total` and `cachey_first_chunk_latency_seconds` have an `exact` label (`1` or `0`), so hit and coalescing rates can be tracked for each mode
 
 See [replica reads](docs/replica-reads.md) for selection, fallback, hedging, and download limits.
 
