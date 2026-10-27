@@ -3,18 +3,3 @@
 #   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo +nightly update -p <crate> --precise <version>
 # A full `cargo update` reverts these until they age out, so re-run the targeted update after it.
 # Remove entries once they are older than the cooldown.
-
-[[exception]]
-crate = "rustls-webpki"
-version = "0.103.16"
-advisory = "RUSTSEC-2026-0382"
-
-[[exception]]
-crate = "webpki-root-certs"
-version = "1.0.10"
-advisory = "RUSTSEC-2026-0383"
-
-[[exception]]
-crate = "ctutils"
-version = "0.4.4"
-advisory = "RUSTSEC-2026-0385"

@@ -159,7 +159,7 @@ Options:
 - [AGENTS.md](./AGENTS.md) and symlinks for your favorite coding buddies
 - [Replica simulation harness](docs/simulation/README.md)
 
-Use the nightly Cargo dependency commands so that the seven-day publication cooldown applies:
+Use the nightly Cargo dependency commands so that the three-day publication cooldown applies:
 
 ```bash
 cargo +nightly add <crate>
