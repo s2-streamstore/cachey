@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/s2-streamstore/cachey/compare/0.12.0...0.12.1) - 2026-10-27
+
+### Other
+
+- *(deps)* upgrade dependencies and shorten cooldown to three days ([#189](https://github.com/s2-streamstore/cachey/pull/189))
+- restore upstream Rust builder ([#190](https://github.com/s2-streamstore/cachey/pull/190))
+
 ## [0.12.0](https://github.com/s2-streamstore/cachey/compare/0.11.4...0.12.0) - 2026-10-27
 
 ### Added
