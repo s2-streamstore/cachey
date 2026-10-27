@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/s2-streamstore/cachey/compare/0.11.4...0.12.0) - 2026-10-27
+
+### Added
+
+- [**breaking**] cache exact byte ranges with C0-Exact ([#169](https://github.com/s2-streamstore/cachey/pull/169))
+- *(object_store)* [**breaking**] size-aware latency model for replica reads ([#182](https://github.com/s2-streamstore/cachey/pull/182))
+
+### Fixed
+
+- *(service)* count egress only for body bytes sent ([#188](https://github.com/s2-streamstore/cachey/pull/188))
+- *(object_store)* treat HTTP 429 and 503 as backend overload ([#187](https://github.com/s2-streamstore/cachey/pull/187))
+- *(cache)* [**breaking**] size foyer's write buffer and blocks for full pages ([#186](https://github.com/s2-streamstore/cachey/pull/186))
+- *(deps)* resolve cargo-deny advisories for ctutils and zstd ([#185](https://github.com/s2-streamstore/cachey/pull/185))
+
+### Other
+
+- harden release workflow with trusted publishing ([#180](https://github.com/s2-streamstore/cachey/pull/180))
+- *(deps)* upgrade dependencies and fix webpki advisories ([#179](https://github.com/s2-streamstore/cachey/pull/179))
+- *(simulation)* organize fixtures by backend and model time before headers ([#177](https://github.com/s2-streamstore/cachey/pull/177))
+- *(simulation)* model mixed response sizes and resolve same-tick ties ([#173](https://github.com/s2-streamstore/cachey/pull/173))
+- *(metrics)* [**breaking**] follow Prometheus naming conventions ([#172](https://github.com/s2-streamstore/cachey/pull/172))
+
 ## [0.11.4](https://github.com/s2-streamstore/cachey/compare/0.11.3...0.11.4) - 2026-10-17
 
 ### Other
