@@ -491,7 +491,7 @@ pub async fn heap_flamegraph() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{ops::Range, time::Duration};
 
     use axum::{
         extract::FromRequestParts,
@@ -516,6 +516,28 @@ mod tests {
         RequestConfig::from_request_parts(&mut parts, &()).await
     }
 
+    async fn parse_read_range(
+        range: Range<u64>,
+        exact: Option<&[u8]>,
+    ) -> Result<ReadRange, StatusCode> {
+        let mut request = Request::builder()
+            .header(
+                header::RANGE,
+                format!("bytes={}-{}", range.start, range.end - 1),
+            )
+            .body(())
+            .unwrap();
+        if let Some(value) = exact {
+            request
+                .headers_mut()
+                .insert(&C0_EXACT_HEADER, HeaderValue::from_bytes(value).unwrap());
+        }
+        let (mut parts, ()) = request.into_parts();
+        ReadRange::from_request_parts(&mut parts, &())
+            .await
+            .map_err(|(status, _)| status)
+    }
+
     #[tokio::test]
     async fn range_header_allows_the_last_page_within_one_tib() {
         let limit = 1 << 40;
@@ -526,18 +548,9 @@ mod tests {
             (0..limit + 1, false),
             (limit..limit + 1, false),
         ] {
-            let request = Request::builder()
-                .header(
-                    header::RANGE,
-                    format!("bytes={}-{}", range.start, range.end - 1),
-                )
-                .body(())
-                .unwrap();
-            let (mut parts, ()) = request.into_parts();
-            let result = ReadRange::from_request_parts(&mut parts, &())
+            let result = parse_read_range(range.clone(), None)
                 .await
-                .map(|read| read.byterange)
-                .map_err(|(status, _)| status);
+                .map(|read| read.byterange);
             assert_eq!(
                 result,
                 if accepted {
@@ -553,40 +566,15 @@ mod tests {
     async fn c0_exact_reads_at_most_a_page() {
         for (exact, length, expected) in [
             (None, PAGE_SIZE + 1, Ok(false)),
-            (
-                Some(HeaderValue::from_static("false")),
-                PAGE_SIZE + 1,
-                Ok(false),
-            ),
-            (Some(HeaderValue::from_static("true")), PAGE_SIZE, Ok(true)),
-            (
-                Some(HeaderValue::from_static("true")),
-                PAGE_SIZE + 1,
-                Err(StatusCode::BAD_REQUEST),
-            ),
-            (
-                Some(HeaderValue::from_static("1")),
-                1,
-                Err(StatusCode::BAD_REQUEST),
-            ),
-            (
-                Some(HeaderValue::from_bytes(&[0xff]).unwrap()),
-                1,
-                Err(StatusCode::BAD_REQUEST),
-            ),
+            (Some(b"false".as_slice()), PAGE_SIZE + 1, Ok(false)),
+            (Some(b"true"), PAGE_SIZE, Ok(true)),
+            (Some(b"true"), PAGE_SIZE + 1, Err(StatusCode::BAD_REQUEST)),
+            (Some(b"1"), 1, Err(StatusCode::BAD_REQUEST)),
+            (Some(&[0xff]), 1, Err(StatusCode::BAD_REQUEST)),
         ] {
-            let mut request = Request::builder()
-                .header(header::RANGE, format!("bytes=0-{}", length - 1))
-                .body(())
-                .unwrap();
-            if let Some(value) = exact {
-                request.headers_mut().insert(&C0_EXACT_HEADER, value);
-            }
-            let (mut parts, ()) = request.into_parts();
-            let result = ReadRange::from_request_parts(&mut parts, &())
+            let result = parse_read_range(0..length, exact)
                 .await
-                .map(|read| read.exact)
-                .map_err(|(status, _)| status);
+                .map(|read| read.exact);
             assert_eq!(result, expected, "{length}");
         }
     }

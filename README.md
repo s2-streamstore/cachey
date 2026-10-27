@@ -8,7 +8,7 @@ High-performance read-through cache for object storage.
 - Works with any S3-compatible backend, but has its own `/fetch` API requiring a precise `Range`
 - Fixed page size (16 MiB) – maps requested byte range to page-aligned lookups
 - Exact-range mode for small reads of large objects – caches just the requested range
-- Coalesces concurrent requests for the same page
+- Coalesces concurrent requests for the same cache entry
 - Makes hedged requests to manage tail latency of object storage
 - Can attempt redundant buckets for a given object
 
@@ -76,24 +76,24 @@ C0-Config: ct=1000 oat=1500 ma=5 ib=10 mb=100
 
 #### Response
 
-The service maps requests to 16 MiB page-aligned ranges and the response has standard HTTP semantics (`206 Partial Content`, `404 Not Found` etc.)
+The service maps requests to 16 MiB page-aligned ranges, or with `C0-Exact` to the exact range, and the response has standard HTTP semantics (`206 Partial Content`, `404 Not Found` etc.)
 
 | Header | Description |
 |--------|-------------|
 | `Content-Range` | Actual byte range served |
 | `Content-Length` | Number of bytes in response |
-| `Last-Modified` | Timestamp from first page |
+| `Last-Modified` | Timestamp from first cache entry |
 | `Content-Type` | Always `application/octet-stream` |
-| `C0-Status` | Status for first page |
+| `C0-Status` | Status for first cache entry |
 
 `C0-Status` format: `{first}-{last}; {bucket}; {cached_at}`
 - Byte range and which bucket was used
 - `cached_at` is Unix timestamp with 0 implying a cache miss
-- First page status is sent as a header over both HTTP/1.1 and HTTP/2
-- Multi-page GET responses include subsequent page statuses as trailers over HTTP/2 only
+- The first entry's status is sent as a header over both HTTP/1.1 and HTTP/2
+- GET responses spanning several pages include later pages' statuses as trailers over HTTP/2 only
 
-Use HTTP/2 when you need per-page status for a multi-page read. HTTP/1.1 responses
-include `Content-Length` and only the first page's status.
+Use HTTP/2 when you need each page's status for a multi-page read. HTTP/1.1 responses
+include `Content-Length` and only the first entry's status.
 
 #### Example Response
 

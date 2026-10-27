@@ -112,7 +112,7 @@ fn io_engine_config(iouring: bool) -> Box<dyn IoEngineConfig> {
 pub struct CacheKey {
     pub kind: ObjectKind,
     pub object: ObjectKey,
-    /// The bytes of the object the entry holds: a page, or exactly a requested range.
+    /// The requested byte range; the entry's data stops early at the object's end.
     pub range: Range<u64>,
 }
 
@@ -244,11 +244,6 @@ impl foyer::Code for CacheKey {
             Ok(u64::from_be_bytes(buf))
         };
         let range = offset()?..offset()?;
-        if range.is_empty() {
-            return Err(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Empty byte range").into(),
-            );
-        }
 
         Ok(Self {
             kind,
@@ -420,7 +415,7 @@ impl foyer::Code for CacheValue {
 #[cfg(test)]
 mod tests {
     use foyer::Code;
-    use proptest::{collection, prop_assert_eq, proptest, strategy::Strategy};
+    use proptest::{arbitrary::any, collection, prop_assert_eq, proptest};
 
     use super::{CacheKey, CacheKeyHeader, CacheValue, CacheValueHeader};
     use crate::{
@@ -543,13 +538,13 @@ mod tests {
         fn prop_cache_key_roundtrip(
             kind in "[a-z0-9.-]{1,64}",
             object in "[a-zA-Z0-9/_.-]{1,1024}",
-            range in (0u64..u64::MAX, 1u64..=u64::MAX)
-                .prop_map(|(start, len)| start..start.saturating_add(len))
+            start in any::<u64>(),
+            end in any::<u64>()
         ) {
             let key = CacheKey {
                 kind: ObjectKind::new(kind).unwrap(),
                 object: ObjectKey::new(object).unwrap(),
-                range,
+                range: start..end,
             };
 
             let mut encoded = Vec::new();
@@ -602,10 +597,6 @@ mod tests {
             let data = [header.to_bytes().as_slice(), kind, object, &[0; 16]].concat();
             assert!(CacheKey::decode(&mut data.as_slice()).is_err());
         }
-
-        let header = CacheKeyHeader::new(CacheKey::VERSION, 4, 4).unwrap();
-        let empty_range = [header.to_bytes().as_slice(), b"kind", b"test", &[0; 16]].concat();
-        assert!(CacheKey::decode(&mut empty_range.as_slice()).is_err());
     }
 
     #[test]

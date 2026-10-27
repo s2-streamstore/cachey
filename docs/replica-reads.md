@@ -131,7 +131,9 @@ Server reads reserve the bytes they expect: 16 MiB per page or an exact range's
 length, less any part past the end of an object of known size. Admission trusts that
 size, so a read whose size is understated can hold up to the rest of its range beyond
 its reservation. By default, 64 full pages fit. This limit is separate from cache
-capacity and total process memory.
+capacity and total process memory. Active copies are also capped at 1,024, so at
+the default memory limit, copies under 1 MiB, such as small exact reads, reach that cap
+first.
 
 Copies other than early hedges and body retries wait for admission while they can
 still finish by the deadline. A queue that formed within the last 100 ms is
@@ -143,8 +145,7 @@ copy fails at once if it would not be admitted in time: each copy ahead of it, t
 the copy itself, is expected to take the average time between departures, admitted
 or abandoned, since the queue was last empty.
 
-Rust callers use `DownloadLimits`; the default active-copy limit is 1,024. Downloader
-clones share limits.
+Rust callers set both limits through `DownloadLimits`. Downloader clones share limits.
 
 ## Errors
 
@@ -185,9 +186,9 @@ since unfinished copies train nothing past their headers.
 overlapped, including rescue and recovery probes; `fallback` counts wins from
 another bucket.
 
-`C0-Status` exposes the serving bucket and cache status. The first page uses a
-response header. Subsequent pages use HTTP/2 trailers; HTTP/1.1 reports only the
-first page.
+`C0-Status` exposes the serving bucket and cache status. The first entry uses a
+response header. Later pages use HTTP/2 trailers; HTTP/1.1 reports only the first
+entry.
 
 See the [simulation harness](simulation/README.md) and
 [reference results](simulation/REFERENCE.md).

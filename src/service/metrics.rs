@@ -206,9 +206,9 @@ pub enum EntryRequestType {
     Download,
     /// Successful entry downloads that started overlapping requests.
     Hedged,
-    /// Fetches whose primary attempt used the client-preferred bucket.
+    /// Downloads whose primary attempt used the client-preferred bucket.
     ClientPref,
-    /// Fetches that succeeded using a copy other than the initially selected one.
+    /// Downloads that succeeded using a copy other than the initially selected one.
     Fallback,
     /// Entry requests that completed successfully, regardless of hit/miss path.
     Success,

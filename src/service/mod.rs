@@ -686,75 +686,19 @@ mod tests {
         server_handle.abort();
     }
 
+    /// Reads share an entry only for the same range, so an exact read is cached apart from
+    /// the page holding it, while an exact read of a whole page shares the page's entry and
+    /// is checked against the size its bucket reported.
     #[tokio::test]
-    async fn exact_reads_cache_only_the_requested_range() {
+    async fn reads_share_an_entry_only_for_the_same_range() {
         let kind = ObjectKind::new("exact-reads").unwrap();
         let object = ObjectKey::new("object").unwrap();
         let bucket = BucketName::new("bucket").unwrap();
-        let object_data = Bytes::from(
+        let data = Bytes::from(
             (0..4096)
                 .map(|index| (index % 251) as u8)
                 .collect::<Vec<_>>(),
         );
-        let (endpoint, request_count, server_handle) = spawn_mock_s3_server(
-            &bucket,
-            &object,
-            object_data.clone(),
-            Duration::from_millis(50),
-        )
-        .await;
-        let service = service(&endpoint, ByteSize::mib(16)).await;
-        let read = |range, exact| {
-            service
-                .clone()
-                .get(
-                    FetchRequest {
-                        kind: kind.clone(),
-                        object: object.clone(),
-                        buckets: bucket.clone().into(),
-                        byterange: range,
-                        object_size: None,
-                        exact,
-                        config: RequestConfig::default(),
-                    },
-                    NonZeroUsize::MIN,
-                )
-                .try_collect::<Vec<_>>()
-        };
-        let (left, right) = tokio::join!(read(100..200, true), read(100..200, true));
-        for chunks in [left, right, read(100..200, true).await] {
-            let chunks = chunks.expect("exact read");
-            assert_eq!(chunks.len(), 1);
-            assert_eq!(chunks[0].data, object_data.slice(100..200));
-            assert_eq!(chunks[0].object_size, object_data.len() as u64);
-        }
-        assert_eq!(request_count.load(Ordering::Relaxed), 1);
-        let cached = service
-            .cache
-            .get(&CacheKey {
-                kind: kind.clone(),
-                object: object.clone(),
-                range: 100..200,
-            })
-            .await
-            .expect("cache")
-            .expect("exact entry");
-        assert_eq!(cached.value().data, object_data.slice(100..200));
-
-        let chunks = read(100..200, false).await.expect("page read");
-        assert_eq!(chunks[0].data, object_data.slice(100..200));
-        assert_eq!(request_count.load(Ordering::Relaxed), 2);
-        server_handle.abort();
-    }
-
-    /// An exact read of a whole page shares the page's entry whatever size either read
-    /// expected, and is checked against the size its bucket reported.
-    #[tokio::test]
-    async fn an_exact_read_of_a_whole_page_shares_its_entry() {
-        let kind = ObjectKind::new("exact-page").unwrap();
-        let object = ObjectKey::new("object").unwrap();
-        let bucket = BucketName::new("bucket").unwrap();
-        let data = Bytes::from(vec![7; 4096]);
         let (endpoint, request_count, server_handle) =
             spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
         let service = service(&endpoint, ByteSize::mib(16)).await;
@@ -776,9 +720,31 @@ mod tests {
                 .try_collect::<Vec<_>>()
         };
 
-        let chunks = read(100..200, None, false).await.unwrap();
+        for _ in 0..2 {
+            let chunks = read(100..200, None, true).await.expect("exact read");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].data, data.slice(100..200));
+        }
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        let cached = service
+            .cache
+            .get(&CacheKey {
+                kind: kind.clone(),
+                object: object.clone(),
+                range: 100..200,
+            })
+            .await
+            .expect("cache")
+            .expect("exact entry");
+        assert_eq!(cached.value().data, data.slice(100..200));
+
+        let chunks = read(100..200, None, false).await.expect("page read");
         assert_eq!(chunks[0].data, data.slice(100..200));
-        let chunks = read(0..PAGE_SIZE, Some(4096), true).await.unwrap();
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+
+        let chunks = read(0..PAGE_SIZE, Some(4096), true)
+            .await
+            .expect("exact read of the page");
         assert_eq!(
             (chunks[0].range.clone(), chunks[0].data.clone()),
             (0..4096, data)
@@ -790,7 +756,7 @@ mod tests {
                 new: 4096
             })
         ));
-        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
         server_handle.abort();
     }
 

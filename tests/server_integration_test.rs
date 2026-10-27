@@ -214,7 +214,7 @@ async fn exact_reads_are_cached_apart_from_pages() {
     let client = reqwest::Client::new();
     let url = format!("{}/fetch/{}/{key}", ctx.server_url, ctx.rustfs.bucket_name);
 
-    for (exact, cached) in [(true, false), (true, true), (false, false), (false, true)] {
+    for exact in [true, false] {
         let response = client
             .get(&url)
             .header("Range", "bytes=4-9")
@@ -224,8 +224,7 @@ async fn exact_reads_are_cached_apart_from_pages() {
             .unwrap();
         assert_eq!(response.status(), 206);
         let status = response.headers()["c0-status"].to_str().unwrap().to_owned();
-        let cached_at: u32 = status.rsplit("; ").next().unwrap().parse().unwrap();
-        assert_eq!(cached_at != 0, cached, "exact: {exact}, status: {status}");
+        assert!(status.ends_with("; 0"), "exact: {exact}, status: {status}");
         assert_eq!(response.bytes().await.unwrap(), data.slice(4..10));
     }
 }
