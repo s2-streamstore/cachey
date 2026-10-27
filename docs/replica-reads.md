@@ -149,6 +149,9 @@ Rust callers set both limits through `DownloadLimits`. Downloader clones share l
 
 ## Errors
 
+A backend response signals overload when its status is 429 or 503, or its error code
+is `SlowDown`, `ServiceUnavailable`, or a throttling code.
+
 Admission failure or overload returns HTTP 503; timeouts return 504. Backend errors
 take precedence over timeouts, admission failures, and missing objects. Errors
 after streaming starts terminate the body.

@@ -132,6 +132,9 @@ fn map_get_object_error(
             timeout: elapsed,
         };
     }
+    let status = error
+        .raw_response()
+        .map(|response| response.status().as_u16());
     let object_size = error
         .raw_response()
         .and_then(|response| response.headers().get("content-range"))
@@ -151,19 +154,25 @@ fn map_get_object_error(
                 object_size,
             }
         }
+        // S3-compatible stores and proxies may signal overload by status alone.
         service_error
-            if matches!(
-                service_error.code(),
-                Some(
-                    "SlowDown"
-                        | "Throttling"
-                        | "ThrottlingException"
-                        | "TooManyRequests"
-                        | "TooManyRequestsException"
-                )
-            ) =>
+            if matches!(status, Some(429 | 503))
+                || matches!(
+                    service_error.code(),
+                    Some(
+                        "SlowDown"
+                            | "ServiceUnavailable"
+                            | "Throttling"
+                            | "ThrottlingException"
+                            | "TooManyRequests"
+                            | "TooManyRequestsException"
+                    )
+                ) =>
         {
-            DownloadError::Overloaded(service_error.to_string())
+            DownloadError::Overloaded(match status {
+                Some(status) => format!("HTTP {status}: {service_error}"),
+                None => service_error.to_string(),
+            })
         }
         other => DownloadError::Unknown(format!("{other:?}")),
     }
@@ -543,6 +552,8 @@ mod tests {
         requests: AtomicUsize,
         active: AtomicUsize,
         service_errors: Mutex<HashMap<usize, u16>>,
+        /// Replaces the default error body, whose code follows the status.
+        service_error_bodies: Mutex<HashMap<usize, &'static str>>,
         range_error_sizes: Mutex<HashMap<usize, u64>>,
     }
 
@@ -552,6 +563,12 @@ mod tests {
             self.state.active.fetch_add(1, Ordering::SeqCst);
             let active = ActiveRequest(self.state.clone());
             let service_error = self.state.service_errors.lock().get(&request_idx).copied();
+            let service_error_body = self
+                .state
+                .service_error_bodies
+                .lock()
+                .get(&request_idx)
+                .copied();
             let object_size = self
                 .state
                 .range_error_sizes
@@ -576,10 +593,12 @@ mod tests {
                         416 => "InvalidRange",
                         _ => "SlowDown",
                     };
-                    let mut response = HttpResponse::new(
-                        status.try_into().unwrap(),
-                        SdkBody::from(format!("<Error><Code>{code}</Code></Error>")),
+                    let body = service_error_body.map_or_else(
+                        || format!("<Error><Code>{code}</Code></Error>"),
+                        str::to_owned,
                     );
+                    let mut response =
+                        HttpResponse::new(status.try_into().unwrap(), SdkBody::from(body));
                     if let Some(object_size) = object_size {
                         response
                             .headers_mut()
@@ -836,6 +855,37 @@ mod tests {
                 "{error:?}"
             );
             assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overload_is_recognised_by_status_or_code() {
+        for (status, body, overloaded) in [
+            (503, "<Error><Code>SlowDown</Code></Error>", true),
+            (503, "<Error><Code>ServiceUnavailable</Code></Error>", true),
+            (503, "", true),
+            (429, "", true),
+            (429, "<html><body>Too Many Requests</body></html>", true),
+            (400, "<Error><Code>TooManyRequests</Code></Error>", true),
+            (500, "<Error><Code>InternalError</Code></Error>", false),
+            (500, "", false),
+            (502, "<html><body>Bad Gateway</body></html>", false),
+        ] {
+            let (downloader, script) = scripted_downloader([("bucket", 1, 0, false)]);
+            script.service_errors.lock().insert(0, status);
+            script.service_error_bodies.lock().insert(0, body);
+            let result =
+                fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+            let as_expected = if overloaded {
+                matches!(
+                    &result,
+                    Err(DownloadError::Overloaded(message))
+                        if message.starts_with(&format!("HTTP {status}: "))
+                )
+            } else {
+                matches!(result, Err(DownloadError::Unknown(_)))
+            };
+            assert!(as_expected, "{status} {body:?}: {result:?}");
         }
     }
 
