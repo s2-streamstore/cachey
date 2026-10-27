@@ -212,12 +212,14 @@ async fn exact_reads_are_cached_apart_from_pages() {
     )
     .await;
     let client = reqwest::Client::new();
-    let url = format!("{}/fetch/{}/{key}", ctx.server_url, ctx.rustfs.bucket_name);
+    let kind = "exact-reads";
+    let url = format!("{}/fetch/{kind}/{key}", ctx.server_url);
 
     for (exact, cached) in [(true, false), (true, true), (false, false), (false, true)] {
         let response = client
             .get(&url)
             .header("Range", "bytes=4-9")
+            .header("C0-Bucket", &ctx.rustfs.bucket_name)
             .header("C0-Exact", exact.to_string())
             .send()
             .await
@@ -233,8 +235,7 @@ async fn exact_reads_are_cached_apart_from_pages() {
     for exact in [0, 1] {
         for hit in [0, 1] {
             let line = format!(
-                "cachey_first_chunk_latency_seconds_count{{exact=\"{exact}\",hit=\"{hit}\",kind=\"{}\"}} 1",
-                ctx.rustfs.bucket_name
+                "cachey_first_chunk_latency_seconds_count{{exact=\"{exact}\",hit=\"{hit}\",kind=\"{kind}\"}} 1"
             );
             assert!(
                 metrics.lines().any(|found| found == line),

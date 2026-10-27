@@ -6,6 +6,7 @@
 use std::{
     num::{NonZeroU32, NonZeroUsize},
     ops::Range,
+    str::FromStr,
     time::{Duration, SystemTime},
 };
 
@@ -80,6 +81,25 @@ fn on_chunk_error(
     (status_code, headers)
 }
 
+/// An optional header's value, or a 400 with `invalid` if it does not parse.
+fn optional_header<T: FromStr>(
+    parts: &Parts,
+    name: &HeaderName,
+    invalid: &'static str,
+) -> Result<Option<T>, (StatusCode, &'static str)> {
+    parts
+        .headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .ok_or((StatusCode::BAD_REQUEST, invalid))
+        })
+        .transpose()
+}
+
 /// The `Range` header's byte range, and whether `C0-Exact` asks for exactly that range.
 #[derive(Debug)]
 pub struct ReadRange {
@@ -121,23 +141,10 @@ where
             _ => return Err((StatusCode::RANGE_NOT_SATISFIABLE, "Unsupported range")),
         };
 
-        let exact = parts
-            .headers
-            .get(&C0_EXACT_HEADER)
-            .map(|value| {
-                value
-                    .to_str()
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .ok_or((StatusCode::BAD_REQUEST, "Invalid C0-Exact header"))
-            })
-            .transpose()?
-            .unwrap_or(false);
+        let exact =
+            optional_header(parts, &C0_EXACT_HEADER, "Invalid C0-Exact header")?.unwrap_or(false);
         if exact && byterange.end - byterange.start > PAGE_SIZE {
-            return Err((
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                "Exact range exceeds the page size",
-            ));
+            return Err((StatusCode::BAD_REQUEST, "Exact range exceeds the page size"));
         }
 
         Ok(Self { byterange, exact })
@@ -241,18 +248,12 @@ where
     type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        parts
-            .headers
-            .get(&C0_OBJECT_SIZE_HEADER)
-            .map(|value| {
-                value
-                    .to_str()
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .ok_or((StatusCode::BAD_REQUEST, "Invalid C0-Object-Size header"))
-            })
-            .transpose()
-            .map(Self)
+        optional_header(
+            parts,
+            &C0_OBJECT_SIZE_HEADER,
+            "Invalid C0-Object-Size header",
+        )
+        .map(Self)
     }
 }
 
@@ -561,7 +562,7 @@ mod tests {
             (
                 Some(HeaderValue::from_static("true")),
                 PAGE_SIZE + 1,
-                Err(StatusCode::RANGE_NOT_SATISFIABLE),
+                Err(StatusCode::BAD_REQUEST),
             ),
             (
                 Some(HeaderValue::from_static("1")),

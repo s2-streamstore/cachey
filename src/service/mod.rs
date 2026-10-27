@@ -106,8 +106,8 @@ pub struct FetchRequest {
     pub object: ObjectKey,
     pub buckets: BucketNameSet,
     pub byterange: Range<u64>,
-    /// When known, pages are admitted and timed at the bytes the object holds, and every
-    /// page must report this size.
+    /// When known, reads are admitted and timed at the bytes the object holds, and every
+    /// response must report this size.
     pub object_size: Option<u64>,
     /// Fetch and cache the byte range as one entry instead of as the pages it spans.
     pub exact: bool,
@@ -322,7 +322,11 @@ impl PageGetExecutor {
                             &executor.request.config,
                         )
                         .await?;
-                    metrics::page_download_latency(&executor.request.kind, out.latency);
+                    metrics::page_download_latency(
+                        &executor.request.kind,
+                        executor.request.exact,
+                        out.latency,
+                    );
                     if out.hedged {
                         executor.count(PageRequestType::Hedged);
                     }
@@ -496,17 +500,20 @@ mod tests {
         aws_sdk_s3::Client::from_conf(config)
     }
 
-    fn page_requests(kind: &ObjectKind, exact: bool, typ: &str) -> u64 {
+    fn metric(series: &str) -> u64 {
         let snapshot = metrics::gather();
-        let prefix = format!(
-            "cachey_page_requests_total{{exact=\"{}\",kind=\"{kind}\",type=\"{typ}\"}} ",
-            u8::from(exact)
-        );
         std::str::from_utf8(&snapshot)
             .unwrap()
             .lines()
-            .find_map(|line| line.strip_prefix(&prefix))
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
             .map_or(0, |value| value.parse().unwrap())
+    }
+
+    fn page_requests(kind: &ObjectKind, exact: bool, typ: &str) -> u64 {
+        metric(&format!(
+            "cachey_page_requests_total{{exact=\"{}\",kind=\"{kind}\",type=\"{typ}\"}}",
+            u8::from(exact)
+        ))
     }
 
     #[tokio::test]
@@ -777,6 +784,13 @@ mod tests {
             ] {
                 assert_eq!(page_requests(&kind, exact, typ), expected, "{exact} {typ}");
             }
+            assert_eq!(
+                metric(&format!(
+                    "cachey_page_download_latency_seconds_count{{exact=\"{}\",kind=\"{kind}\"}}",
+                    u8::from(exact)
+                )),
+                1
+            );
         }
         server_handle.abort();
     }

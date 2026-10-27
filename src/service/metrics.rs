@@ -258,12 +258,12 @@ pub fn page_request_count(kind: &ObjectKind, exact: bool, typ: PageRequestType) 
         .inc();
 }
 
-pub fn page_download_latency(kind: &ObjectKind, latency: std::time::Duration) {
+pub fn page_download_latency(kind: &ObjectKind, exact: bool, latency: std::time::Duration) {
     static HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec!(
             "cachey_page_download_latency_seconds",
             "Successful page download latency, including retries, hedging, and bucket fallback",
-            &["kind"],
+            &["kind", "exact"],
             vec![
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
             ]
@@ -272,7 +272,7 @@ pub fn page_download_latency(kind: &ObjectKind, latency: std::time::Duration) {
     });
 
     HISTOGRAM
-        .with_label_values(&[&**kind])
+        .with_label_values(&[&**kind, flag(exact)])
         .observe(latency.as_secs_f64());
 }
 
