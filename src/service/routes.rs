@@ -314,7 +314,7 @@ pub async fn fetch(
     let mut headers = HeaderMap::new();
     match first_chunk {
         Ok(chunk) => {
-            metrics::first_chunk_latency(&kind, chunk.cached_at.is_some(), start.elapsed());
+            metrics::first_chunk_latency(&kind, exact, chunk.cached_at.is_some(), start.elapsed());
             let object_size = chunk.object_size;
             let first_byte = chunk.range.start;
             let last_byte = byterange.end.min(object_size) - 1;

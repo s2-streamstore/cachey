@@ -228,6 +228,20 @@ async fn exact_reads_are_cached_apart_from_pages() {
         assert_eq!(cached_at != 0, cached, "exact: {exact}, status: {status}");
         assert_eq!(response.bytes().await.unwrap(), data.slice(4..10));
     }
+
+    let metrics = scrape_metrics(&client, &ctx.server_url).await;
+    for exact in [0, 1] {
+        for hit in [0, 1] {
+            let line = format!(
+                "cachey_first_chunk_latency_seconds_count{{exact=\"{exact}\",hit=\"{hit}\",kind=\"{}\"}} 1",
+                ctx.rustfs.bucket_name
+            );
+            assert!(
+                metrics.lines().any(|found| found == line),
+                "{line}\n{metrics}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

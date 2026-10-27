@@ -291,7 +291,8 @@ impl PageGetExecutor {
         span: Span,
         cache: foyer::HybridCache<CacheKey, CacheValue>,
     ) -> Result<(Span, CacheValue), ServiceError> {
-        metrics::page_request_count(&self.request.kind, metrics::PageRequestType::Access);
+        let exact = self.request.exact;
+        metrics::page_request_count(&self.request.kind, exact, metrics::PageRequestType::Access);
 
         let cache_key = CacheKey {
             kind: self.request.kind.clone(),
@@ -307,6 +308,7 @@ impl PageGetExecutor {
                     fetched_by_current_request.store(true, Ordering::Relaxed);
                     metrics::page_request_count(
                         &self.request.kind,
+                        exact,
                         metrics::PageRequestType::Download,
                     );
 
@@ -324,18 +326,21 @@ impl PageGetExecutor {
                     if out.hedged {
                         metrics::page_request_count(
                             &self.request.kind,
+                            exact,
                             metrics::PageRequestType::Hedged,
                         );
                     }
                     if out.primary_bucket_idx == 0 {
                         metrics::page_request_count(
                             &self.request.kind,
+                            exact,
                             metrics::PageRequestType::ClientPref,
                         );
                     }
                     if out.used_bucket_idx != out.primary_bucket_idx {
                         metrics::page_request_count(
                             &self.request.kind,
+                            exact,
                             metrics::PageRequestType::Fallback,
                         );
                     }
@@ -355,22 +360,34 @@ impl PageGetExecutor {
                     .unwrap_or(ServiceError::Cache(err))
             })?;
         let key = entry.key();
-        metrics::page_request_count(&key.kind, metrics::PageRequestType::Success);
+        metrics::page_request_count(&key.kind, exact, metrics::PageRequestType::Success);
 
         let mut value = entry.value().clone();
         match entry.source() {
             Source::Memory => {
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHitMemory);
+                metrics::page_request_count(&key.kind, exact, metrics::PageRequestType::CacheHit);
+                metrics::page_request_count(
+                    &key.kind,
+                    exact,
+                    metrics::PageRequestType::CacheHitMemory,
+                );
             }
             Source::Disk => {
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHit);
-                metrics::page_request_count(&key.kind, metrics::PageRequestType::CacheHitDisk);
+                metrics::page_request_count(&key.kind, exact, metrics::PageRequestType::CacheHit);
+                metrics::page_request_count(
+                    &key.kind,
+                    exact,
+                    metrics::PageRequestType::CacheHitDisk,
+                );
             }
             Source::Outer => {
                 value.cached_at = 0;
                 if !fetched_by_current_request.load(Ordering::Relaxed) {
-                    metrics::page_request_count(&key.kind, metrics::PageRequestType::Coalesced);
+                    metrics::page_request_count(
+                        &key.kind,
+                        exact,
+                        metrics::PageRequestType::Coalesced,
+                    );
                 }
             }
         }
@@ -502,6 +519,19 @@ mod tests {
             .region(Region::new("us-east-1"))
             .build();
         aws_sdk_s3::Client::from_conf(config)
+    }
+
+    fn page_requests(kind: &ObjectKind, exact: bool, typ: &str) -> u64 {
+        let snapshot = metrics::gather();
+        let prefix = format!(
+            "cachey_page_requests_total{{exact=\"{}\",kind=\"{kind}\",type=\"{typ}\"}} ",
+            u8::from(exact)
+        );
+        std::str::from_utf8(&snapshot)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map_or(0, |value| value.parse().unwrap())
     }
 
     #[tokio::test]
@@ -703,8 +733,13 @@ mod tests {
                 .map(|index| (index % 251) as u8)
                 .collect::<Vec<_>>(),
         );
-        let (endpoint, request_count, server_handle) =
-            spawn_mock_s3_server(&bucket, &object, object_data.clone(), Duration::ZERO).await;
+        let (endpoint, request_count, server_handle) = spawn_mock_s3_server(
+            &bucket,
+            &object,
+            object_data.clone(),
+            Duration::from_millis(50),
+        )
+        .await;
         let service = service(&endpoint, ByteSize::mib(16)).await;
         let read = |range, exact| {
             service
@@ -729,13 +764,14 @@ mod tests {
             span,
         };
 
-        for expected_requests in [1, 1] {
-            let chunks = read(100..200, true).await.expect("exact read");
+        let (left, right) = tokio::join!(read(100..200, true), read(100..200, true));
+        for chunks in [left, right, read(100..200, true).await] {
+            let chunks = chunks.expect("exact read");
             assert_eq!(chunks.len(), 1);
             assert_eq!(chunks[0].data, object_data.slice(100..200));
             assert_eq!(chunks[0].object_size, object_data.len() as u64);
-            assert_eq!(request_count.load(Ordering::Relaxed), expected_requests);
         }
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
         let cached = service
             .cache
             .get(&key(Span::Exact(100..200)))
@@ -755,6 +791,18 @@ mod tests {
         let chunks = read(100..200, false).await.expect("page read");
         assert_eq!(chunks[0].data, object_data.slice(100..200));
         assert_eq!(request_count.load(Ordering::Relaxed), 2);
+        for (exact, access, download, coalesced, cache_hit) in
+            [(true, 3, 1, 1, 1), (false, 1, 1, 0, 0)]
+        {
+            for (typ, expected) in [
+                ("access", access),
+                ("download", download),
+                ("coalesced", coalesced),
+                ("cache_hit", cache_hit),
+            ] {
+                assert_eq!(page_requests(&kind, exact, typ), expected, "{exact} {typ}");
+            }
+        }
         server_handle.abort();
     }
 
@@ -810,8 +858,6 @@ mod tests {
             assert_eq!(chunks[0].range, range);
             assert_eq!(chunks[0].cached_at, None);
         }
-        let snapshot = super::metrics::gather();
-        let text = std::str::from_utf8(&snapshot).unwrap();
         for (typ, expected) in [
             ("access", 2),
             ("success", 2),
@@ -819,12 +865,7 @@ mod tests {
             ("coalesced", 1),
             ("cache_hit", 0),
         ] {
-            let prefix = format!("cachey_page_requests_total{{kind=\"{kind}\",type=\"{typ}\"}} ");
-            let value = text
-                .lines()
-                .find_map(|line| line.strip_prefix(&prefix))
-                .unwrap_or("0");
-            assert_eq!(value.parse::<u64>().unwrap(), expected, "{typ}");
+            assert_eq!(page_requests(&kind, false, typ), expected, "{typ}");
         }
 
         server_handle.abort();
