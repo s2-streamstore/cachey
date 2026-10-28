@@ -372,7 +372,6 @@ impl Followups<'_> {
                 )
             })?,
         };
-        let model = routing.model(index);
         let overloaded = routing.all_overloaded();
         let retrying = !early && self.states.buckets[index].tried;
         // Hedges and retries never queue for admission, so a retry cannot spend a credit
@@ -402,7 +401,7 @@ impl Followups<'_> {
         self.started(index);
         Some(CopyAttempt {
             index,
-            model,
+            model: routing.model(index).clone(),
             is_primary: false,
             probe: None,
             permits,
@@ -463,7 +462,7 @@ impl Downloader {
         };
         followups.started(primary);
         let mut hedge = HedgeTimer::new(
-            primary_copy.model,
+            primary_copy.model.clone(),
             &request.primary_timeline,
             bytes,
             self.limits.hedge_budget_percent > 0 && !probing,
@@ -530,7 +529,7 @@ impl Downloader {
         let (admission, backup_admission) = reservations.unzip();
         let copy = CopyAttempt {
             index,
-            model: routing.model(index),
+            model: routing.model(index).clone(),
             is_primary: true,
             probe,
             permits: admission.map(|admission| AttemptPermits {

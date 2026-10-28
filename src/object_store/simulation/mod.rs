@@ -413,9 +413,16 @@ async fn assert_stalls_are_rescued(
     reports
 }
 
-/// Allow 1.5 nominal reads for the hedge delay plus one for the replacement.
+/// Allow 1.5 nominal reads for the hedge delay plus one for the replacement. Where reads of
+/// a size split between warm and cold objects, every read's hedge waits past the cold
+/// ones, so each nominal read allows for a cold object.
 fn hedged_read_ms(scenario: &Scenario, bytes: usize) -> u64 {
-    scenario.replicas[0].read_ms(bytes) * 5 / 2 + 30
+    let replica = &scenario.replicas[0];
+    let cold_ms = replica
+        .hot_cache
+        .as_ref()
+        .map_or(0, |cache| cache.cold_headers_ms);
+    (replica.read_ms(bytes) + cold_ms) * 5 / 2 + 30
 }
 
 /// Allow at most 2% of healthy reads to overlap copies.
@@ -480,6 +487,16 @@ async fn simulation_exact_ranges_hedge_stalls_but_not_healthy_reads() {
         )
         .await;
     }
+}
+
+/// S3 Standard serves an object cold once it ages out of its cache, sooner the larger it
+/// is, and a second copy of a cold read finishes no sooner than the first. Reads that are
+/// merely cold must not spend the hedge budget, which stalls still need.
+#[tokio::test(start_paused = true)]
+async fn simulation_cold_objects_are_not_hedged_but_stalls_are() {
+    assert_rarely_hedged("s3_standard_cold_objects").await;
+    let scenario = scenario_named("s3_standard_cold_objects_stalls");
+    assert_stalls_are_rescued(scenario, 5, hedged_read_ms).await;
 }
 
 /// At one read per second, a half-life still spans enough observations that healthy

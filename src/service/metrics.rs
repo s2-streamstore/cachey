@@ -8,13 +8,21 @@ use prometheus::{
 };
 
 use crate::{
-    object_store::{BucketMetrics, LatencyEstimate, Predictions},
+    object_store::{BucketMetrics, Predictions, QUANTILES, size_bands},
     types::{BucketName, ObjectKind},
 };
 
+static BAND_LABELS: LazyLock<Vec<(u64, String)>> = LazyLock::new(|| {
+    size_bands()
+        .map(|bytes| (bytes, bytes.to_string()))
+        .collect()
+});
+
+static QUANTILE_LABELS: LazyLock<[String; 3]> =
+    LazyLock::new(|| QUANTILES.map(|quantile| quantile.to_string()));
+
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     type BucketGauge = (GaugeVec, fn(&BucketMetrics) -> f64);
-    type LatencyGauge = (GaugeVec, fn(&LatencyEstimate) -> f64);
 
     static GAUGES: LazyLock<[BucketGauge; 3]> = LazyLock::new(|| {
         let gauge = |name: &str, help: &str| register_gauge_vec!(name, help, &["bucket"]).unwrap();
@@ -43,61 +51,62 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         ]
     });
 
-    static LATENCY_GAUGES: LazyLock<[LatencyGauge; 4]> = LazyLock::new(|| {
-        let gauge =
-            |name: &str, help: &str| register_gauge_vec!(name, help, &["bucket", "phase"]).unwrap();
-        [
-            (
-                gauge(
-                    "cachey_bucket_latency_base_seconds",
-                    "Median latency of a zero-byte request",
-                ),
-                |estimate| estimate.base.as_secs_f64(),
-            ),
-            (
-                gauge(
-                    "cachey_bucket_latency_seconds_per_byte",
-                    "Median latency added per byte",
-                ),
-                |estimate| estimate.seconds_per_byte,
-            ),
-            (
-                gauge(
-                    "cachey_bucket_latency_tail_ratio",
-                    "p99 latency as a multiple of the median",
-                ),
-                |estimate| estimate.tail_ratio,
-            ),
-            (
-                gauge(
-                    "cachey_bucket_latency_model_bytes",
-                    "Largest size retained by the latency model",
-                ),
-                |estimate| estimate.largest_bytes as f64,
-            ),
-        ]
+    static LATENCY: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_latency_seconds",
+            "Latency quantile of a size band, labeled by its smallest size in bytes",
+            &["bucket", "phase", "bytes", "quantile"]
+        )
+        .unwrap()
+    });
+
+    static MODEL_BYTES: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_latency_model_bytes",
+            "Largest size retained by the latency model",
+            &["bucket", "phase"]
+        )
+        .unwrap()
     });
 
     for (gauge, value) in &*GAUGES {
         gauge.with_label_values(&[bucket]).set(value(metrics));
     }
     for (phase, estimate) in [
-        ("first_byte", metrics.first_byte),
-        ("body", metrics.body),
-        ("request", metrics.request),
+        ("first_byte", &metrics.first_byte),
+        ("body", &metrics.body),
+        ("request", &metrics.request),
     ] {
-        for (gauge, value) in &*LATENCY_GAUGES {
-            match &estimate {
-                Some(estimate) => gauge
-                    .with_label_values(&[&**bucket, phase])
-                    .set(value(estimate)),
-                None => {
-                    let _ = gauge.remove_label_values(&[bucket, phase]);
+        let bands = estimate
+            .as_ref()
+            .map_or(&[][..], |estimate| &estimate.bands);
+        for (bytes, bytes_label) in &*BAND_LABELS {
+            let quantiles = bands
+                .iter()
+                .find(|band| band.bytes == *bytes)
+                .map(|band| band.quantiles);
+            for (index, quantile) in QUANTILE_LABELS.iter().enumerate() {
+                let labels = [&**bucket, phase, bytes_label, quantile];
+                match quantiles {
+                    Some(quantiles) => LATENCY
+                        .with_label_values(&labels)
+                        .set(quantiles[index].as_secs_f64()),
+                    None => {
+                        let _ = LATENCY.remove_label_values(&labels);
+                    }
                 }
             }
         }
-        if let Some(estimate) = estimate {
-            count_predictions(bucket, phase, estimate.predictions);
+        match estimate {
+            Some(estimate) => {
+                MODEL_BYTES
+                    .with_label_values(&[&**bucket, phase])
+                    .set(estimate.largest_bytes as f64);
+                count_predictions(bucket, phase, estimate.predictions);
+            }
+            None => {
+                let _ = MODEL_BYTES.remove_label_values(&[bucket, phase]);
+            }
         }
     }
 }
@@ -131,11 +140,11 @@ fn count_predictions(bucket: &BucketName, phase: &str, predictions: Predictions)
             predictions.observations,
         ),
         (
-            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, "0.5"]),
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILE_LABELS[0]]),
             predictions.above_median,
         ),
         (
-            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, "0.99"]),
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILE_LABELS[2]]),
             predictions.above_tail,
         ),
     ] {

@@ -2074,7 +2074,7 @@ mod tests {
         let peer = metrics(&downloader, "peer").await;
         assert!(peer.deprioritized);
         assert_eq!(
-            peer.request.map(|estimate| estimate.base),
+            peer.request.map(|estimate| estimate.bands[0].quantiles[0]),
             Some(Duration::from_millis(20))
         );
         assert_eq!(script.active.load(Ordering::SeqCst), 0);
@@ -2604,7 +2604,8 @@ mod tests {
         let second = fetch(&downloader, &["bucket"]).await;
         assert_eq!(script.requests.load(Ordering::SeqCst), 3);
         assert!(second.hedged);
-        assert_eq!(second.latency, Duration::from_millis(115));
+        // The hedge waits 1.25 times the 10 ms p95, rounded up to the timer's millisecond.
+        assert_eq!(second.latency, Duration::from_millis(113));
     }
 
     #[tokio::test(start_paused = true)]

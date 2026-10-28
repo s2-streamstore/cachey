@@ -8,11 +8,11 @@ use std::{
 };
 
 use dashmap::DashMap;
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
 use tokio::{sync::SetOnce, time::Instant};
 
-pub use self::model::{LatencyEstimate, Predictions};
-use self::model::{Median, Refit, SizeHistogram, SizeModel, TIMER_RESOLUTION};
+pub use self::model::{BandLatency, LatencyEstimate, Predictions, QUANTILES, size_bands};
+use self::model::{Median, SizeHistogram, SizeModel, TIMER_RESOLUTION};
 use crate::{
     object_store::DownloadLimits,
     types::{BucketName, BucketNameSet},
@@ -155,7 +155,7 @@ impl Sample {
 
 /// Per-bucket latency by size. Time to first byte and complete requests are modeled by
 /// requested bytes, bodies by the length announced in headers.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct LatencyModel {
     pub first_byte: SizeModel,
     pub body: SizeModel,
@@ -219,9 +219,9 @@ impl LatencyEstimates {
 
     fn model(&self) -> LatencyModel {
         LatencyModel {
-            first_byte: self.first_byte.model(),
-            body: self.body.model(),
-            request: self.request.model(),
+            first_byte: self.first_byte.model().clone(),
+            body: self.body.model().clone(),
+            request: self.request.model().clone(),
         }
     }
 
@@ -303,7 +303,7 @@ impl BucketStats {
 
     /// Every success eases the excess; the first measurement and recovery probes clear it.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
-        if probe || self.estimates.request.estimate().is_none() {
+        if probe || !self.estimates.request.is_measured() {
             self.routing_excess = 0.0;
             self.unmeasured_latency = Duration::ZERO;
         } else {
@@ -446,25 +446,14 @@ impl BucketStats {
 }
 
 /// Refits once per interval if `interval` allows, or sooner while observation counts
-/// double. Fitting runs outside the lock so it does not delay the bucket's copies;
-/// claiming the refit under the lock leaves concurrent callers nothing to refit.
-fn refit(stats: &mut MutexGuard<'_, BucketStats>, now: Instant, interval: bool) {
+/// double.
+fn refit(stats: &mut BucketStats, now: Instant, interval: bool) {
     let due = interval && now.duration_since(stats.summarized_at) >= LATENCY_SNAPSHOT_INTERVAL;
     if due {
         stats.summarized_at = now;
     }
-    let refits: [Option<Refit>; 3] = stats
-        .estimates
-        .histograms()
-        .map(|histogram| histogram.refit(due));
-    if refits.iter().all(Option::is_none) {
-        return;
-    }
-    let fits = MutexGuard::unlocked(stats, || refits.map(|refit| refit.map(Refit::fit)));
-    for (histogram, fitted) in stats.estimates.histograms().into_iter().zip(fits) {
-        if let Some(fitted) = fitted {
-            histogram.store(fitted);
-        }
+    for histogram in stats.estimates.histograms() {
+        histogram.refit(due);
     }
 }
 
@@ -727,8 +716,8 @@ impl RoutingSnapshot {
         self.buckets[index].tail
     }
 
-    pub fn model(&self, index: usize) -> LatencyModel {
-        self.buckets[index].model
+    pub fn model(&self, index: usize) -> &LatencyModel {
+        &self.buckets[index].model
     }
 
     pub fn overloaded(&self, index: usize) -> bool {
@@ -805,6 +794,7 @@ impl BucketedStats {
                     refit(&mut stats, now, Some(index) == oldest);
                     let model = stats.estimates.model();
                     let median = model.request.median(requested_bytes);
+                    let tail = model.request.tail(requested_bytes);
                     let current = stats.routing_latency(now, median.map(Median::value));
                     if index == 0 {
                         preferred_latency = current;
@@ -817,7 +807,7 @@ impl BucketedStats {
                         stats: state.clone(),
                         model,
                         median: median.map(Median::value),
-                        tail: model.request.tail(requested_bytes),
+                        tail,
                         latency: locality_adjusted(latency, index),
                         deprioritized: stats.deprioritized,
                         error_rate: stats.error_rate(now),
@@ -1376,7 +1366,10 @@ mod tests {
         let mut exported = 0;
         stats.export_bucket_metrics(|bucket, metrics| {
             assert_eq!(
-                metrics.request.map(|estimate| estimate.base),
+                metrics
+                    .request
+                    .as_ref()
+                    .map(|estimate| estimate.bands[0].quantiles[0]),
                 Some(Duration::from_millis(3))
             );
             let entry = stats
@@ -1609,9 +1602,6 @@ mod tests {
     /// Speed shifts span 4x and jitter 1.56x, so a size observed at one speed can route up
     /// to 6.25x from its observations once other sizes see another.
     const ROUTING_SLACK: f64 = 8.0;
-    /// A size is judged once a fit includes this many of its observations, since a line fit
-    /// to fewer can trade them for other sizes' larger deviations.
-    const JUDGED_OBSERVATIONS: usize = 3;
 
     #[derive(Debug, Clone)]
     enum Finish {
@@ -1692,9 +1682,9 @@ mod tests {
         let buckets = BucketNameSet::from(BucketName::new("bucket").unwrap());
         let entry = stats.entry(&buckets[0]);
         let mut successes = 0;
-        // The range of latencies observed at each size, and which successes observed it.
-        let mut observed: [(Duration, Duration, Vec<u64>); ROUTED_SIZES.len()] =
-            std::array::from_fn(|_| (Duration::MAX, Duration::ZERO, Vec::new()));
+        // The range of latencies observed at each size, and the first success that observed it.
+        let mut observed: [(Duration, Duration, Option<u64>); ROUTED_SIZES.len()] =
+            std::array::from_fn(|_| (Duration::MAX, Duration::ZERO, None));
         for (gap_ms, event) in events {
             advance(Duration::from_millis(gap_ms)).await;
             let (size, finish) = match event {
@@ -1730,10 +1720,10 @@ mod tests {
                     ratios.0 - 1e-9 <= factor && factor <= ratios.1 + 1e-9,
                     "factor {factor} outside {ratios:?}"
                 );
-                let (low, high, seen) = &observed[size];
-                let judged = seen
-                    .get(JUDGED_OBSERVATIONS - 1)
-                    .is_some_and(|&nth| stats.estimates.request.fitted_updates() >= nth);
+                let (low, high, first) = &observed[size];
+                // A size is judged once a fit includes its first observation.
+                let judged =
+                    first.is_some_and(|first| stats.estimates.request.fitted_updates() >= first);
                 let scaled = latency.div_f64(1.0 + stats.routing_excess(Instant::now()));
                 prop_assert!(
                     !judged
@@ -1749,10 +1739,10 @@ mod tests {
                 } => {
                     let latency = backend.latency(size, jitter_percent);
                     successes += 1;
-                    let (low, high, seen) = &mut observed[size];
+                    let (low, high, first) = &mut observed[size];
                     *low = (*low).min(latency);
                     *high = (*high).max(latency);
-                    seen.push(successes);
+                    first.get_or_insert(successes);
                     record_success(&entry, ROUTED_SIZES[size], latency, probe);
                 }
                 Finish::Cancel { elapsed_percent } => {
@@ -1840,7 +1830,7 @@ mod tests {
                     read(0, 80),
                 ],
             ),
-            // A line fit to one size predicted smaller ones.
+            // One observed size predicted smaller ones.
             (
                 3.0,
                 5.35,
@@ -1871,7 +1861,7 @@ mod tests {
                     read(2, 80),
                 ],
             ),
-            // Reads at two speeds fit no line, and the plain fit dropped the fixed cost.
+            // Reads at two speeds, with cancellations at both.
             (
                 20.48,
                 19.53,
