@@ -672,6 +672,7 @@ mod tests {
             .endpoint_url("http://s3.test")
             .force_path_style(true)
             .retry_config(RetryConfig::standard().with_max_attempts(1))
+            .retry_partition(crate::object_store::isolated_retry_partition())
             .http_client(http_client_fn(move |_, _| connector.clone()))
             .build();
         let downloader = Downloader::new(
