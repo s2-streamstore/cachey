@@ -1613,9 +1613,6 @@ mod tests {
     /// Speed shifts span 4x and jitter 1.56x, so a size observed at one speed can route up
     /// to 6.25x from its observations once other sizes see another.
     const ROUTING_SLACK: f64 = 8.0;
-    /// A size is judged once a fit includes this many of its observations, since a line fit
-    /// to fewer can trade them for other sizes' larger deviations.
-    const JUDGED_OBSERVATIONS: usize = 3;
 
     #[derive(Debug, Clone)]
     enum Finish {
@@ -1735,9 +1732,10 @@ mod tests {
                     "factor {factor} outside {ratios:?}"
                 );
                 let (low, high, seen) = &observed[size];
+                // A size is judged once a fit includes its first observation.
                 let judged = seen
-                    .get(JUDGED_OBSERVATIONS - 1)
-                    .is_some_and(|&nth| stats.estimates.request.fitted_updates() >= nth);
+                    .first()
+                    .is_some_and(|&first| stats.estimates.request.fitted_updates() >= first);
                 let scaled = latency.div_f64(1.0 + stats.routing_excess(Instant::now()));
                 prop_assert!(
                     !judged
@@ -1844,7 +1842,7 @@ mod tests {
                     read(0, 80),
                 ],
             ),
-            // A line fit to one size predicted smaller ones.
+            // One observed size predicted smaller ones.
             (
                 3.0,
                 5.35,
@@ -1875,7 +1873,7 @@ mod tests {
                     read(2, 80),
                 ],
             ),
-            // Reads at two speeds fit no line, and the plain fit dropped the fixed cost.
+            // Reads at two speeds, with cancellations at both.
             (
                 20.48,
                 19.53,

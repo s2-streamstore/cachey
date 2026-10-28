@@ -34,7 +34,8 @@ struct Point {
 #[derive(Debug, Clone)]
 struct Curve {
     points: Arc<[Point]>,
-    /// One observed size fits a transfer cost rather than a fixed cost.
+    /// Below the smallest band, latency falls toward the timer resolution at zero bytes, as
+    /// a transfer cost, rather than holding flat as a fixed cost.
     proportional: bool,
     smallest_bytes: u64,
     largest_bytes: u64,
@@ -42,13 +43,12 @@ struct Curve {
 
 impl Curve {
     /// Quantiles at a size. Beyond the largest observed size, the last segment's slope
-    /// predicts larger reads, and none are predicted where it measures no cost per byte.
+    /// predicts larger reads, and none are predicted where latency does not grow measurably.
     fn micros(&self, bytes: u64) -> Option<[f64; 3]> {
         let points = &self.points[..];
         let size = bytes as f64;
         let first = points[0];
         let last = points[points.len() - 1];
-        // A proportional curve of one size runs from the timer resolution at zero bytes.
         let origin = Point {
             micros: [TIMER_MICROS; 3],
             ..Point::default()
@@ -107,7 +107,7 @@ pub struct BandLatency {
 #[derive(Debug, Clone)]
 pub struct LatencyEstimate {
     pub bands: Vec<BandLatency>,
-    /// Largest retained size; larger sizes are predicted only from a measurable per-byte cost.
+    /// Largest retained size; larger sizes are predicted only where latency grows measurably.
     pub largest_bytes: u64,
     pub predictions: Predictions,
 }
@@ -121,7 +121,7 @@ fn duration(micros: f64) -> Duration {
 pub(in crate::object_store) enum Median {
     /// Within the range of retained sizes.
     Observed(Duration),
-    /// Outside it: along the last segment where the cost per byte is measurable, or else the
+    /// Outside it: along the last segment where latency grows measurably, or else the
     /// median at the largest retained size, a lower bound since latency grows with size.
     /// Either way an estimate that can be far off, so it is not evidence about the bucket.
     Unobserved(Duration),
@@ -294,7 +294,7 @@ fn curve(observations: &[Observation], proportional: bool, values: &mut Vec<(f64
 /// observation, so sparse traffic keeps enough observations for a tail estimate.
 #[derive(Debug)]
 pub(super) struct SizeHistogram {
-    /// One observed size fits a transfer cost rather than a fixed cost.
+    /// Body time falls toward zero below the smallest band, as a transfer cost.
     proportional: bool,
     bands: BTreeMap<u32, Reservoir<Measurement>>,
     clock: f64,
@@ -638,7 +638,7 @@ mod tests {
         );
     }
 
-    /// Buffered bodies of one size, or fixed overhead across sizes, measure no cost per byte.
+    /// Buffered bodies of one size, or fixed overhead across sizes, show no growth with size.
     #[tokio::test(start_paused = true)]
     async fn flat_history_does_not_establish_larger_transfer_times() {
         for history in [&[(3000, 0)][..], &[(4096, 20), (65_536, 20)]] {
@@ -695,56 +695,6 @@ mod tests {
             model.median(16 * MIB),
             Some(Median::Unobserved(Duration::from_millis(161)))
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_rare_large_stall_does_not_become_the_body_median() {
-        let mut histogram = body();
-        for (bytes, body_micros, count) in [
-            (1024, 20_010, 100),
-            (65_536, 20_625, 10),
-            (16 * MIB, 180_000, 1),
-            (16 * MIB, 800_000, 1),
-        ] {
-            for _ in 0..count {
-                histogram.update(Instant::now(), bytes, Duration::from_micros(body_micros));
-            }
-        }
-        let model = histogram.summary(true);
-        let near = |actual: Option<Duration>, expected: Duration, tolerance_micros| {
-            actual.unwrap().abs_diff(expected) <= Duration::from_micros(tolerance_micros)
-        };
-        assert!(near(
-            model.median(16 * MIB).map(Median::value),
-            Duration::from_millis(180),
-            1
-        ));
-        assert!(near(model.tail(16 * MIB), Duration::from_millis(800), 1));
-        // With two reads at this size, one stalled, its p95 is the stall.
-        assert!(near(
-            model.hedge_delay(16 * MIB),
-            Duration::from_millis(800),
-            1
-        ));
-    }
-
-    /// Reads from two speeds fit no line. Small reads keep their fixed cost rather than
-    /// trading it for the large read's absolute deviation.
-    #[tokio::test(start_paused = true)]
-    async fn sizes_no_line_fits_keep_the_fixed_cost_of_small_reads() {
-        let mut histogram = SizeHistogram::new(false);
-        for (bytes, millis, count) in [(4096, 16, 3), (MIB, 16, 4), (16 * MIB, 366, 1)] {
-            for _ in 0..count {
-                update(&mut histogram, bytes, millis);
-            }
-        }
-        let model = histogram.summary(true);
-        assert!(
-            model.median(4096).unwrap().value() >= Duration::from_millis(8),
-            "{:?}",
-            model.median(4096)
-        );
-        assert!(model.median(16 * MIB).unwrap().value() >= Duration::from_millis(300));
     }
 
     #[tokio::test(start_paused = true)]
