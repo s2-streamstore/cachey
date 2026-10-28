@@ -80,6 +80,15 @@ with size: reads of one size split between a warm and a cold mode, and the media
 steps up where cold reads become the majority. A line through every size predicts
 seconds for 16 MiB from that step; quantiles by band follow it.
 
+Sizes read only a few times are estimated from few samples, and mostly err toward
+hedging late. A lone slow read becomes its band's median and tail, and raises the
+median of sizes between it and the next band, until more reads arrive or it ages out.
+Sizes beyond the largest retained one follow the last segment, which overstates them
+after a warm-to-cold step when the last band holds one size. The exception is a band
+that has seen only a few healthy reads: its tails sit close to its median, so its
+hedges can fire on healthy reads, within the hedge budget. At a cold start, when every
+band is sparse, they can spend the budget before the first stall.
+
 Observations have a 15-second half-life of model time. Model time advances at most
 150 ms per observation, so a half-life spans at least 100 observations when traffic
 is light, and idle buckets keep their history. Each model retains up to 1,024
