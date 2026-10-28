@@ -26,10 +26,8 @@ fn band_bytes(band: u32) -> u64 {
     1 << (2 * band)
 }
 
-/// The smallest size of every band.
-pub fn size_bands() -> impl Iterator<Item = u64> {
-    (0..u64::BITS / 2).map(band_bytes)
-}
+/// Read sizes at which models report latency: 16 times apart, so fewer than their bands.
+pub const REPORTED_SIZES: [u64; 4] = [4 << 10, 64 << 10, 1 << 20, 16 << 20];
 
 /// A band's median, p95, and p99 at its median size.
 #[derive(Debug, Clone, Copy)]
@@ -87,8 +85,7 @@ pub struct Predictions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BandLatency {
-    /// The smallest size in the band.
+pub struct SizeLatency {
     pub bytes: u64,
     /// As [`QUANTILES`] lists them.
     pub quantiles: [Duration; 3],
@@ -97,7 +94,9 @@ pub struct BandLatency {
 /// A fitted latency model, exported as metrics.
 #[derive(Debug, Clone)]
 pub struct LatencyEstimate {
-    pub bands: Vec<BandLatency>,
+    /// At each of [`REPORTED_SIZES`] up to the largest retained size, so none is
+    /// extrapolated.
+    pub sizes: Vec<SizeLatency>,
     /// Largest retained size; larger sizes are predicted only where latency grows measurably.
     pub largest_bytes: u64,
     pub predictions: Predictions,
@@ -448,13 +447,14 @@ impl SizeHistogram {
     pub fn estimate(&self) -> Option<LatencyEstimate> {
         let curve = self.model.0.as_ref()?;
         Some(LatencyEstimate {
-            bands: curve
-                .points
-                .iter()
-                .filter(|point| point.bytes > 0.0)
-                .map(|point| BandLatency {
-                    bytes: band_bytes(band(point.bytes as u64)),
-                    quantiles: point.micros.map(duration),
+            sizes: REPORTED_SIZES
+                .into_iter()
+                .take_while(|&bytes| bytes <= curve.largest_bytes)
+                .filter_map(|bytes| {
+                    Some(SizeLatency {
+                        bytes,
+                        quantiles: curve.micros(bytes)?.map(duration),
+                    })
                 })
                 .collect(),
             largest_bytes: curve.largest_bytes,

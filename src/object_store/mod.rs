@@ -18,4 +18,6 @@ pub(crate) fn isolated_retry_partition() -> aws_sdk_s3::config::retry::RetryPart
 
 pub use config::{DownloadLimits, RequestConfig};
 pub use downloader::{DownloadError, DownloadOutput, Downloader, Hedge, HedgePhase, ObjectPiece};
-pub use stats::{BandLatency, BucketMetrics, LatencyEstimate, Predictions, QUANTILES, size_bands};
+pub use stats::{
+    BucketMetrics, LatencyEstimate, Predictions, QUANTILES, REPORTED_SIZES, SizeLatency,
+};
