@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/s2-streamstore/cachey/compare/0.12.1...0.13.0) - 2026-10-28
+
+### Added
+
+- *(object_store)* report early hedge outcomes ([#194](https://github.com/s2-streamstore/cachey/pull/194))
+- *(object_store)* [**breaking**] model latency by size band ([#192](https://github.com/s2-streamstore/cachey/pull/192))
+
+### Fixed
+
+- *(object_store)* recognise bare 404 and 416 responses ([#200](https://github.com/s2-streamstore/cachey/pull/200))
+
+### Other
+
+- use Chainguard Rust for cachey ([#195](https://github.com/s2-streamstore/cachey/pull/195))
+- give each test client its own SDK retry partition ([#199](https://github.com/s2-streamstore/cachey/pull/199))
+
 ## [0.12.1](https://github.com/s2-streamstore/cachey/compare/0.12.0...0.12.1) - 2026-10-27
 
 ### Other
