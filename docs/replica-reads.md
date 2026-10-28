@@ -60,16 +60,16 @@ size and median latency, with medians made nondecreasing across bands by pooling
 adjacent violators into their weighted mean. Medians are interpolated linearly between
 points and held flat below the first. Beyond the last they follow the last segment,
 where latency grows measurably with size, at most in proportion to size and no faster
-than the last band's own halves, each twice the other's sizes, show. With a single
-band, body time is a transfer cost from 1 ms at zero bytes. Predictions have a 1 ms
-floor.
+than the last band's own halves, each twice the other's sizes, show. A lone band
+follows its halves; without them, its body time is a transfer cost from 1 ms at zero
+bytes. Predictions have a 1 ms floor.
 
 A band's p95 and p99 are its median times those quantiles of each sample's latency
 relative to the median at the sample's size, and at least the band's own, so neither
 the band's largest sizes nor a step in latency below it set its tail. They come only
-from the band's own samples, so a stall or slow mode at one size never stretches
-another's. Between points they are interpolated like medians, and beyond the last they
-keep their ratio to it.
+from the band's own samples, so a stall or slow mode in one band never stretches
+another's. Between points they are interpolated like medians, so sizes between two
+bands take tails from both, and beyond the last they keep their ratio to it.
 
 Latency need not grow in proportion to size. S3 Standard serves objects from a cache
 while their age times their size stays under about 50 MiB·s, with a first byte in
@@ -87,7 +87,9 @@ Sizes beyond the largest retained one follow the last segment, which overstates 
 after a warm-to-cold step when the last band holds one size. The exception is a band
 that has seen only a few healthy reads: its tails sit close to its median, so its
 hedges can fire on healthy reads, within the hedge budget. At a cold start, when every
-band is sparse, they can spend the budget before the first stall.
+band is sparse, they can spend the budget before the first stall. Likewise, where cold
+reads are 1% to 5% of a band, its p95 stays warm and its p99 cold, so those cold reads
+are hedged, within the budget.
 
 Observations have a 15-second half-life of model time. Model time advances at most
 150 ms per observation, so a half-life spans at least 100 observations when traffic

@@ -224,10 +224,11 @@ fn tail_ratios(values: &mut [(f64, f64)]) -> [f64; 2] {
 /// A point per size band at its median size, with medians made nondecreasing across bands.
 /// Beyond the last point the median follows the last segment, at most in proportion to
 /// size, and no faster than within the last band where its halves, each twice the other's
-/// sizes, show it. A lone band is a transfer cost if `proportional`. Tail ratios are to the
-/// median at each sample's size, and at least to its band's own, so neither a band's
-/// largest sizes nor a step in latency below it set its tail, and come only from the
-/// band's own samples, so a slow mode at one size never stretches another's.
+/// sizes, show it. A lone band follows its halves, or without them is a transfer cost if
+/// `proportional`. Tail ratios are to the median at each sample's size, and at least to
+/// its band's own, so neither a band's largest sizes nor a step in latency below it set
+/// its tail, and come only from the band's own samples, so a slow mode in one band never
+/// stretches another's.
 fn curve(observations: &[Observation], proportional: bool) -> Curve {
     let mut values = Vec::new();
     let bands: Vec<_> = observations
@@ -273,9 +274,16 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
             },
         );
     }
-    let segment = points.len().checked_sub(2).map_or(0.0, |previous| {
-        (last.micros[0] - points[previous].micros[0]) / (last.bytes - points[previous].bytes)
-    });
+    let segment = points.len().checked_sub(2).map_or(
+        if halves_slope.is_finite() {
+            f64::INFINITY
+        } else {
+            0.0
+        },
+        |previous| {
+            (last.micros[0] - points[previous].micros[0]) / (last.bytes - points[previous].bytes)
+        },
+    );
     let slope = segment
         .min(last.micros[0] / last.bytes)
         .min(halves_slope)
@@ -782,7 +790,8 @@ mod tests {
 
     /// Capacitor reads a range before sending headers, so its time to first byte grows with
     /// size. A band spans sizes four times apart, and where latency is set by size alone,
-    /// its tail follows its median rather than its largest sizes.
+    /// its tail follows its median rather than its largest sizes, and a lone band's growth
+    /// carries beyond the largest size read.
     #[tokio::test(start_paused = true)]
     async fn latency_set_by_size_alone_has_no_tail() {
         let samples: Vec<_> = (4..=64)
@@ -800,6 +809,11 @@ mod tests {
         assert_eq!(
             model.median(16 * MIB),
             Some(Median::Observed(Duration::from_millis(65)))
+        );
+        let lone_band: Vec<_> = samples[..12].to_vec();
+        assert_eq!(
+            fitted(&lone_band, false).median(4 * MIB),
+            Some(Median::Unobserved(Duration::from_millis(17)))
         );
     }
 
