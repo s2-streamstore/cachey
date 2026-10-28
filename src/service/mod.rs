@@ -499,6 +499,7 @@ mod tests {
             .endpoint_url(endpoint)
             .force_path_style(true)
             .region(Region::new("us-east-1"))
+            .retry_partition(crate::object_store::isolated_retry_partition())
             .build();
         aws_sdk_s3::Client::from_conf(config)
     }

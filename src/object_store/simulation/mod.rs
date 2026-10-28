@@ -152,6 +152,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                 .endpoint_url("http://simulation.invalid")
                 .force_path_style(true)
                 .retry_config(retry)
+                .retry_partition(crate::object_store::isolated_retry_partition())
                 .http_client(http_client_fn(move |_, _| connector.clone()))
                 .build();
             let downloader = Downloader::new(
