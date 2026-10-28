@@ -2158,10 +2158,9 @@ mod tests {
         assert_eq!(output.used_bucket_idx, 0);
         assert_eq!(output.latency, Duration::from_millis(40));
         assert_eq!(script.requests.load(Ordering::SeqCst), 3);
-        let peer = metrics(&downloader, "peer").await;
-        assert!(peer.deprioritized);
+        assert!(metrics(&downloader, "peer").await.deprioritized);
         assert_eq!(
-            peer.request.map(|estimate| estimate.bands[0].quantiles[0]),
+            model(&downloader, "peer").request.tail(4),
             Some(Duration::from_millis(20))
         );
         assert_eq!(script.active.load(Ordering::SeqCst), 0);

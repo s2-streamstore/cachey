@@ -8,15 +8,12 @@ use prometheus::{
 };
 
 use crate::{
-    object_store::{BucketMetrics, Hedge, Predictions, QUANTILES, size_bands},
+    object_store::{BucketMetrics, Hedge, Predictions, QUANTILES, REPORTED_SIZES},
     types::{BucketName, ObjectKind},
 };
 
-static BAND_LABELS: LazyLock<Vec<(u64, String)>> = LazyLock::new(|| {
-    size_bands()
-        .map(|bytes| (bytes, bytes.to_string()))
-        .collect()
-});
+static SIZE_LABELS: LazyLock<[String; 4]> =
+    LazyLock::new(|| REPORTED_SIZES.map(|bytes| bytes.to_string()));
 
 static QUANTILE_LABELS: LazyLock<[String; 3]> =
     LazyLock::new(|| QUANTILES.map(|quantile| quantile.to_string()));
@@ -54,7 +51,7 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     static LATENCY: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
             "cachey_bucket_latency_seconds",
-            "Latency quantile of a size band, labeled by its smallest size in bytes",
+            "Latency quantile at a read size in bytes",
             &["bucket", "phase", "bytes", "quantile"]
         )
         .unwrap()
@@ -77,14 +74,14 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         ("body", &metrics.body),
         ("request", &metrics.request),
     ] {
-        let bands = estimate
+        let sizes = estimate
             .as_ref()
-            .map_or(&[][..], |estimate| &estimate.bands);
-        for (bytes, bytes_label) in &*BAND_LABELS {
-            let quantiles = bands
+            .map_or(&[][..], |estimate| &estimate.sizes);
+        for (bytes, bytes_label) in REPORTED_SIZES.iter().zip(&*SIZE_LABELS) {
+            let quantiles = sizes
                 .iter()
-                .find(|band| band.bytes == *bytes)
-                .map(|band| band.quantiles);
+                .find(|size| size.bytes == *bytes)
+                .map(|size| size.quantiles);
             for (index, quantile) in QUANTILE_LABELS.iter().enumerate() {
                 let labels = [&**bucket, phase, bytes_label, quantile];
                 match quantiles {
