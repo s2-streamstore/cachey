@@ -18,9 +18,16 @@ pub struct Replica {
     pub body_ms_per_mib: u64,
     pub slots: u32,
     pub queue: u32,
-    /// An object stays hot while its age times its size in MiB is below this, as S3
-    /// Standard's cache keeps large objects for less time. Without it, objects never cool.
-    pub hot_mib_ms: Option<u64>,
+    /// Without it, objects never cool.
+    pub hot_cache: Option<HotCache>,
+}
+
+/// S3 Standard's cache, which keeps large objects for less time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HotCache {
+    /// An object stays hot while its age times its size in MiB is below this.
+    pub hot_mib_ms: u64,
     /// Time a cold object adds before headers. Every copy of a cold read waits for the
     /// first copy's fetch, so a later copy gets headers no sooner.
     pub cold_headers_ms: u64,
@@ -35,19 +42,17 @@ impl Default for Replica {
             body_ms_per_mib: 0,
             slots: 1024,
             queue: 1024,
-            hot_mib_ms: None,
-            cold_headers_ms: 0,
+            hot_cache: None,
         }
     }
 }
 
 impl Replica {
-    pub fn is_cold(&self, age_ms: Option<u64>, body_bytes: usize) -> bool {
-        self.hot_mib_ms
-            .zip(age_ms)
-            .is_some_and(|(hot_mib_ms, age_ms)| {
-                u128::from(age_ms) * body_bytes as u128 > u128::from(hot_mib_ms) * u128::from(MIB)
-            })
+    /// The time a read adds before headers if its object is cold.
+    pub fn cold_headers_ms(&self, age_ms: Option<u64>, body_bytes: usize) -> Option<u64> {
+        let cache = self.hot_cache.as_ref()?;
+        (u128::from(age_ms?) * body_bytes as u128 > u128::from(cache.hot_mib_ms) * u128::from(MIB))
+            .then_some(cache.cold_headers_ms)
     }
 
     pub fn headers_ms(&self, body_bytes: usize) -> u64 {
@@ -221,11 +226,12 @@ impl Scenario {
             self.object_ages
                 .as_ref()
                 .is_none_or(|ages| ages.min_ms > 0 && ages.max_ms > ages.min_ms)
-                && self.replicas.iter().all(|replica| {
-                    (replica.hot_mib_ms.is_some() || replica.cold_headers_ms == 0)
-                        && (self.object_ages.is_some() || replica.hot_mib_ms.is_none())
-                }),
-            "a cold replica needs a hot cache, and a hot cache needs object ages"
+                && (self.object_ages.is_some()
+                    || self
+                        .replicas
+                        .iter()
+                        .all(|replica| replica.hot_cache.is_none())),
+            "a replica with a hot cache needs object ages"
         );
         eyre::ensure!(
             self.sdk_attempts > 0 && self.jitter_percent <= 100,

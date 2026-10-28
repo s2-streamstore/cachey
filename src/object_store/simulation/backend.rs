@@ -473,15 +473,13 @@ impl Backend {
         }
         let mut headers_at = Instant::now() + Duration::from_millis(headers_ms);
         let age_ms = self.scenario.read_age_ms(self.seed, transport.read);
-        if !header_fault && replica.is_cold(age_ms, body_bytes) {
+        if !header_fault && let Some(cold_ms) = replica.cold_headers_ms(age_ms, body_bytes) {
             let warm_at = *self
                 .state
                 .lock()
                 .warm_at
                 .entry((transport.read, transport.replica))
-                .or_insert_with(|| {
-                    headers_at + Duration::from_millis(jitter(replica.cold_headers_ms, 1002))
-                });
+                .or_insert_with(|| headers_at + Duration::from_millis(jitter(cold_ms, 1002)));
             headers_at = headers_at.max(warm_at);
         }
         let response = Response {

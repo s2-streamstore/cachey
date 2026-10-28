@@ -372,7 +372,7 @@ impl Followups<'_> {
                 )
             })?,
         };
-        let model = routing.model(index);
+        let model = routing.model(index).clone();
         let overloaded = routing.all_overloaded();
         let retrying = !early && self.states.buckets[index].tried;
         // Hedges and retries never queue for admission, so a retry cannot spend a credit
@@ -530,7 +530,7 @@ impl Downloader {
         let (admission, backup_admission) = reservations.unzip();
         let copy = CopyAttempt {
             index,
-            model: routing.model(index),
+            model: routing.model(index).clone(),
             is_primary: true,
             probe,
             permits: admission.map(|admission| AttemptPermits {

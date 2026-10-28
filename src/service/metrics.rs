@@ -133,11 +133,11 @@ fn count_predictions(bucket: &BucketName, phase: &str, predictions: Predictions)
             predictions.observations,
         ),
         (
-            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, "0.5"]),
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILES[0].to_string()]),
             predictions.above_median,
         ),
         (
-            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, "0.99"]),
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILES[2].to_string()]),
             predictions.above_tail,
         ),
     ] {

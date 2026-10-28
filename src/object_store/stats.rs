@@ -716,8 +716,8 @@ impl RoutingSnapshot {
         self.buckets[index].tail
     }
 
-    pub fn model(&self, index: usize) -> LatencyModel {
-        self.buckets[index].model.clone()
+    pub fn model(&self, index: usize) -> &LatencyModel {
+        &self.buckets[index].model
     }
 
     pub fn overloaded(&self, index: usize) -> bool {
@@ -1682,9 +1682,9 @@ mod tests {
         let buckets = BucketNameSet::from(BucketName::new("bucket").unwrap());
         let entry = stats.entry(&buckets[0]);
         let mut successes = 0;
-        // The range of latencies observed at each size, and which successes observed it.
-        let mut observed: [(Duration, Duration, Vec<u64>); ROUTED_SIZES.len()] =
-            std::array::from_fn(|_| (Duration::MAX, Duration::ZERO, Vec::new()));
+        // The range of latencies observed at each size, and the first success that observed it.
+        let mut observed: [(Duration, Duration, Option<u64>); ROUTED_SIZES.len()] =
+            std::array::from_fn(|_| (Duration::MAX, Duration::ZERO, None));
         for (gap_ms, event) in events {
             advance(Duration::from_millis(gap_ms)).await;
             let (size, finish) = match event {
@@ -1720,11 +1720,10 @@ mod tests {
                     ratios.0 - 1e-9 <= factor && factor <= ratios.1 + 1e-9,
                     "factor {factor} outside {ratios:?}"
                 );
-                let (low, high, seen) = &observed[size];
+                let (low, high, first) = &observed[size];
                 // A size is judged once a fit includes its first observation.
-                let judged = seen
-                    .first()
-                    .is_some_and(|&first| stats.estimates.request.fitted_updates() >= first);
+                let judged =
+                    first.is_some_and(|first| stats.estimates.request.fitted_updates() >= first);
                 let scaled = latency.div_f64(1.0 + stats.routing_excess(Instant::now()));
                 prop_assert!(
                     !judged
@@ -1740,10 +1739,10 @@ mod tests {
                 } => {
                     let latency = backend.latency(size, jitter_percent);
                     successes += 1;
-                    let (low, high, seen) = &mut observed[size];
+                    let (low, high, first) = &mut observed[size];
                     *low = (*low).min(latency);
                     *high = (*high).max(latency);
-                    seen.push(successes);
+                    first.get_or_insert(successes);
                     record_success(&entry, ROUTED_SIZES[size], latency, probe);
                 }
                 Finish::Cancel { elapsed_percent } => {

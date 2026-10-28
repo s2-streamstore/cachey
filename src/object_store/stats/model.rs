@@ -77,9 +77,12 @@ impl Curve {
             }
             (None, None) => return None,
         };
-        let median = median.max(TIMER_MICROS);
-        Some([median, median * tail_ratios[0], median * tail_ratios[1]])
+        Some(quantiles(median.max(TIMER_MICROS), tail_ratios))
     }
+}
+
+fn quantiles(median: f64, tail_ratios: [f64; 2]) -> [f64; 3] {
+    [median, median * tail_ratios[0], median * tail_ratios[1]]
 }
 
 /// How observations compared with the model in use when each arrived.
@@ -234,14 +237,15 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
     let bands: Vec<_> = observations
         .chunk_by(|left, right| band(left.bytes) == band(right.bytes))
         .collect();
-    let weights: Vec<f64> = bands
+    let (mut medians, weights): (Vec<f64>, Vec<f64>) = bands
         .iter()
-        .map(|samples| samples.iter().map(|sample| sample.weight).sum())
-        .collect();
-    let mut medians: Vec<f64> = bands
-        .iter()
-        .map(|samples| weighted_median(samples, |sample| sample.micros, &mut values))
-        .collect();
+        .map(|samples| {
+            (
+                weighted_median(samples, |sample| sample.micros, &mut values),
+                samples.iter().map(|sample| sample.weight).sum::<f64>(),
+            )
+        })
+        .unzip();
     nondecreasing(&mut medians, &weights);
     let mut points: Vec<Point> = bands
         .iter()
@@ -282,13 +286,12 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
         .min(last.median / last.bytes)
         .min(halves_slope)
         .max(0.0);
-    let build = |origin: Option<Point>, points: &[Point]| Curve {
-        points: origin.iter().chain(points).copied().collect(),
+    let medians = Curve {
+        points: origin.iter().chain(&points).copied().collect(),
         slope,
         smallest_bytes: observations[0].bytes,
         largest_bytes: observations[observations.len() - 1].bytes,
     };
-    let medians = build(origin, &points);
     for (point, samples) in points.iter_mut().zip(&bands) {
         values.clear();
         values.extend(samples.iter().map(|sample| {
@@ -305,7 +308,10 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
         tail_ratios: points[0].tail_ratios,
         ..origin
     });
-    build(origin, &points)
+    Curve {
+        points: origin.iter().chain(&points).copied().collect(),
+        ..medians
+    }
 }
 
 /// Latency observations by size. Size strata retain rare sizes for one continuous model.
@@ -446,8 +452,7 @@ impl SizeHistogram {
                 .filter(|point| point.bytes > 0.0)
                 .map(|point| BandLatency {
                     bytes: band_bytes(band(point.bytes as u64)),
-                    quantiles: [1.0, point.tail_ratios[0], point.tail_ratios[1]]
-                        .map(|ratio| duration(point.median * ratio)),
+                    quantiles: quantiles(point.median, point.tail_ratios).map(duration),
                 })
                 .collect(),
             largest_bytes: curve.largest_bytes,
@@ -501,6 +506,14 @@ mod tests {
 
     fn update(histogram: &mut SizeHistogram, bytes: u64, millis: u64) {
         histogram.update(Instant::now(), bytes, Duration::from_millis(millis));
+    }
+
+    fn fitted(samples: &[(u64, u64)], proportional: bool) -> super::SizeModel {
+        let mut histogram = SizeHistogram::new(proportional);
+        for &(bytes, millis) in samples {
+            update(&mut histogram, bytes, millis);
+        }
+        histogram.summary(true)
     }
 
     #[tokio::test(start_paused = true)]
@@ -586,9 +599,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn one_request_size_is_a_fixed_cost_outside_transfers() {
-        let mut histogram = SizeHistogram::new(false);
-        update(&mut histogram, 16 * MIB, 25);
-        let model = histogram.summary(false);
+        let model = fitted(&[(16 * MIB, 25)], false);
         assert_eq!(
             model.median(4096),
             Some(Median::Unobserved(Duration::from_millis(25)))
@@ -706,14 +717,6 @@ mod tests {
         }
         // 0.4 × 0.75 rounds above the first weight in floating point.
         assert_eq!(quantile(&mut [(1.0, 0.3), (2.0, 0.1)], 0.75), 1.0);
-    }
-
-    fn fitted(samples: &[(u64, u64)], proportional: bool) -> super::SizeModel {
-        let mut histogram = SizeHistogram::new(proportional);
-        for &(bytes, millis) in samples {
-            update(&mut histogram, bytes, millis);
-        }
-        histogram.summary(true)
     }
 
     /// Latency that steps up with size and then levels off, as S3 Standard's cold objects

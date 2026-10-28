@@ -37,8 +37,8 @@ resolved configuration, seed, sampling mode, Git revision, and dirty-tree flag.
 Replicas have limited service slots and queues. Queue overflow returns `SlowDown`;
 cancellation can leave work running for a configurable delay.
 
-A replica with `hot_mib_ms` models S3 Standard's cache: an object is cold once its age
-in milliseconds times its size in MiB exceeds it, and a cold read adds
+A replica's `hot_cache` models S3 Standard's cache: an object is cold once its age in
+milliseconds times its size in MiB exceeds `hot_mib_ms`, and a cold read adds
 `cold_headers_ms` before headers. Every copy of a cold read waits for the first
 copy's fetch, so a hedge gets headers no sooner. Fixtures with such replicas set
 `object_ages`, sampled log-uniformly per read.
