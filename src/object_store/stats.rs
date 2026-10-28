@@ -8,11 +8,11 @@ use std::{
 };
 
 use dashmap::DashMap;
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
 use tokio::{sync::SetOnce, time::Instant};
 
-pub use self::model::{BandLatency, LatencyEstimate, Predictions, QUANTILES};
-use self::model::{Median, Refit, SizeHistogram, SizeModel, TIMER_RESOLUTION};
+pub use self::model::{BandLatency, LatencyEstimate, Predictions};
+use self::model::{Median, SizeHistogram, SizeModel, TIMER_RESOLUTION};
 use crate::{
     object_store::DownloadLimits,
     types::{BucketName, BucketNameSet},
@@ -446,25 +446,14 @@ impl BucketStats {
 }
 
 /// Refits once per interval if `interval` allows, or sooner while observation counts
-/// double. Fitting runs outside the lock so it does not delay the bucket's copies;
-/// claiming the refit under the lock leaves concurrent callers nothing to refit.
-fn refit(stats: &mut MutexGuard<'_, BucketStats>, now: Instant, interval: bool) {
+/// double.
+fn refit(stats: &mut BucketStats, now: Instant, interval: bool) {
     let due = interval && now.duration_since(stats.summarized_at) >= LATENCY_SNAPSHOT_INTERVAL;
     if due {
         stats.summarized_at = now;
     }
-    let refits: [Option<Refit>; 3] = stats
-        .estimates
-        .histograms()
-        .map(|histogram| histogram.refit(due));
-    if refits.iter().all(Option::is_none) {
-        return;
-    }
-    let fits = MutexGuard::unlocked(stats, || refits.map(|refit| refit.map(Refit::fit)));
-    for (histogram, fitted) in stats.estimates.histograms().into_iter().zip(fits) {
-        if let Some(fitted) = fitted {
-            histogram.store(fitted);
-        }
+    for histogram in stats.estimates.histograms() {
+        histogram.refit(due);
     }
 }
 
@@ -1380,7 +1369,7 @@ mod tests {
                 metrics
                     .request
                     .as_ref()
-                    .map(|estimate| estimate.bands[0].quantiles[0]),
+                    .map(|estimate| estimate.bands[0].median),
                 Some(Duration::from_millis(3))
             );
             let entry = stats

@@ -8,7 +8,7 @@ use prometheus::{
 };
 
 use crate::{
-    object_store::{BucketMetrics, Predictions, QUANTILES},
+    object_store::{BucketMetrics, Predictions},
     types::{BucketName, ObjectKind},
 };
 
@@ -42,11 +42,11 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         ]
     });
 
-    static LATENCY: LazyLock<GaugeVec> = LazyLock::new(|| {
+    static MEDIAN: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
-            "cachey_bucket_latency_seconds",
-            "Latency quantile of a size band, from its smallest size in bytes",
-            &["bucket", "phase", "bytes", "quantile"]
+            "cachey_bucket_latency_median_seconds",
+            "Median latency of a size band, labeled by its smallest size in bytes",
+            &["bucket", "phase", "bytes"]
         )
         .unwrap()
     });
@@ -60,15 +60,6 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         .unwrap()
     });
 
-    static BANDS: LazyLock<Vec<(u64, String)>> = LazyLock::new(|| {
-        (0..u64::BITS / 2)
-            .map(|band| 1_u64 << (2 * band))
-            .map(|bytes| (bytes, bytes.to_string()))
-            .collect()
-    });
-    static QUANTILE_LABELS: LazyLock<Vec<String>> =
-        LazyLock::new(|| QUANTILES.iter().map(f64::to_string).collect());
-
     for (gauge, value) in &*GAUGES {
         gauge.with_label_values(&[bucket]).set(value(metrics));
     }
@@ -80,17 +71,16 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         let bands = estimate
             .as_ref()
             .map_or(&[][..], |estimate| &estimate.bands);
-        for (bytes, label) in &*BANDS {
-            let band = bands.iter().find(|band| band.bytes == *bytes);
-            for (index, quantile) in QUANTILE_LABELS.iter().enumerate() {
-                let labels = [&**bucket, phase, label, quantile];
-                match band {
-                    Some(band) => LATENCY
-                        .with_label_values(&labels)
-                        .set(band.quantiles[index].as_secs_f64()),
-                    None => {
-                        let _ = LATENCY.remove_label_values(&labels);
-                    }
+        for band in 0..u64::BITS / 2 {
+            let bytes = 1_u64 << (2 * band);
+            let label = bytes.to_string();
+            let labels = [&**bucket, phase, label.as_str()];
+            match bands.iter().find(|band| band.bytes == bytes) {
+                Some(band) => MEDIAN
+                    .with_label_values(&labels)
+                    .set(band.median.as_secs_f64()),
+                None => {
+                    let _ = MEDIAN.remove_label_values(&labels);
                 }
             }
         }

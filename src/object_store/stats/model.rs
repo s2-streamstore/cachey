@@ -10,8 +10,7 @@ use super::{OBSERVATION_SPACING, reservoir::Reservoir};
 
 pub(super) const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MICROS: f64 = TIMER_RESOLUTION.as_micros() as f64;
-/// The median, p95, and p99.
-pub const QUANTILES: [f64; 3] = [0.5, 0.95, 0.99];
+const TAIL_QUANTILES: [f64; 2] = [0.95, 0.99];
 const HEDGE_TAIL_CAP: f64 = 1.25;
 /// Samples a histogram retains, split evenly across its size bands.
 const SAMPLES: usize = 1024;
@@ -21,48 +20,32 @@ fn band(bytes: u64) -> u32 {
     bytes.ilog2() / 2
 }
 
-/// Latency quantiles of one size band, at the band's median size.
-#[derive(Debug, Clone, Copy, Default)]
+/// The median, p95, and p99 latency at a size.
+#[derive(Debug, Clone, Copy)]
 struct Point {
-    band: u32,
     bytes: f64,
     micros: [f64; 3],
 }
 
-/// Latency quantiles by size: each band's quantiles, nondecreasing with size and joined by
-/// straight segments.
+/// Latency quantiles by size: a point per size band, joined by straight segments.
 #[derive(Debug, Clone)]
 struct Curve {
     points: Arc<[Point]>,
-    /// Below the smallest band, latency falls toward the timer resolution at zero bytes, as
-    /// a transfer cost, rather than holding flat as a fixed cost.
-    proportional: bool,
     smallest_bytes: u64,
     largest_bytes: u64,
 }
 
 impl Curve {
-    /// Quantiles at a size. Beyond the largest observed size, the last segment's slope
-    /// predicts larger reads, and none are predicted where latency does not grow measurably.
+    /// Quantiles at a size: flat below the first point, and beyond the last along the last
+    /// segment, with none predicted where latency does not grow measurably.
     fn micros(&self, bytes: u64) -> Option<[f64; 3]> {
-        let points = &self.points[..];
         let size = bytes as f64;
-        let first = points[0];
-        let last = points[points.len() - 1];
-        let origin = Point {
-            micros: [TIMER_MICROS; 3],
-            ..Point::default()
-        };
-        let (from, to) = match points {
-            [_] if self.proportional => (origin, first),
-            [_] => (first, first),
-            _ if size <= first.bytes && self.proportional => (origin, first),
-            _ if size <= first.bytes => (first, first),
-            _ => points
-                .windows(2)
-                .find(|pair| size <= pair[1].bytes)
-                .map_or((points[points.len() - 2], last), |pair| (pair[0], pair[1])),
-        };
+        let last = self.points.len() - 1;
+        let next = self
+            .points
+            .partition_point(|point| point.bytes < size)
+            .clamp(last.min(1), last);
+        let (from, to) = (self.points[next.saturating_sub(1)], self.points[next]);
         let span = to.bytes - from.bytes;
         let slope = |quantile: usize| {
             if span > 0.0 {
@@ -94,13 +77,12 @@ pub struct Predictions {
     pub above_tail: u64,
 }
 
-/// A size band's fitted latency quantiles.
+/// A size band's median latency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BandLatency {
-    /// The smallest size in the band; bands are four times apart.
+    /// The smallest size in the band.
     pub bytes: u64,
-    /// The median, p95, and p99, as [`QUANTILES`] lists them.
-    pub quantiles: [Duration; 3],
+    pub median: Duration,
 }
 
 /// A fitted latency model, exported as metrics.
@@ -140,6 +122,10 @@ impl Median {
 pub(in crate::object_store) struct SizeModel(Option<Curve>);
 
 impl SizeModel {
+    fn micros(&self, bytes: u64) -> Option<[f64; 3]> {
+        self.0.as_ref()?.micros(bytes)
+    }
+
     /// None until measured.
     pub fn median(&self, bytes: u64) -> Option<Median> {
         let curve = self.0.as_ref()?;
@@ -154,21 +140,16 @@ impl SizeModel {
 
     /// Uncapped p99.
     pub fn tail(&self, bytes: u64) -> Option<Duration> {
-        self.0
-            .as_ref()?
-            .micros(bytes)
-            .map(|micros| duration(micros[2]))
+        self.micros(bytes).map(|micros| duration(micros[2]))
     }
 
     /// p99, capped at 1.25 times the p95. Where stalls exceed 1% of reads they set the p99,
-    /// and the cap keeps hedges early; with ±20% jitter it is 1.5 times the median. It caps
-    /// the p95 rather than the median because reads of one size can split between fast and
-    /// slow objects, like S3 Standard's warm and cold ones, and a hedge cannot speed up the
-    /// slow mode once it is 5% of reads.
+    /// and the cap keeps hedges early; with ±20% jitter the cap is about 1.5 times the
+    /// median. It caps the p95 rather than the median because reads of one size can split
+    /// between fast and slow objects, like S3 Standard's warm and cold ones, and a hedge
+    /// cannot speed up the slow mode once it is 5% of reads.
     pub fn hedge_delay(&self, bytes: u64) -> Option<Duration> {
-        self.0
-            .as_ref()?
-            .micros(bytes)
+        self.micros(bytes)
             .map(|micros| duration(micros[2].min(micros[1] * HEDGE_TAIL_CAP)))
     }
 }
@@ -214,12 +195,22 @@ fn nondecreasing(values: &mut [f64], weights: &[f64]) {
     }
 }
 
-/// Each band's median, p95, and p99, made nondecreasing across bands. A band's quantiles
-/// come only from its own samples, so a slow mode at one size never stretches another's.
-/// Its sizes span a factor of four, so its p95 and p99 are taken as multiples of the
-/// median at each sample's size, lest the band's largest sizes set its tail.
-fn curve(observations: &[Observation], proportional: bool, values: &mut Vec<(f64, f64)>) -> Curve {
-    let bands: Vec<&[Observation]> = observations
+fn weighted_quantile(samples: &[Observation], value: fn(&Observation) -> f64, q: f64) -> f64 {
+    let mut values: Vec<_> = samples
+        .iter()
+        .map(|sample| (value(sample), sample.weight))
+        .collect();
+    quantile(&mut values, q)
+}
+
+/// A point per size band at its median size, holding the band's median latency, and its
+/// p95 and p99 as multiples of the median at each sample's size, so that where latency
+/// grows with size the band's largest sizes do not set its tail. A band's quantiles come
+/// only from its own samples, so a slow mode at one size never stretches another's. Each
+/// quantile is made nondecreasing across bands. Proportional curves start from the timer
+/// resolution at zero bytes.
+fn curve(observations: &[Observation], proportional: bool) -> Curve {
+    let bands: Vec<_> = observations
         .chunk_by(|left, right| band(left.bytes) == band(right.bytes))
         .collect();
     let weights: Vec<f64> = bands
@@ -228,64 +219,50 @@ fn curve(observations: &[Observation], proportional: bool, values: &mut Vec<(f64
         .collect();
     let mut medians: Vec<f64> = bands
         .iter()
-        .map(|samples| {
-            values.clear();
-            values.extend(samples.iter().map(|sample| (sample.micros, sample.weight)));
-            quantile(values, QUANTILES[0])
-        })
+        .map(|samples| weighted_quantile(samples, |sample| sample.micros, 0.5))
         .collect();
     nondecreasing(&mut medians, &weights);
-    let mut curve = Curve {
-        points: bands
-            .iter()
-            .zip(&medians)
-            .map(|(samples, &median)| {
-                values.clear();
-                values.extend(
-                    samples
-                        .iter()
-                        .map(|sample| (sample.bytes as f64, sample.weight)),
-                );
-                Point {
-                    band: band(samples[0].bytes),
-                    bytes: quantile(values, 0.5),
-                    micros: [median; 3],
-                }
-            })
-            .collect(),
-        proportional,
+    let mut points: Vec<Point> = bands
+        .iter()
+        .zip(&medians)
+        .map(|(samples, &median)| Point {
+            bytes: weighted_quantile(samples, |sample| sample.bytes as f64, 0.5),
+            micros: [median; 3],
+        })
+        .collect();
+    let origin = proportional.then_some(Point {
+        bytes: 0.0,
+        micros: [TIMER_MICROS; 3],
+    });
+    let build = |points: &[Point]| Curve {
+        points: origin.iter().chain(points).copied().collect(),
         smallest_bytes: observations[0].bytes,
         largest_bytes: observations[observations.len() - 1].bytes,
     };
+    let median_curve = build(&points);
     let mut tails: [Vec<f64>; 2] = Default::default();
-    for (samples, median) in bands.iter().zip(&medians) {
-        values.clear();
-        values.extend(samples.iter().map(|sample| {
-            let expected = curve
-                .micros(sample.bytes)
-                .map_or(*median, |micros| micros[0]);
-            (sample.micros / expected, sample.weight)
-        }));
-        for (tail, q) in tails.iter_mut().zip(&QUANTILES[1..]) {
-            tail.push(median * quantile(values, *q));
+    for (samples, &median) in bands.iter().zip(&medians) {
+        let mut ratios: Vec<_> = samples
+            .iter()
+            .map(|sample| {
+                let expected = median_curve
+                    .micros(sample.bytes)
+                    .map_or(median, |micros| micros[0]);
+                (sample.micros / expected, sample.weight)
+            })
+            .collect();
+        for (tail, q) in tails.iter_mut().zip(TAIL_QUANTILES) {
+            tail.push(median * quantile(&mut ratios, q));
         }
     }
     for tail in &mut tails {
         nondecreasing(tail, &weights);
     }
-    curve.points = curve
-        .points
-        .iter()
-        .zip(tails[0].iter().zip(&tails[1]))
-        .map(|(point, (&p95, &p99))| {
-            let p95 = p95.max(point.micros[0]);
-            Point {
-                micros: [point.micros[0], p95, p99.max(p95)],
-                ..*point
-            }
-        })
-        .collect();
-    curve
+    for (point, (&p95, &p99)) in points.iter_mut().zip(tails[0].iter().zip(&tails[1])) {
+        point.micros[1] = p95.max(point.micros[0]);
+        point.micros[2] = p99.max(point.micros[1]);
+    }
+    build(&points)
 }
 
 /// Latency observations by size. Size strata retain rare sizes for one continuous model.
@@ -300,9 +277,8 @@ pub(super) struct SizeHistogram {
     clock: f64,
     observed_at: Option<Instant>,
     updates: u64,
-    summarized_updates: u64,
-    model: SizeModel,
     fitted_updates: u64,
+    model: SizeModel,
     predictions: Predictions,
 }
 
@@ -314,9 +290,8 @@ impl SizeHistogram {
             clock: 0.0,
             observed_at: None,
             updates: 0,
-            summarized_updates: 0,
-            model: SizeModel::default(),
             fitted_updates: 0,
+            model: SizeModel::default(),
             predictions: Predictions::default(),
         }
     }
@@ -353,8 +328,7 @@ impl SizeHistogram {
             self.rebalance();
         }
         let micros = (latency.as_secs_f64() * 1_000_000.0).max(TIMER_MICROS);
-        if let Some([median, _, tail]) = self.model.0.as_ref().and_then(|curve| curve.micros(bytes))
-        {
+        if let Some([median, _, tail]) = self.model.micros(bytes) {
             self.predictions.observations += 1;
             self.predictions.above_median += u64::from(micros > median);
             self.predictions.above_tail += u64::from(micros > tail);
@@ -376,16 +350,16 @@ impl SizeHistogram {
         self.fitted_updates
     }
 
-    /// Observations to refit once `due`, or as soon as the observation count doubles.
-    pub fn refit(&mut self, due: bool) -> Option<Refit> {
-        if self.updates == self.summarized_updates
-            || !(due || self.updates >= self.summarized_updates.saturating_mul(2))
+    /// Refits once `due`, or as soon as the observation count doubles.
+    pub fn refit(&mut self, due: bool) {
+        if self.updates == self.fitted_updates
+            || !(due || self.updates >= self.fitted_updates.saturating_mul(2))
         {
-            return None;
+            return;
         }
-        self.summarized_updates = self.updates;
+        self.fitted_updates = self.updates;
         let clock = self.clock;
-        let observations = self
+        let mut observations: Vec<_> = self
             .bands
             .values_mut()
             .flat_map(|band| band.weighted(clock))
@@ -400,69 +374,6 @@ impl SizeHistogram {
         if self.bands.len() < bands {
             self.rebalance();
         }
-        Some(Refit {
-            observations,
-            proportional: self.proportional,
-            updates: self.updates,
-        })
-    }
-
-    pub fn model(&self) -> SizeModel {
-        self.model.clone()
-    }
-
-    pub fn estimate(&self) -> Option<LatencyEstimate> {
-        self.model.0.as_ref().map(|curve| LatencyEstimate {
-            bands: curve
-                .points
-                .iter()
-                .map(|point| BandLatency {
-                    bytes: 1 << (2 * point.band),
-                    quantiles: point.micros.map(duration),
-                })
-                .collect(),
-            largest_bytes: curve.largest_bytes,
-            predictions: self.predictions,
-        })
-    }
-
-    /// Keeps the fit of the most observations when refits finish out of order.
-    pub fn store(&mut self, fitted: Fitted) {
-        if fitted.updates > self.fitted_updates {
-            self.model = fitted.model;
-            self.fitted_updates = fitted.updates;
-        }
-    }
-
-    #[cfg(test)]
-    pub fn summary(&mut self, due: bool) -> SizeModel {
-        if let Some(refit) = self.refit(due) {
-            self.store(refit.fit());
-        }
-        self.model.clone()
-    }
-}
-
-/// Observations copied for fitting without access to their histogram.
-pub(super) struct Refit {
-    observations: Vec<Observation>,
-    proportional: bool,
-    updates: u64,
-}
-
-#[derive(Debug)]
-pub(super) struct Fitted {
-    model: SizeModel,
-    updates: u64,
-}
-
-impl Refit {
-    pub fn fit(self) -> Fitted {
-        let Self {
-            mut observations,
-            proportional,
-            updates,
-        } = self;
         // Reservoirs return samples in random order; a fixed order makes rounding depend
         // only on which samples were kept, and groups each size band's samples.
         observations.sort_unstable_by(|left, right| {
@@ -471,12 +382,35 @@ impl Refit {
                 .then(left.micros.total_cmp(&right.micros))
                 .then(left.weight.total_cmp(&right.weight))
         });
-        let model =
-            (!observations.is_empty()).then(|| curve(&observations, proportional, &mut Vec::new()));
-        Fitted {
-            model: SizeModel(model),
-            updates,
-        }
+        self.model =
+            SizeModel((!observations.is_empty()).then(|| curve(&observations, self.proportional)));
+    }
+
+    pub fn model(&self) -> SizeModel {
+        self.model.clone()
+    }
+
+    pub fn estimate(&self) -> Option<LatencyEstimate> {
+        let curve = self.model.0.as_ref()?;
+        Some(LatencyEstimate {
+            bands: curve
+                .points
+                .iter()
+                .filter(|point| point.bytes > 0.0)
+                .map(|point| BandLatency {
+                    bytes: 1 << (2 * band(point.bytes as u64)),
+                    median: duration(point.micros[0]),
+                })
+                .collect(),
+            largest_bytes: curve.largest_bytes,
+            predictions: self.predictions,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn summary(&mut self, due: bool) -> SizeModel {
+        self.refit(due);
+        self.model()
     }
 }
 
@@ -580,23 +514,6 @@ mod tests {
         assert_eq!(
             model.median(MIB),
             Some(Median::Observed(Duration::from_millis(21)))
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_refit_finishing_late_does_not_replace_a_newer_model() {
-        let mut histogram = body();
-        update(&mut histogram, MIB, 10);
-        let older = histogram.refit(true).unwrap();
-        for _ in 0..2 {
-            update(&mut histogram, MIB, 30);
-        }
-        let newer = histogram.refit(true).unwrap();
-        histogram.store(newer.fit());
-        histogram.store(older.fit());
-        assert_eq!(
-            histogram.model().median(MIB),
-            Some(Median::Observed(Duration::from_millis(30)))
         );
     }
 
@@ -837,7 +754,7 @@ mod tests {
                 weight: f64::from(weight),
             }).collect();
             observations.sort_unstable_by_key(|sample| sample.bytes);
-            let curve = curve(&observations, proportional, &mut Vec::new());
+            let curve = curve(&observations, proportional);
             let mut sizes = sizes;
             sizes.sort_unstable();
             let mut previous = [0.0; 3];

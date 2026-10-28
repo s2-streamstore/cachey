@@ -9,4 +9,4 @@ mod simulation;
 
 pub use config::{DownloadLimits, RequestConfig};
 pub use downloader::{DownloadError, DownloadOutput, Downloader, ObjectPiece};
-pub use stats::{BandLatency, BucketMetrics, LatencyEstimate, Predictions, QUANTILES};
+pub use stats::{BandLatency, BucketMetrics, LatencyEstimate, Predictions};

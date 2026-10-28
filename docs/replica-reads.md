@@ -55,20 +55,17 @@ admission and the models count a read at the bytes the object holds within it, w
 is what it receives. Without it, the models of page reads describe whatever response
 sizes pages return.
 
-Each model groups samples into size bands four times apart. A band is a point at its
-median size and median latency. Its p95 and p99 are its median times those quantiles
-of each sample's latency relative to the median at the sample's size, so where
-latency grows with size, the band's largest sizes do not set its tail. Each band's
-quantiles come only from its own samples, so a stall or slow mode at one size never
-stretches another's. Each quantile is made nondecreasing across bands by pooling
-adjacent violators into their weighted mean, and a band's p95 and p99 are raised to
-at least its median and p95.
+Each model has a point per size band, bands being four times apart: the band's median
+size, median latency, and p95 and p99. The p95 and p99 are the median times those
+quantiles of each sample's latency relative to the median at its size, so the band's
+largest sizes do not set its tail. A band's quantiles come only from its own samples,
+so a stall or slow mode at one size never stretches another's. Each quantile is made
+nondecreasing across bands by pooling adjacent violators into their weighted mean.
 
-Between points, quantiles are interpolated linearly. Below the smallest point, body
-time falls toward 1 ms at zero bytes, as transfer cost, and the other intervals hold
-flat, as fixed cost. Beyond the largest point, quantiles extend along the last
-segment, so sizes beyond every retained observation are predicted only where latency
-grows measurably with size. Predictions have a 1 ms floor.
+Quantiles are interpolated linearly between points, held flat below the first, and
+extended along the last segment beyond the last, where latency grows measurably with
+size. Body time starts from a point at 1 ms and zero bytes, as a transfer cost.
+Predictions have a 1 ms floor.
 
 Latency need not grow in proportion to size. S3 Standard serves objects from a cache
 while their age times their size stays under about 50 MiB·s, with a first byte in
@@ -94,8 +91,8 @@ latency history.
 
 Models refit at most once per second, or sooner while the observation count
 doubles. A routing decision refits at most one bucket on that interval, the one
-longest without a refit. Samples are copied under the bucket's statistics lock, then
-fitted outside it. Metrics report the latest fit.
+longest without a refit. A fit of 1,024 samples takes tens of microseconds, under the
+bucket's statistics lock. Metrics report the latest fit.
 
 ## Deadlines and hedging
 
@@ -174,7 +171,7 @@ contacting a backend.
 
 | Measurement | Meaning |
 |-------------|---------|
-| `cachey_bucket_latency_seconds` | Median, p95, or p99 (`quantile`) of a size band, labeled by its smallest size (`bytes`) |
+| `cachey_bucket_latency_median_seconds` | Median latency of a size band, labeled by its smallest size (`bytes`) |
 | `cachey_bucket_latency_model_bytes` | Largest size retained by the model |
 | `cachey_bucket_latency_predictions_total` | Observations at sizes the model predicted |
 | `cachey_bucket_latency_predictions_exceeded_total` | Those slower than the predicted median (`quantile="0.5"`) or p99 (`quantile="0.99"`) |
@@ -184,10 +181,8 @@ contacting a backend.
 | `cachey_first_chunk_latency_seconds` | Handler time to first chunk, including cache lookup and coalescing |
 
 Latency gauges have a `phase` label: `first_byte`, `body`, or `request`. They are
-absent until measured, and a band's series only while it retains samples. A band's
-quantiles are those at its median size, after pooling across bands. A hedge delay is
-the p99 at the read's size capped at 1.25 times the p95. Latencies exclude
-transmission to the client.
+absent until measured, and a band's series only while it retains samples. Latencies
+exclude transmission to the client.
 
 Prediction counters compare each observation that trains a model with the fit in use
 when it arrives. For an accurate model, half exceed the median and 1% exceed p99.

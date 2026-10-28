@@ -34,7 +34,6 @@ pub struct Transport {
     pub delivered_bytes: u64,
     pub fault: Option<FaultKind>,
     pub capacity_rejected: bool,
-    pub cold: bool,
 }
 
 #[derive(Debug)]
@@ -320,7 +319,6 @@ impl HttpConnector for Backend {
             delivered_bytes: 0,
             fault: fault.map(|value| value.0),
             capacity_rejected: rejected,
-            cold: false,
         });
         state.client_active += 1;
         state.peak_client = state.peak_client.max(state.client_active);
@@ -476,9 +474,9 @@ impl Backend {
         let mut headers_at = Instant::now() + Duration::from_millis(headers_ms);
         let age_ms = self.scenario.read_age_ms(self.seed, transport.read);
         if !header_fault && replica.is_cold(age_ms, body_bytes) {
-            let mut state = self.state.lock();
-            state.transports[index].cold = true;
-            let warm_at = *state
+            let warm_at = *self
+                .state
+                .lock()
                 .warm_at
                 .entry((transport.read, transport.replica))
                 .or_insert_with(|| {
