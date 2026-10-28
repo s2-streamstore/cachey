@@ -149,7 +149,18 @@ fn map_get_object_error(
             DownloadError::InvalidObjectState(invalid_object_state.message.unwrap_or_default())
         }
         GetObjectError::NoSuchKey(_) => DownloadError::NoSuchKey,
-        service_error if service_error.code() == Some("InvalidRange") => {
+        // S3-compatible stores and proxies may answer a miss or an unsatisfiable range by
+        // status alone. The SDK codes an empty 404 `NotFound`, and leaves other bodies
+        // without XML uncoded.
+        service_error
+            if status == Some(404) && matches!(service_error.code(), None | Some("NotFound")) =>
+        {
+            DownloadError::NoSuchKey
+        }
+        service_error
+            if service_error.code() == Some("InvalidRange")
+                || (status == Some(416) && service_error.code().is_none()) =>
+        {
             DownloadError::RangeNotSatisfied {
                 requested: req_range.clone(),
                 object_size,
@@ -517,6 +528,7 @@ mod tests {
     use std::{
         collections::{HashMap, VecDeque},
         io,
+        mem::discriminant,
         ops::Range,
         sync::{
             Arc,
@@ -886,33 +898,72 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn overload_is_recognised_by_status_or_code() {
-        for (status, body, overloaded) in [
-            (503, "<Error><Code>SlowDown</Code></Error>", true),
-            (503, "<Error><Code>ServiceUnavailable</Code></Error>", true),
-            (503, "", true),
-            (429, "", true),
-            (429, "<html><body>Too Many Requests</body></html>", true),
-            (400, "<Error><Code>TooManyRequests</Code></Error>", true),
-            (500, "<Error><Code>InternalError</Code></Error>", false),
-            (500, "", false),
-            (502, "<html><body>Bad Gateway</body></html>", false),
+    async fn misses_ranges_and_overload_are_recognised_by_status_or_code() {
+        let missing = DownloadError::NoSuchKey;
+        let unsatisfied = DownloadError::RangeNotSatisfied {
+            requested: 0..4,
+            object_size: None,
+        };
+        let overloaded = DownloadError::Overloaded(String::new());
+        let unknown = DownloadError::Unknown(String::new());
+        for (status, body, expected) in [
+            (503, "<Error><Code>SlowDown</Code></Error>", &overloaded),
+            (
+                503,
+                "<Error><Code>ServiceUnavailable</Code></Error>",
+                &overloaded,
+            ),
+            (503, "", &overloaded),
+            (429, "", &overloaded),
+            (
+                429,
+                "<html><body>Too Many Requests</body></html>",
+                &overloaded,
+            ),
+            (
+                400,
+                "<Error><Code>TooManyRequests</Code></Error>",
+                &overloaded,
+            ),
+            (404, "", &missing),
+            (404, "<html><body>Not Found</body></html>", &missing),
+            (404, "<Error><Code>NoSuchBucket</Code></Error>", &unknown),
+            (416, "", &unsatisfied),
+            (
+                416,
+                "<html><body>Range Not Satisfiable</body></html>",
+                &unsatisfied,
+            ),
+            (500, "<Error><Code>InternalError</Code></Error>", &unknown),
+            (500, "", &unknown),
+            (502, "<html><body>Bad Gateway</body></html>", &unknown),
         ] {
             let (downloader, script) = scripted_downloader([("bucket", 1, 0, false)]);
             script.service_errors.lock().insert(0, status);
             script.service_error_bodies.lock().insert(0, body);
             let result =
                 fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
-            let as_expected = if overloaded {
-                matches!(
-                    &result,
-                    Err(DownloadError::Overloaded(message))
-                        if message.starts_with(&format!("HTTP {status}: "))
-                )
-            } else {
-                matches!(result, Err(DownloadError::Unknown(_)))
-            };
-            assert!(as_expected, "{status} {body:?}: {result:?}");
+            let error = result.as_ref().err();
+            assert_eq!(
+                error.map(discriminant),
+                Some(discriminant(expected)),
+                "{status} {body:?}: {result:?}"
+            );
+            if let Some(DownloadError::Overloaded(message)) = error {
+                assert!(
+                    message.starts_with(&format!("HTTP {status}: ")),
+                    "{message}"
+                );
+            }
+            let failed = !matches!(
+                expected,
+                DownloadError::NoSuchKey | DownloadError::RangeNotSatisfied { .. }
+            );
+            assert_eq!(
+                metrics(&downloader, "bucket").await.consecutive_failures,
+                u32::from(failed),
+                "{status} {body:?}"
+            );
         }
     }
 
