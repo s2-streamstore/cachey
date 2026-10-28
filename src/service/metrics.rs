@@ -8,7 +8,7 @@ use prometheus::{
 };
 
 use crate::{
-    object_store::{BucketMetrics, Predictions},
+    object_store::{BucketMetrics, Predictions, QUANTILES},
     types::{BucketName, ObjectKind},
 };
 
@@ -42,11 +42,11 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         ]
     });
 
-    static MEDIAN: LazyLock<GaugeVec> = LazyLock::new(|| {
+    static LATENCY: LazyLock<GaugeVec> = LazyLock::new(|| {
         register_gauge_vec!(
-            "cachey_bucket_latency_median_seconds",
-            "Median latency of a size band, labeled by its smallest size in bytes",
-            &["bucket", "phase", "bytes"]
+            "cachey_bucket_latency_seconds",
+            "Latency quantile of a size band, labeled by its smallest size in bytes",
+            &["bucket", "phase", "bytes", "quantile"]
         )
         .unwrap()
     });
@@ -73,14 +73,21 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
             .map_or(&[][..], |estimate| &estimate.bands);
         for band in 0..u64::BITS / 2 {
             let bytes = 1_u64 << (2 * band);
-            let label = bytes.to_string();
-            let labels = [&**bucket, phase, label.as_str()];
-            match bands.iter().find(|band| band.bytes == bytes) {
-                Some(band) => MEDIAN
-                    .with_label_values(&labels)
-                    .set(band.median.as_secs_f64()),
-                None => {
-                    let _ = MEDIAN.remove_label_values(&labels);
+            let quantiles = bands
+                .iter()
+                .find(|band| band.bytes == bytes)
+                .map(|band| band.quantiles);
+            let bytes = bytes.to_string();
+            for (index, quantile) in QUANTILES.iter().enumerate() {
+                let quantile = quantile.to_string();
+                let labels = [&**bucket, phase, bytes.as_str(), quantile.as_str()];
+                match quantiles {
+                    Some(quantiles) => LATENCY
+                        .with_label_values(&labels)
+                        .set(quantiles[index].as_secs_f64()),
+                    None => {
+                        let _ = LATENCY.remove_label_values(&labels);
+                    }
                 }
             }
         }

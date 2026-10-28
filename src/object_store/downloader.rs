@@ -2074,7 +2074,7 @@ mod tests {
         let peer = metrics(&downloader, "peer").await;
         assert!(peer.deprioritized);
         assert_eq!(
-            peer.request.map(|estimate| estimate.bands[0].median),
+            peer.request.map(|estimate| estimate.bands[0].quantiles[0]),
             Some(Duration::from_millis(20))
         );
         assert_eq!(script.active.load(Ordering::SeqCst), 0);

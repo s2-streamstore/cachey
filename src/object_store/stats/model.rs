@@ -10,7 +10,8 @@ use super::{OBSERVATION_SPACING, reservoir::Reservoir};
 
 pub(super) const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MICROS: f64 = TIMER_RESOLUTION.as_micros() as f64;
-const TAIL_QUANTILES: [f64; 2] = [0.95, 0.99];
+/// The median, p95, and p99.
+pub const QUANTILES: [f64; 3] = [0.5, 0.95, 0.99];
 const HEDGE_TAIL_CAP: f64 = 1.25;
 /// Samples a histogram retains, split evenly across its size bands.
 const SAMPLES: usize = 1024;
@@ -77,12 +78,13 @@ pub struct Predictions {
     pub above_tail: u64,
 }
 
-/// A size band's median latency.
+/// A size band's latency quantiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BandLatency {
     /// The smallest size in the band.
     pub bytes: u64,
-    pub median: Duration,
+    /// As [`QUANTILES`] lists them.
+    pub quantiles: [Duration; 3],
 }
 
 /// A fitted latency model, exported as metrics.
@@ -219,7 +221,7 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
         .collect();
     let mut medians: Vec<f64> = bands
         .iter()
-        .map(|samples| weighted_quantile(samples, |sample| sample.micros, 0.5))
+        .map(|samples| weighted_quantile(samples, |sample| sample.micros, QUANTILES[0]))
         .collect();
     nondecreasing(&mut medians, &weights);
     let mut points: Vec<Point> = bands
@@ -251,7 +253,7 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
                 (sample.micros / expected, sample.weight)
             })
             .collect();
-        for (tail, q) in tails.iter_mut().zip(TAIL_QUANTILES) {
+        for (tail, &q) in tails.iter_mut().zip(&QUANTILES[1..]) {
             tail.push(median * quantile(&mut ratios, q));
         }
     }
@@ -399,7 +401,7 @@ impl SizeHistogram {
                 .filter(|point| point.bytes > 0.0)
                 .map(|point| BandLatency {
                     bytes: 1 << (2 * band(point.bytes as u64)),
-                    median: duration(point.micros[0]),
+                    quantiles: point.micros.map(duration),
                 })
                 .collect(),
             largest_bytes: curve.largest_bytes,

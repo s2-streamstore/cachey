@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::{sync::SetOnce, time::Instant};
 
-pub use self::model::{BandLatency, LatencyEstimate, Predictions};
+pub use self::model::{BandLatency, LatencyEstimate, Predictions, QUANTILES};
 use self::model::{Median, SizeHistogram, SizeModel, TIMER_RESOLUTION};
 use crate::{
     object_store::DownloadLimits,
@@ -1369,7 +1369,7 @@ mod tests {
                 metrics
                     .request
                     .as_ref()
-                    .map(|estimate| estimate.bands[0].median),
+                    .map(|estimate| estimate.bands[0].quantiles[0]),
                 Some(Duration::from_millis(3))
             );
             let entry = stats

@@ -171,7 +171,7 @@ contacting a backend.
 
 | Measurement | Meaning |
 |-------------|---------|
-| `cachey_bucket_latency_median_seconds` | Median latency of a size band, labeled by its smallest size (`bytes`) |
+| `cachey_bucket_latency_seconds` | Median, p95, or p99 (`quantile`) of a size band, labeled by its smallest size (`bytes`) |
 | `cachey_bucket_latency_model_bytes` | Largest size retained by the model |
 | `cachey_bucket_latency_predictions_total` | Observations at sizes the model predicted |
 | `cachey_bucket_latency_predictions_exceeded_total` | Those slower than the predicted median (`quantile="0.5"`) or p99 (`quantile="0.99"`) |
