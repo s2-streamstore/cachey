@@ -8,7 +8,7 @@ use prometheus::{
 };
 
 use crate::{
-    object_store::{BucketMetrics, Predictions, QUANTILES},
+    object_store::{BucketMetrics, Predictions, QUANTILES, size_bands},
     types::{BucketName, ObjectKind},
 };
 
@@ -71,8 +71,7 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         let bands = estimate
             .as_ref()
             .map_or(&[][..], |estimate| &estimate.bands);
-        for band in 0..u64::BITS / 2 {
-            let bytes = 1_u64 << (2 * band);
+        for bytes in size_bands() {
             let quantiles = bands
                 .iter()
                 .find(|band| band.bytes == bytes)

@@ -10,9 +10,10 @@ use super::{OBSERVATION_SPACING, reservoir::Reservoir};
 
 pub(super) const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MICROS: f64 = TIMER_RESOLUTION.as_micros() as f64;
-/// The median, p95, and p99.
 pub const QUANTILES: [f64; 3] = [0.5, 0.95, 0.99];
 const HEDGE_TAIL_CAP: f64 = 1.25;
+/// S3 Standard's cold objects take about four times as long as its warm ones.
+const HEDGE_MEDIAN_CAP: f64 = 5.0;
 /// Samples a histogram retains, split evenly across its size bands.
 const SAMPLES: usize = 1024;
 
@@ -21,58 +22,63 @@ fn band(bytes: u64) -> u32 {
     bytes.ilog2() / 2
 }
 
-/// The median, p95, and p99 latency at a size.
+fn band_bytes(band: u32) -> u64 {
+    1 << (2 * band)
+}
+
+/// The smallest size of every band.
+pub fn size_bands() -> impl Iterator<Item = u64> {
+    (0..u64::BITS / 2).map(band_bytes)
+}
+
+/// A band's median latency at its median size, with its p95 and p99 as multiples of it.
 #[derive(Debug, Clone, Copy)]
 struct Point {
     bytes: f64,
-    micros: [f64; 3],
+    median: f64,
+    tail_ratios: [f64; 2],
 }
 
-/// Latency quantiles by size: a point per size band, joined by straight segments.
+/// Latency by size: medians joined by straight segments, flat below the first point and
+/// extended beyond the last at `slope`, with tail ratios interpolated alongside.
 #[derive(Debug, Clone)]
 struct Curve {
     points: Arc<[Point]>,
+    slope: f64,
     smallest_bytes: u64,
     largest_bytes: u64,
 }
 
 impl Curve {
-    /// Quantiles at a size: flat below the first point, and beyond the last along the last
-    /// segment, with none predicted where latency does not grow measurably. Beyond the last
-    /// point latency grows at most in proportion to size, since two close points can make
-    /// a steep segment.
+    /// None beyond the largest size where the median does not grow measurably there.
     fn micros(&self, bytes: u64) -> Option<[f64; 3]> {
         let size = bytes as f64;
-        let last = self.points.len() - 1;
-        let next = self
-            .points
-            .partition_point(|point| point.bytes < size)
-            .clamp(last.min(1), last);
-        let (from, to) = (self.points[next.saturating_sub(1)], self.points[next]);
-        let span = to.bytes - from.bytes;
-        let along = (size - to.bytes).max(from.bytes - to.bytes);
-        let slope = |quantile: usize| {
-            let slope = if span > 0.0 {
-                (to.micros[quantile] - from.micros[quantile]) / span
-            } else {
-                0.0
-            };
-            if along > 0.0 {
-                slope.min(to.micros[quantile] / to.bytes)
-            } else {
-                slope
+        let next = self.points.partition_point(|point| point.bytes < size);
+        let (median, tail_ratios) = match (self.points[..next].last(), self.points.get(next)) {
+            (Some(from), Some(to)) => {
+                let along = (size - from.bytes) / (to.bytes - from.bytes);
+                let lerp = |from: f64, to: f64| from + (to - from) * along;
+                (
+                    lerp(from.median, to.median),
+                    [0, 1].map(|tail| lerp(from.tail_ratios[tail], to.tail_ratios[tail])),
+                )
             }
+            (None, Some(first)) => (first.median, first.tail_ratios),
+            (Some(last), None) => {
+                if bytes > self.largest_bytes
+                    && self.slope * self.largest_bytes as f64 <= TIMER_MICROS
+                {
+                    return None;
+                }
+                (
+                    last.median + self.slope * (size - last.bytes),
+                    last.tail_ratios,
+                )
+            }
+            (None, None) => return None,
         };
-        if bytes > self.largest_bytes && slope(0) * self.largest_bytes as f64 <= TIMER_MICROS {
-            return None;
-        }
-        let mut micros: [f64; 3] = std::array::from_fn(|quantile| {
-            (to.micros[quantile] + slope(quantile) * along).max(TIMER_MICROS)
-        });
-        // Quantiles extrapolated along their own slopes must not cross.
-        micros[1] = micros[1].max(micros[0]);
-        micros[2] = micros[2].max(micros[1]);
-        Some(micros)
+        let median = median.max(TIMER_MICROS);
+        Some([median, median * tail_ratios[0], median * tail_ratios[1]])
     }
 }
 
@@ -112,7 +118,7 @@ fn duration(micros: f64) -> Duration {
 pub(in crate::object_store) enum Median {
     /// Within the range of retained sizes.
     Observed(Duration),
-    /// Outside it: along the last segment where latency grows measurably, or else the
+    /// Outside it: beyond the last band where latency grows measurably, or else the
     /// median at the largest retained size, a lower bound since latency grows with size.
     /// Either way an estimate that can be far off, so it is not evidence about the bucket.
     Unobserved(Duration),
@@ -152,14 +158,16 @@ impl SizeModel {
         self.micros(bytes).map(|micros| duration(micros[2]))
     }
 
-    /// p99, capped at 1.25 times the p95. Where stalls exceed 1% of reads they set the p99,
-    /// and the cap keeps hedges early; with ±20% jitter the cap is about 1.5 times the
-    /// median. It caps the p95 rather than the median because reads of one size can split
-    /// between fast and slow objects, like S3 Standard's warm and cold ones, and a hedge
-    /// cannot speed up the slow mode once it is 5% of reads.
+    /// p99, capped at 1.25 times the p95 and five times the median. Where stalls exceed 1%
+    /// of reads they set the p99, and with ±20% jitter the p95 cap is about 1.5 times the
+    /// median. Reads of one size can split between fast and slow objects, like S3
+    /// Standard's warm and cold ones, and a hedge cannot speed up the slow mode, so a slow
+    /// mode above 5% of reads is waited out, unless it is more than five times the median,
+    /// as stalls are, which a hedge can rescue.
     pub fn hedge_delay(&self, bytes: u64) -> Option<Duration> {
-        self.micros(bytes)
-            .map(|micros| duration(micros[2].min(micros[1] * HEDGE_TAIL_CAP)))
+        self.micros(bytes).map(|[median, p95, p99]| {
+            duration(p99.min(p95 * HEDGE_TAIL_CAP).min(median * HEDGE_MEDIAN_CAP))
+        })
     }
 }
 
@@ -204,21 +212,25 @@ fn nondecreasing(values: &mut [f64], weights: &[f64]) {
     }
 }
 
-fn weighted_quantile(samples: &[Observation], value: fn(&Observation) -> f64, q: f64) -> f64 {
-    let mut values: Vec<_> = samples
-        .iter()
-        .map(|sample| (value(sample), sample.weight))
-        .collect();
-    quantile(&mut values, q)
+fn weighted_median(
+    samples: &[Observation],
+    value: fn(&Observation) -> f64,
+    values: &mut Vec<(f64, f64)>,
+) -> f64 {
+    values.clear();
+    values.extend(samples.iter().map(|sample| (value(sample), sample.weight)));
+    quantile(values, 0.5)
 }
 
-/// A point per size band at its median size, holding the band's median latency, and its
-/// p95 and p99 as multiples of the median at each sample's size, so that where latency
-/// grows with size the band's largest sizes do not set its tail. A band's quantiles come
-/// only from its own samples, so a slow mode at one size never stretches another's. Each
-/// quantile is made nondecreasing across bands. Proportional curves start from the timer
-/// resolution at zero bytes.
+/// A point per size band at its median size, with medians made nondecreasing across bands.
+/// Tails are ratios to the median at each sample's size, and at least to the band's own,
+/// so neither the band's largest sizes nor a step in latency below it set its tail, and a
+/// slow mode at one size never stretches another's. Beyond the last point the median
+/// follows the last segment, at most in proportion to size, and no faster than within the
+/// last band where its halves, each twice the other's sizes, show it. A lone band is a
+/// transfer cost if `proportional`.
 fn curve(observations: &[Observation], proportional: bool) -> Curve {
+    let mut values = Vec::new();
     let bands: Vec<_> = observations
         .chunk_by(|left, right| band(left.bytes) == band(right.bytes))
         .collect();
@@ -228,50 +240,72 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
         .collect();
     let mut medians: Vec<f64> = bands
         .iter()
-        .map(|samples| weighted_quantile(samples, |sample| sample.micros, QUANTILES[0]))
+        .map(|samples| weighted_median(samples, |sample| sample.micros, &mut values))
         .collect();
     nondecreasing(&mut medians, &weights);
     let mut points: Vec<Point> = bands
         .iter()
-        .zip(&medians)
-        .map(|(samples, &median)| Point {
-            bytes: weighted_quantile(samples, |sample| sample.bytes as f64, 0.5),
-            micros: [median; 3],
+        .zip(medians)
+        .map(|(samples, median)| Point {
+            bytes: weighted_median(samples, |sample| sample.bytes as f64, &mut values),
+            median,
+            tail_ratios: [1.0; 2],
         })
         .collect();
-    let origin = proportional.then_some(Point {
+    let origin = (proportional && points.len() == 1).then_some(Point {
         bytes: 0.0,
-        micros: [TIMER_MICROS; 3],
+        median: TIMER_MICROS,
+        tail_ratios: [1.0; 2],
     });
-    let build = |points: &[Point]| Curve {
+    let last = points[points.len() - 1];
+    let last_band = bands[bands.len() - 1];
+    let middle = 2 * band_bytes(band(last_band[0].bytes));
+    let (lower, upper) =
+        last_band.split_at(last_band.partition_point(|sample| sample.bytes < middle));
+    let halves_slope = if lower.is_empty() || upper.is_empty() {
+        f64::INFINITY
+    } else {
+        let mut median = |samples, value| weighted_median(samples, value, &mut values);
+        (median(upper, |sample| sample.micros) - median(lower, |sample| sample.micros))
+            / (median(upper, |sample| sample.bytes as f64)
+                - median(lower, |sample| sample.bytes as f64))
+    };
+    let segment = points
+        .len()
+        .checked_sub(2)
+        .map(|previous| points[previous])
+        .or(origin)
+        .map_or(0.0, |previous| {
+            (last.median - previous.median) / (last.bytes - previous.bytes)
+        });
+    let slope = segment
+        .min(last.median / last.bytes)
+        .min(halves_slope)
+        .max(0.0);
+    let build = |origin: Option<Point>, points: &[Point]| Curve {
         points: origin.iter().chain(points).copied().collect(),
+        slope,
         smallest_bytes: observations[0].bytes,
         largest_bytes: observations[observations.len() - 1].bytes,
     };
-    let median_curve = build(&points);
-    let mut tails: [Vec<f64>; 2] = Default::default();
-    for (samples, &median) in bands.iter().zip(&medians) {
-        let mut ratios: Vec<_> = samples
-            .iter()
-            .map(|sample| {
-                let expected = median_curve
-                    .micros(sample.bytes)
-                    .map_or(median, |micros| micros[0]);
-                (sample.micros / expected, sample.weight)
-            })
-            .collect();
-        for (tail, &q) in tails.iter_mut().zip(&QUANTILES[1..]) {
-            tail.push(median * quantile(&mut ratios, q));
-        }
+    let medians = build(origin, &points);
+    for (point, samples) in points.iter_mut().zip(&bands) {
+        values.clear();
+        values.extend(samples.iter().map(|sample| {
+            let expected = medians
+                .micros(sample.bytes)
+                .map_or(point.median, |micros| micros[0])
+                .max(point.median);
+            (sample.micros / expected, sample.weight)
+        }));
+        let p95 = quantile(&mut values, QUANTILES[1]).max(1.0);
+        point.tail_ratios = [p95, quantile(&mut values, QUANTILES[2]).max(p95)];
     }
-    for tail in &mut tails {
-        nondecreasing(tail, &weights);
-    }
-    for (point, (&p95, &p99)) in points.iter_mut().zip(tails[0].iter().zip(&tails[1])) {
-        point.micros[1] = p95.max(point.micros[0]);
-        point.micros[2] = p99.max(point.micros[1]);
-    }
-    build(&points)
+    let origin = origin.map(|origin| Point {
+        tail_ratios: points[0].tail_ratios,
+        ..origin
+    });
+    build(origin, &points)
 }
 
 /// Latency observations by size. Size strata retain rare sizes for one continuous model.
@@ -280,7 +314,7 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
 /// observation, so sparse traffic keeps enough observations for a tail estimate.
 #[derive(Debug)]
 pub(super) struct SizeHistogram {
-    /// Body time falls toward zero below the smallest band, as a transfer cost.
+    /// A lone band is a transfer cost rather than a fixed cost.
     proportional: bool,
     bands: BTreeMap<u32, Reservoir<Measurement>>,
     clock: f64,
@@ -395,8 +429,8 @@ impl SizeHistogram {
             SizeModel((!observations.is_empty()).then(|| curve(&observations, self.proportional)));
     }
 
-    pub fn model(&self) -> SizeModel {
-        self.model.clone()
+    pub fn model(&self) -> &SizeModel {
+        &self.model
     }
 
     pub fn is_measured(&self) -> bool {
@@ -411,8 +445,9 @@ impl SizeHistogram {
                 .iter()
                 .filter(|point| point.bytes > 0.0)
                 .map(|point| BandLatency {
-                    bytes: 1 << (2 * band(point.bytes as u64)),
-                    quantiles: point.micros.map(duration),
+                    bytes: band_bytes(band(point.bytes as u64)),
+                    quantiles: [1.0, point.tail_ratios[0], point.tail_ratios[1]]
+                        .map(|ratio| duration(point.median * ratio)),
                 })
                 .collect(),
             largest_bytes: curve.largest_bytes,
@@ -423,7 +458,7 @@ impl SizeHistogram {
     #[cfg(test)]
     pub fn summary(&mut self, due: bool) -> SizeModel {
         self.refit(due);
-        self.model()
+        self.model.clone()
     }
 }
 
@@ -682,31 +717,55 @@ mod tests {
     }
 
     /// Latency that steps up with size and then levels off, as S3 Standard's cold objects
-    /// do, is not extended as a line through the step.
+    /// do, is not extended as a line through the step, within the sizes read or beyond
+    /// them, and the step sets no band's tail.
     #[tokio::test(start_paused = true)]
-    async fn a_step_in_latency_is_not_extrapolated_as_a_line() {
-        let samples = [
-            (64 * 1024, 30),
-            (256 * 1024, 32),
-            (MIB, 110),
-            (4 * MIB, 112),
-        ]
-        .repeat(30);
+    async fn a_step_in_latency_is_not_extended_as_a_line() {
+        let samples: Vec<_> = (64..1024)
+            .step_by(64)
+            .map(|kib| (kib * 1024, 30))
+            .chain((4..16).map(|quarters| (quarters * MIB / 4, 110)))
+            .chain([(4 * MIB, 110); 20])
+            .chain([(15 * MIB, 110); 2])
+            .collect::<Vec<_>>()
+            .repeat(4);
         let model = fitted(&samples, false);
-        let median = |bytes| model.median(bytes).unwrap().value();
-        assert!(median(64 * 1024) <= Duration::from_millis(31));
-        assert!(median(4 * MIB) <= Duration::from_millis(113));
-        assert!(
-            median(16 * MIB) <= Duration::from_millis(120),
-            "{:?}",
-            median(16 * MIB)
+        assert_eq!(
+            model.median(64 * 1024),
+            Some(Median::Observed(Duration::from_millis(30)))
+        );
+        for bytes in [3 * MIB, 8 * MIB, 15 * MIB] {
+            assert_eq!(
+                model.median(bytes),
+                Some(Median::Observed(Duration::from_millis(110)))
+            );
+            assert_eq!(
+                model.tail(bytes),
+                Some(Duration::from_millis(110)),
+                "{bytes}"
+            );
+        }
+        assert_eq!(
+            model.median(64 * MIB),
+            Some(Median::Unobserved(Duration::from_millis(110)))
         );
     }
 
-    /// When reads of one size split between warm and cold objects, a hedge cannot speed up
-    /// the cold ones, so it waits past them.
+    /// Stalls on many reads of one size leave another size's tail alone.
     #[tokio::test(start_paused = true)]
-    async fn sizes_split_between_warm_and_cold_hedge_after_the_cold_mode() {
+    async fn stalls_at_one_size_leave_other_sizes_alone() {
+        let samples: Vec<_> = (0..1000)
+            .map(|read| (4096, if read % 20 == 0 { 1000 } else { 30 }))
+            .chain([(4 * MIB, 60); 100])
+            .collect();
+        let model = fitted(&samples, false);
+        assert_eq!(model.tail(4 * MIB), Some(Duration::from_millis(60)));
+    }
+
+    /// When reads of one size split between warm and cold objects, a hedge cannot speed up
+    /// the cold ones, so it waits past them, but not past stalls, which it can rescue.
+    #[tokio::test(start_paused = true)]
+    async fn hedges_wait_out_a_slow_mode_but_not_stalls() {
         let samples = [(MIB, 30); 60]
             .into_iter()
             .chain([(MIB, 110); 40])
@@ -715,6 +774,13 @@ mod tests {
         let model = fitted(&samples, false);
         assert!(model.hedge_delay(MIB).unwrap() >= Duration::from_millis(110));
         assert!(model.hedge_delay(64 * 1024).unwrap() <= Duration::from_millis(45));
+        let stalled: Vec<_> = (0..100)
+            .map(|read| (MIB, if read % 12 == 0 { 1000 } else { 30 }))
+            .collect();
+        assert_eq!(
+            fitted(&stalled, false).hedge_delay(MIB),
+            Some(Duration::from_millis(150))
+        );
     }
 
     /// Capacitor reads a range before sending headers, so its time to first byte grows with
@@ -756,7 +822,7 @@ mod tests {
         }
 
         #[test]
-        fn quantiles_never_decrease_with_size_or_cross(
+        fn medians_never_decrease_with_size_and_quantiles_never_cross(
             samples in collection::vec((1_u64..=16 * MIB, 1_000_u32..=1_000_000, 1_u8..=20), 1..60),
             sizes in collection::vec(1_u64..=32 * MIB, 1..20),
             proportional: bool,
@@ -782,14 +848,12 @@ mod tests {
                     }
                 }
             }
-            let mut previous = [0.0; 3];
+            let mut previous = 0.0;
             for bytes in sizes {
                 let Some(micros) = curve.micros(bytes) else { break };
                 prop_assert!(micros[0] <= micros[1] && micros[1] <= micros[2], "{micros:?} at {bytes}");
-                for (value, before) in micros.iter().zip(previous) {
-                    prop_assert!(*value + 1e-6 >= before, "{micros:?} after {previous:?} at {bytes}");
-                }
-                previous = micros;
+                prop_assert!(micros[0] + 1e-6 >= previous, "{micros:?} after {previous} at {bytes}");
+                previous = micros[0];
             }
         }
     }

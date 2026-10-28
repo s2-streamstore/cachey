@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::{sync::SetOnce, time::Instant};
 
-pub use self::model::{BandLatency, LatencyEstimate, Predictions, QUANTILES};
+pub use self::model::{BandLatency, LatencyEstimate, Predictions, QUANTILES, size_bands};
 use self::model::{Median, SizeHistogram, SizeModel, TIMER_RESOLUTION};
 use crate::{
     object_store::DownloadLimits,
@@ -219,9 +219,9 @@ impl LatencyEstimates {
 
     fn model(&self) -> LatencyModel {
         LatencyModel {
-            first_byte: self.first_byte.model(),
-            body: self.body.model(),
-            request: self.request.model(),
+            first_byte: self.first_byte.model().clone(),
+            body: self.body.model().clone(),
+            request: self.request.model().clone(),
         }
     }
 

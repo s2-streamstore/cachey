@@ -56,17 +56,19 @@ is what it receives. Without it, the models of page reads describe whatever resp
 sizes pages return.
 
 Each model has a point per size band, bands being four times apart: the band's median
-size, median latency, and p95 and p99. The p95 and p99 are the median times those
-quantiles of each sample's latency relative to the median at its size, so the band's
-largest sizes do not set its tail. A band's quantiles come only from its own samples,
-so a stall or slow mode at one size never stretches another's. Each quantile is made
-nondecreasing across bands by pooling adjacent violators into their weighted mean.
+size and median latency, with medians made nondecreasing across bands by pooling
+adjacent violators into their weighted mean. Medians are interpolated linearly between
+points and held flat below the first. Beyond the last they follow the last segment,
+where latency grows measurably with size, at most in proportion to size and no faster
+than the last band's own halves, each twice the other's sizes, show. With a single
+band, body time is a transfer cost from 1 ms at zero bytes. Predictions have a 1 ms
+floor.
 
-Quantiles are interpolated linearly between points, held flat below the first, and
-extended along the last segment beyond the last, where latency grows measurably with
-size. There they grow at most in proportion to size, since two close points can make
-a steep segment. Body time starts from a point at 1 ms and zero bytes, as a transfer cost.
-Predictions have a 1 ms floor.
+A band's p95 and p99 are its median times those quantiles of each sample's latency
+relative to the median at the sample's size, and at least the band's own, so neither
+the band's largest sizes nor a step in latency below it set its tail. They come only
+from the band's own samples, so a stall or slow mode at one size never stretches
+another's, and are interpolated between points like medians.
 
 Latency need not grow in proportion to size. S3 Standard serves objects from a cache
 while their age times their size stays under about 50 MiB·s, with a first byte in
@@ -103,13 +105,15 @@ starting at its first admission, whose expiry counts against health once. Up to 
 copies can run per download; the first validated result wins and cancels the others.
 
 Early hedges use the first-byte model at the requested size, then the body model at
-the announced size. Each delay is p99 capped at 1.25 times the p95. Where stalls
-exceed 1% of reads they set the p99, and the cap keeps hedges early; with ±20% jitter
-it is about 1.5 times the median. The cap follows the p95 rather than the median
-because reads of one size can split between fast and slow objects, like S3 Standard's
-warm and cold ones. Every copy of a cold read waits for the same fetch from storage,
-so hedging it only spends the budget that stalls need. Health, rescue, and retry
-decisions use uncapped estimates.
+the announced size. Each delay is p99 capped at 1.25 times the p95 and five times the
+median. Where stalls exceed 1% of reads they set the p99, and with ±20% jitter the p95
+cap is about 1.5 times the median. The cap follows the p95 because reads of one size
+can split between fast and slow objects, like S3 Standard's warm and cold ones. Every
+copy of a cold read waits for the same fetch from storage, so hedging it only spends
+the budget that stalls need. Cold reads take about four times as long as warm ones, so
+a slow mode beyond five times the median is a stall, which a hedge can rescue even
+when it exceeds 5% of reads. Health, rescue, and retry decisions use uncapped
+estimates.
 
 Early hedges use one SDK attempt, skip overloaded buckets, and never wait for
 admission. They prefer an untried bucket expected to finish within its timeout and

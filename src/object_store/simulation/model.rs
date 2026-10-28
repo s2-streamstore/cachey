@@ -221,12 +221,11 @@ impl Scenario {
             self.object_ages
                 .as_ref()
                 .is_none_or(|ages| ages.min_ms > 0 && ages.max_ms > ages.min_ms)
-                && (self.object_ages.is_some()
-                    || self
-                        .replicas
-                        .iter()
-                        .all(|replica| replica.hot_mib_ms.is_none())),
-            "a replica with a hot cache needs object ages"
+                && self.replicas.iter().all(|replica| {
+                    (replica.hot_mib_ms.is_some() || replica.cold_headers_ms == 0)
+                        && (self.object_ages.is_some() || replica.hot_mib_ms.is_none())
+                }),
+            "a cold replica needs a hot cache, and a hot cache needs object ages"
         );
         eyre::ensure!(
             self.sdk_attempts > 0 && self.jitter_percent <= 100,
