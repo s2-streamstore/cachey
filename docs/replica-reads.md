@@ -64,7 +64,8 @@ nondecreasing across bands by pooling adjacent violators into their weighted mea
 
 Quantiles are interpolated linearly between points, held flat below the first, and
 extended along the last segment beyond the last, where latency grows measurably with
-size. Body time starts from a point at 1 ms and zero bytes, as a transfer cost.
+size. There they grow at most in proportion to size, since two close points can make
+a steep segment. Body time starts from a point at 1 ms and zero bytes, as a transfer cost.
 Predictions have a 1 ms floor.
 
 Latency need not grow in proportion to size. S3 Standard serves objects from a cache

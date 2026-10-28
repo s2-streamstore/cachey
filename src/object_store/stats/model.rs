@@ -38,7 +38,9 @@ struct Curve {
 
 impl Curve {
     /// Quantiles at a size: flat below the first point, and beyond the last along the last
-    /// segment, with none predicted where latency does not grow measurably.
+    /// segment, with none predicted where latency does not grow measurably. Beyond the last
+    /// point latency grows at most in proportion to size, since two close points can make
+    /// a steep segment.
     fn micros(&self, bytes: u64) -> Option<[f64; 3]> {
         let size = bytes as f64;
         let last = self.points.len() - 1;
@@ -48,17 +50,22 @@ impl Curve {
             .clamp(last.min(1), last);
         let (from, to) = (self.points[next.saturating_sub(1)], self.points[next]);
         let span = to.bytes - from.bytes;
+        let along = (size - to.bytes).max(from.bytes - to.bytes);
         let slope = |quantile: usize| {
-            if span > 0.0 {
+            let slope = if span > 0.0 {
                 (to.micros[quantile] - from.micros[quantile]) / span
             } else {
                 0.0
+            };
+            if along > 0.0 {
+                slope.min(to.micros[quantile] / to.bytes)
+            } else {
+                slope
             }
         };
         if bytes > self.largest_bytes && slope(0) * self.largest_bytes as f64 <= TIMER_MICROS {
             return None;
         }
-        let along = (size - to.bytes).max(from.bytes - to.bytes);
         let mut micros: [f64; 3] = std::array::from_fn(|quantile| {
             (to.micros[quantile] + slope(quantile) * along).max(TIMER_MICROS)
         });
@@ -390,6 +397,10 @@ impl SizeHistogram {
 
     pub fn model(&self) -> SizeModel {
         self.model.clone()
+    }
+
+    pub fn is_measured(&self) -> bool {
+        self.model.0.is_some()
     }
 
     pub fn estimate(&self) -> Option<LatencyEstimate> {
@@ -759,6 +770,18 @@ mod tests {
             let curve = curve(&observations, proportional);
             let mut sizes = sizes;
             sizes.sort_unstable();
+            let largest = observations[observations.len() - 1].bytes;
+            if let Some(at_largest) = curve.micros(largest) {
+                for &bytes in sizes.iter().filter(|&&bytes| bytes > largest) {
+                    let Some(micros) = curve.micros(bytes) else { break };
+                    for (value, limit) in micros.iter().zip(at_largest) {
+                        prop_assert!(
+                            *value <= limit * bytes as f64 / largest as f64 + 1e-6,
+                            "{micros:?} at {bytes} grows faster than size from {at_largest:?}"
+                        );
+                    }
+                }
+            }
             let mut previous = [0.0; 3];
             for bytes in sizes {
                 let Some(micros) = curve.micros(bytes) else { break };

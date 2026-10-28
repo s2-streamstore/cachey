@@ -303,7 +303,7 @@ impl BucketStats {
 
     /// Every success eases the excess; the first measurement and recovery probes clear it.
     fn record(&mut self, now: Instant, sample: &Sample, probe: bool) {
-        if probe || self.estimates.request.estimate().is_none() {
+        if probe || !self.estimates.request.is_measured() {
             self.routing_excess = 0.0;
             self.unmeasured_latency = Duration::ZERO;
         } else {
