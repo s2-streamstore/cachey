@@ -72,10 +72,12 @@ grows measurably with size. Predictions have a 1 ms floor.
 
 Latency need not grow in proportion to size. S3 Standard serves objects from a cache
 while their age times their size stays under about 50 MiB·s, with a first byte in
-about 30 ms, and adds about 80 ms when they are cold, regardless of size. A large
-object goes cold within seconds, so in a band of large reads most are cold, while
-small reads stay warm. A line through every size predicts seconds for 16 MiB from
-that step; quantiles by band follow it.
+about 30 ms, and adds about 80 ms when they are cold, regardless of size. A read soon
+after a write can find an object warm, while a later one, such as a reader catching
+up, finds it cold. Small objects stay warm longer, so the share of cold reads grows
+with size: reads of one size split between a warm and a cold mode, and the median
+steps up where cold reads become the majority. A line through every size predicts
+seconds for 16 MiB from that step; quantiles by band follow it.
 
 Observations have a 15-second half-life of model time. Model time advances at most
 150 ms per observation, so a half-life spans at least 100 observations when traffic
