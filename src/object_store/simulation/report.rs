@@ -34,6 +34,8 @@ pub struct Read {
     pub primary: Option<usize>,
     pub winner: Option<usize>,
     pub hedged: bool,
+    /// The early hedge's phase, target, and outcome.
+    pub hedge: Option<String>,
     pub health: Vec<Health>,
 }
 
@@ -118,6 +120,8 @@ pub struct Report {
     delivered_bytes: u64,
     useful_bytes: u64,
     pub overlapping_reads: usize,
+    /// Early hedges of successful reads by phase, target, and outcome.
+    hedges: BTreeMap<String, usize>,
     wins_by_replica: Vec<usize>,
     pub recoveries: Vec<Recovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -322,6 +326,13 @@ impl Report {
                 .map(|read| read.body_bytes as u64)
                 .sum(),
             overlapping_reads: reads.iter().filter(|read| read.hedged).count(),
+            hedges: reads.iter().filter_map(|read| read.hedge.clone()).fold(
+                BTreeMap::new(),
+                |mut hedges, hedge| {
+                    *hedges.entry(hedge).or_default() += 1;
+                    hedges
+                },
+            ),
             wins_by_replica: wins,
             recoveries,
             scenario,

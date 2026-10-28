@@ -31,6 +31,8 @@ CACHEY_SIM_OUTPUT=/tmp/cachey-simulation.json \
 [Fixtures](../../tests/scenarios/replica_reads.json) inherit omitted fields from
 [model defaults](../../src/object_store/simulation/model.rs). Reports include the
 resolved configuration, seed, sampling mode, Git revision, and dirty-tree flag.
+`hedges` counts early hedges of successful reads by phase, target, and outcome, as
+`cachey_hedges_total` does.
 
 ## Model
 

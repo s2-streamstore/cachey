@@ -231,7 +231,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                         state.completed_reads += 1;
                         order
                     });
-                    let (error, primary, winner, hedged) = match result {
+                    let (error, primary, winner, hedged, hedge) = match result {
                         Some(Ok(output)) => {
                             assert_eq!(output.piece.data.len(), body_bytes);
                             (
@@ -239,6 +239,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                                 Some(output.primary_bucket_idx),
                                 Some(output.used_bucket_idx),
                                 output.hedged,
+                                output.hedge.map(|hedge| hedge.labels().join("/")),
                             )
                         }
                         Some(Err(error)) => (
@@ -246,8 +247,9 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                             None,
                             None,
                             false,
+                            None,
                         ),
-                        None => (Some("caller_cancelled".to_owned()), None, None, false),
+                        None => (Some("caller_cancelled".to_owned()), None, None, false, None),
                     };
                     let mut health = vec![];
                     downloader.observe_bucket_metrics(|bucket, metrics| {
@@ -268,6 +270,7 @@ async fn simulate(scenario: Scenario, seed: u64, native_reservoir: bool, trace: 
                         primary,
                         winner,
                         hedged,
+                        hedge,
                         health,
                     }
                 }

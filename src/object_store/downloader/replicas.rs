@@ -17,8 +17,8 @@ use tokio::{
 };
 
 use super::{
-    BucketDeadline, BucketOperation, DownloadError, DownloadOutput, Downloader, HedgeTimer,
-    ObjectPiece, PieceRequest, RequestConfig, RequestTimeline,
+    BucketDeadline, BucketOperation, DownloadError, DownloadOutput, Downloader, Hedge, HedgePhase,
+    HedgeTimer, ObjectPiece, PieceRequest, RequestConfig, RequestTimeline,
 };
 use crate::{
     object_store::{
@@ -34,6 +34,7 @@ const MAX_CONCURRENT_COPIES: usize = 3;
 struct Completion {
     index: usize,
     is_primary: bool,
+    is_hedge: bool,
     result: Result<ObjectPiece, DownloadError>,
 }
 
@@ -174,6 +175,7 @@ struct CopyAttempt {
     index: usize,
     model: LatencyModel,
     is_primary: bool,
+    is_hedge: bool,
     probe: Option<ProbePermit>,
     permits: Option<AttemptPermits>,
 }
@@ -195,13 +197,20 @@ impl ReplicaRequest<'_> {
             / 2
     }
 
-    fn output(&self, piece: ObjectPiece, used: usize, start: Instant) -> DownloadOutput {
+    fn output(
+        &self,
+        piece: ObjectPiece,
+        used: usize,
+        start: Instant,
+        hedge: Option<Hedge>,
+    ) -> DownloadOutput {
         DownloadOutput {
             piece,
             primary_bucket_idx: self.primary,
             used_bucket_idx: used,
             latency: start.elapsed(),
             hedged: self.hedged.load(Ordering::Relaxed),
+            hedge,
         }
     }
 
@@ -210,6 +219,7 @@ impl ReplicaRequest<'_> {
             index,
             model,
             is_primary,
+            is_hedge,
             probe,
             permits,
         } = copy;
@@ -255,6 +265,7 @@ impl ReplicaRequest<'_> {
         Completion {
             index,
             is_primary,
+            is_hedge,
             result,
         }
     }
@@ -274,7 +285,7 @@ async fn next_rescue(rescues: &mut VecDeque<(Duration, usize)>, start: Instant) 
 enum Trigger {
     Fallback,
     Rescue(usize),
-    Hedge,
+    Hedge(HedgePhase),
 }
 
 struct Followups<'a> {
@@ -333,7 +344,7 @@ impl Followups<'_> {
         if remaining.is_zero() {
             return None;
         }
-        let early = matches!(trigger, Trigger::Hedge);
+        let early = matches!(trigger, Trigger::Hedge(_));
         let downloader = self.request.downloader;
         let routing = downloader.bucketed_stats.snapshot(
             self.request.buckets,
@@ -343,7 +354,7 @@ impl Followups<'_> {
         let untried = |index: usize| !self.states.buckets[index].tried;
         let index = match trigger {
             Trigger::Rescue(index) => index,
-            Trigger::Hedge => routing
+            Trigger::Hedge(_) => routing
                 .best(
                     |index| {
                         untried(index)
@@ -403,6 +414,7 @@ impl Followups<'_> {
             index,
             model: routing.model(index).clone(),
             is_primary: false,
+            is_hedge: early,
             probe: None,
             permits,
         })
@@ -469,12 +481,20 @@ impl Downloader {
         );
         let mut active = Vec::with_capacity(MAX_CONCURRENT_COPIES);
         active.push((primary, Box::pin(request.attempt(primary_copy))));
+        let mut launched_hedge = None;
         while !active.is_empty() {
             let trigger = select! {
                 biased;
-                Completion { index, is_primary, result } = next_completion(&mut active) => {
+                Completion { index, is_primary, is_hedge, result } = next_completion(&mut active) => {
                     let error = match result {
-                        Ok(piece) => return Ok(request.output(piece, index, start)),
+                        Ok(piece) => {
+                            let hedge = launched_hedge.map(|(phase, bucket)| Hedge {
+                                phase,
+                                same_bucket: bucket == primary,
+                                won: is_hedge,
+                            });
+                            return Ok(request.output(piece, index, start, hedge));
+                        }
                         Err(error) => error,
                     };
                     if error.ends_read() {
@@ -494,13 +514,14 @@ impl Downloader {
                     Trigger::Fallback
                 },
                 index = next_rescue(&mut rescues, start) => Trigger::Rescue(index),
-                () = hedge.due() => Trigger::Hedge,
+                phase = hedge.due() => Trigger::Hedge(phase),
             };
             if active.len() < MAX_CONCURRENT_COPIES
                 && let Some(copy) = followups.next(trigger, active.is_empty())
             {
-                if matches!(trigger, Trigger::Hedge) {
+                if let Trigger::Hedge(phase) = trigger {
                     hedge.disarm();
+                    launched_hedge = Some((phase, copy.index));
                 }
                 active.push((copy.index, Box::pin(request.attempt(copy))));
             }
@@ -531,6 +552,7 @@ impl Downloader {
             index,
             model: routing.model(index).clone(),
             is_primary: true,
+            is_hedge: false,
             probe,
             permits: admission.map(|admission| AttemptPermits {
                 admission,

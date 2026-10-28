@@ -52,8 +52,9 @@ impl BucketDeadline {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Phase {
+/// When an early hedge fired: before the primary's headers, or during its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HedgePhase {
     FirstByte,
     Body,
 }
@@ -64,7 +65,7 @@ pub(super) struct HedgeTimer<'a> {
     model: LatencyModel,
     primary: &'a RequestTimeline,
     requested_bytes: u64,
-    next: Option<Phase>,
+    next: Option<HedgePhase>,
 }
 
 impl<'a> HedgeTimer<'a> {
@@ -78,7 +79,7 @@ impl<'a> HedgeTimer<'a> {
             model,
             primary,
             requested_bytes,
-            next: enabled.then_some(Phase::FirstByte),
+            next: enabled.then_some(HedgePhase::FirstByte),
         }
     }
 
@@ -90,17 +91,18 @@ impl<'a> HedgeTimer<'a> {
     fn due_at(&self, headers: Option<Headers>) -> Option<Instant> {
         let (since, delay) = match (self.next?, headers) {
             (_, Some(headers)) => (headers.at, self.model.body.hedge_delay(headers.body_bytes)?),
-            (Phase::FirstByte, None) => (
+            (HedgePhase::FirstByte, None) => (
                 self.primary.started()?,
                 self.model.first_byte.hedge_delay(self.requested_bytes)?,
             ),
-            (Phase::Body, None) => return None,
+            (HedgePhase::Body, None) => return None,
         };
         since.checked_add(delay)
     }
 
-    /// Waits until a hedge is due; stays pending once no phase remains to time.
-    pub async fn due(&mut self) {
+    /// Waits until a hedge is due, in the phase it fires in; stays pending once no phase
+    /// remains to time.
+    pub async fn due(&mut self) -> HedgePhase {
         if self.next.is_none() {
             return std::future::pending().await;
         }
@@ -119,8 +121,12 @@ impl<'a> HedgeTimer<'a> {
                 biased;
                 () = primary.changed(), if !settled => {}
                 () = sleep_until(at) => {
-                    self.next = (!settled).then_some(Phase::Body);
-                    return;
+                    self.next = (!settled).then_some(HedgePhase::Body);
+                    return if settled {
+                        HedgePhase::Body
+                    } else {
+                        HedgePhase::FirstByte
+                    };
                 }
             }
         }
@@ -158,7 +164,7 @@ mod tests {
         timeout(Duration::from_secs(60), timer.due())
             .await
             .ok()
-            .map(|()| start.elapsed())
+            .map(|_| start.elapsed())
     }
 
     fn timer(model: LatencyModel, timeline: &RequestTimeline, bytes: u64) -> HedgeTimer<'_> {

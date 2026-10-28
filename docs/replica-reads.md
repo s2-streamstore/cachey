@@ -195,6 +195,7 @@ contacting a backend.
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_download_latency_seconds` | Successful download latency, including admission and fallback |
+| `cachey_hedges_total` | Early hedges of successful downloads, by `phase`, `target`, and `outcome` |
 | `cachey_first_chunk_latency_seconds` | Handler time to first chunk, including cache lookup and coalescing |
 
 Latency gauges have a `phase` label: `first_byte`, `body`, or `request`. They are
@@ -208,7 +209,11 @@ since unfinished copies train nothing past their headers.
 
 `DownloadOutput` identifies the initial and winning buckets. `hedged` means copies
 overlapped, including rescue and recovery probes; `fallback` counts wins from
-another bucket.
+another bucket. `hedge` reports a download's early hedge, of which there is at most
+one, and `cachey_hedges_total` counts them by the primary's `bucket`: the `phase` it
+fired in (`first_byte` or `body`), whether it went to the primary's bucket or a peer
+(`target`), and whether its response was served (`outcome` of `won` or `lost`).
+Downloads that fail are not counted.
 
 `C0-Status` exposes the serving bucket and cache status. The first entry uses a
 response header. Later pages use HTTP/2 trailers; HTTP/1.1 reports only the first

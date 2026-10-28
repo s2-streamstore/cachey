@@ -8,7 +8,7 @@ use prometheus::{
 };
 
 use crate::{
-    object_store::{BucketMetrics, Predictions, QUANTILES, size_bands},
+    object_store::{BucketMetrics, Hedge, Predictions, QUANTILES, size_bands},
     types::{BucketName, ObjectKind},
 };
 
@@ -259,6 +259,22 @@ pub fn entry_request_count(kind: &ObjectKind, typ: EntryRequestType) {
     });
 
     COUNTER.with_label_values(&[&**kind, typ.as_label()]).inc();
+}
+
+pub fn hedge_count(kind: &ObjectKind, primary_bucket: &BucketName, hedge: Hedge) {
+    static COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "cachey_hedges_total",
+            "Early hedges of successful downloads, by the phase they fired in, whether they went to the primary's bucket, and whether they served the response",
+            &["kind", "bucket", "phase", "target", "outcome"]
+        )
+        .unwrap()
+    });
+
+    let [phase, target, outcome] = hedge.labels();
+    COUNTER
+        .with_label_values(&[&**kind, &**primary_bucket, phase, target, outcome])
+        .inc();
 }
 
 pub fn download_latency(kind: &ObjectKind, latency: std::time::Duration) {

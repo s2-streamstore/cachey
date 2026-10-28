@@ -27,6 +27,7 @@ use crate::{
 mod replicas;
 mod timeline;
 
+pub use timeline::HedgePhase;
 use timeline::{BucketDeadline, HedgeTimer};
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -194,6 +195,32 @@ pub struct DownloadOutput {
     pub latency: Duration,
     /// Whether an overlapping request was started, including deadline or recovery probes.
     pub hedged: bool,
+    /// The early hedge, if one started.
+    pub hedge: Option<Hedge>,
+}
+
+/// An early hedge: when it fired, where it went, and whether its response was served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hedge {
+    pub phase: HedgePhase,
+    /// Sent to the primary copy's bucket rather than a peer.
+    pub same_bucket: bool,
+    pub won: bool,
+}
+
+impl Hedge {
+    /// Phase, target, and outcome.
+    #[must_use]
+    pub fn labels(self) -> [&'static str; 3] {
+        [
+            match self.phase {
+                HedgePhase::FirstByte => "first_byte",
+                HedgePhase::Body => "body",
+            },
+            if self.same_bucket { "primary" } else { "peer" },
+            if self.won { "won" } else { "lost" },
+        ]
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -519,7 +546,7 @@ mod tests {
 
     use super::{
         BucketDeadline, BucketMetrics, DownloadError, DownloadLimits, DownloadOutput, Downloader,
-        RequestConfig, RequestTimeline, map_get_object_error,
+        Hedge, HedgePhase, RequestConfig, RequestTimeline, map_get_object_error,
     };
     use crate::{
         object_store::{
@@ -1510,6 +1537,14 @@ mod tests {
 
             let output = fetch(&downloader, &["bucket"]).await;
             assert!(output.hedged);
+            assert_eq!(
+                output.hedge,
+                Some(Hedge {
+                    phase: HedgePhase::Body,
+                    same_bucket: true,
+                    won: false,
+                })
+            );
             assert_eq!(output.latency, Duration::from_millis(150));
             assert_eq!(output.piece.data, Bytes::from_static(b"data"));
 
@@ -2604,6 +2639,14 @@ mod tests {
         let second = fetch(&downloader, &["bucket"]).await;
         assert_eq!(script.requests.load(Ordering::SeqCst), 3);
         assert!(second.hedged);
+        assert_eq!(
+            second.hedge,
+            Some(Hedge {
+                phase: HedgePhase::FirstByte,
+                same_bucket: true,
+                won: true,
+            })
+        );
         // The hedge waits 1.25 times the 10 ms p95, rounded up to the timer's millisecond.
         assert_eq!(second.latency, Duration::from_millis(113));
     }
