@@ -31,16 +31,15 @@ pub fn size_bands() -> impl Iterator<Item = u64> {
     (0..u64::BITS / 2).map(band_bytes)
 }
 
-/// A band's median latency at its median size, with its p95 and p99 as multiples of it.
+/// A band's median, p95, and p99 at its median size.
 #[derive(Debug, Clone, Copy)]
 struct Point {
     bytes: f64,
-    median: f64,
-    tail_ratios: [f64; 2],
+    micros: [f64; 3],
 }
 
-/// Latency by size: medians joined by straight segments, flat below the first point and
-/// extended beyond the last at `slope`, with tail ratios interpolated alongside.
+/// Latency by size: quantiles joined by straight segments and flat below the first point.
+/// Beyond the last, the median grows at `slope` and the tails keep their ratios to it.
 #[derive(Debug, Clone)]
 struct Curve {
     points: Arc<[Point]>,
@@ -55,31 +54,27 @@ impl Curve {
         if bytes > self.largest_bytes && self.slope * self.largest_bytes as f64 <= TIMER_MICROS {
             return None;
         }
-        let (median, tail_ratios) = interpolate(&self.points, self.slope, bytes as f64);
-        Some(quantiles(median, tail_ratios))
+        Some(interpolate(&self.points, self.slope, bytes as f64))
     }
 }
 
-fn interpolate(points: &[Point], slope: f64, size: f64) -> (f64, [f64; 2]) {
+fn interpolate(points: &[Point], slope: f64, size: f64) -> [f64; 3] {
     let next = points.partition_point(|point| point.bytes < size);
-    let (median, tail_ratios) = match (points[..next].last(), points.get(next)) {
+    let micros = match (points[..next].last(), points.get(next)) {
         (Some(from), Some(to)) => {
             let along = (size - from.bytes) / (to.bytes - from.bytes);
-            let lerp = |from: f64, to: f64| from + (to - from) * along;
-            (
-                lerp(from.median, to.median),
-                [0, 1].map(|tail| lerp(from.tail_ratios[tail], to.tail_ratios[tail])),
-            )
+            std::array::from_fn(|quantile| {
+                from.micros[quantile] + (to.micros[quantile] - from.micros[quantile]) * along
+            })
         }
-        (None, Some(first)) => (first.median, first.tail_ratios),
-        (Some(last), None) => (last.median + slope * (size - last.bytes), last.tail_ratios),
-        (None, None) => (TIMER_MICROS, [1.0; 2]),
+        (None, Some(first)) => first.micros,
+        (Some(last), None) => {
+            let scale = 1.0 + slope * (size - last.bytes) / last.micros[0];
+            last.micros.map(|micros| micros * scale)
+        }
+        (None, None) => [TIMER_MICROS; 3],
     };
-    (median.max(TIMER_MICROS), tail_ratios)
-}
-
-fn quantiles(median: f64, tail_ratios: [f64; 2]) -> [f64; 3] {
-    [median, median * tail_ratios[0], median * tail_ratios[1]]
+    micros.map(|micros| micros.max(TIMER_MICROS))
 }
 
 /// How observations compared with the model in use when each arrived.
@@ -253,8 +248,7 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
         .zip(medians)
         .map(|(samples, median)| Point {
             bytes: weighted_median(samples, |sample| sample.bytes as f64, &mut values),
-            median,
-            tail_ratios: [1.0; 2],
+            micros: [median; 3],
         })
         .collect();
     let last = points[points.len() - 1];
@@ -275,16 +269,15 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
             0,
             Point {
                 bytes: 0.0,
-                median: TIMER_MICROS,
-                tail_ratios: [1.0; 2],
+                micros: [TIMER_MICROS; 3],
             },
         );
     }
     let segment = points.len().checked_sub(2).map_or(0.0, |previous| {
-        (last.median - points[previous].median) / (last.bytes - points[previous].bytes)
+        (last.micros[0] - points[previous].micros[0]) / (last.bytes - points[previous].bytes)
     });
     let slope = segment
-        .min(last.median / last.bytes)
+        .min(last.micros[0] / last.bytes)
         .min(halves_slope)
         .max(0.0);
     let offset = points.len() - bands.len();
@@ -294,18 +287,19 @@ fn curve(observations: &[Observation], proportional: bool) -> Curve {
         .map(|(samples, point)| {
             values.clear();
             values.extend(samples.iter().map(|sample| {
-                let expected = interpolate(&points, slope, sample.bytes as f64)
-                    .0
-                    .max(point.median);
+                let expected =
+                    interpolate(&points, slope, sample.bytes as f64)[0].max(point.micros[0]);
                 (sample.micros / expected, sample.weight)
             }));
             tail_ratios(&mut values)
         })
         .collect();
-    for (point, tail_ratios) in points[offset..].iter_mut().zip(own) {
-        point.tail_ratios = tail_ratios;
+    for (point, [p95, p99]) in points[offset..].iter_mut().zip(own) {
+        let median = point.micros[0];
+        point.micros = [median, median * p95, median * p99];
     }
-    points[0].tail_ratios = points[offset].tail_ratios;
+    let scale = points[0].micros[0] / points[offset].micros[0];
+    points[0].micros = points[offset].micros.map(|micros| micros * scale);
     Curve {
         points: points.into(),
         slope,
@@ -452,7 +446,7 @@ impl SizeHistogram {
                 .filter(|point| point.bytes > 0.0)
                 .map(|point| BandLatency {
                     bytes: band_bytes(band(point.bytes as u64)),
-                    quantiles: quantiles(point.median, point.tail_ratios).map(duration),
+                    quantiles: point.micros.map(duration),
                 })
                 .collect(),
             largest_bytes: curve.largest_bytes,
@@ -825,7 +819,7 @@ mod tests {
         }
 
         #[test]
-        fn medians_never_decrease_with_size_and_quantiles_never_cross(
+        fn quantiles_never_cross_or_exceed_the_bands_around_them(
             samples in collection::vec((1_u64..=16 * MIB, 1_000_u32..=1_000_000, 1_u8..=20), 1..60),
             sizes in collection::vec(1_u64..=32 * MIB, 1..20),
             proportional: bool,
@@ -851,12 +845,27 @@ mod tests {
                     }
                 }
             }
+            let points: Vec<_> = curve
+                .points
+                .iter()
+                .filter(|point| point.bytes > 0.0)
+                .map(|point| (point.bytes, curve.micros(point.bytes as u64).unwrap()))
+                .collect();
             let mut previous = 0.0;
             for bytes in sizes {
                 let Some(micros) = curve.micros(bytes) else { break };
                 prop_assert!(micros[0] <= micros[1] && micros[1] <= micros[2], "{micros:?} at {bytes}");
                 prop_assert!(micros[0] + 1e-6 >= previous, "{micros:?} after {previous} at {bytes}");
                 previous = micros[0];
+                let next = points.partition_point(|(point, _)| *point < bytes as f64);
+                if let (Some((_, from)), Some((_, to))) = (points[..next].last(), points.get(next)) {
+                    for quantile in 0..3 {
+                        prop_assert!(
+                            micros[quantile] <= from[quantile].max(to[quantile]) + 1e-6,
+                            "{micros:?} at {bytes} exceeds {from:?} and {to:?}"
+                        );
+                    }
+                }
             }
         }
     }

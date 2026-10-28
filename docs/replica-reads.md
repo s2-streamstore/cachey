@@ -68,7 +68,8 @@ A band's p95 and p99 are its median times those quantiles of each sample's laten
 relative to the median at the sample's size, and at least the band's own, so neither
 the band's largest sizes nor a step in latency below it set its tail. They come only
 from the band's own samples, so a stall or slow mode at one size never stretches
-another's, and are interpolated between points like medians.
+another's. Between points they are interpolated like medians, and beyond the last they
+keep their ratio to it.
 
 Latency need not grow in proportion to size. S3 Standard serves objects from a cache
 while their age times their size stays under about 50 MiB·s, with a first byte in
