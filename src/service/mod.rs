@@ -319,6 +319,13 @@ impl EntryGetExecutor {
                             metrics::EntryRequestType::Hedged,
                         );
                     }
+                    if let Some(hedge) = out.hedge {
+                        metrics::hedge_count(
+                            &self.request.kind,
+                            &self.request.buckets[out.primary_bucket_idx],
+                            hedge,
+                        );
+                    }
                     if out.primary_bucket_idx == 0 {
                         metrics::entry_request_count(
                             &self.request.kind,
