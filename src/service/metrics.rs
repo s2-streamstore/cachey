@@ -12,6 +12,15 @@ use crate::{
     types::{BucketName, ObjectKind},
 };
 
+static BAND_LABELS: LazyLock<Vec<(u64, String)>> = LazyLock::new(|| {
+    size_bands()
+        .map(|bytes| (bytes, bytes.to_string()))
+        .collect()
+});
+
+static QUANTILE_LABELS: LazyLock<[String; 3]> =
+    LazyLock::new(|| QUANTILES.map(|quantile| quantile.to_string()));
+
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     type BucketGauge = (GaugeVec, fn(&BucketMetrics) -> f64);
 
@@ -71,15 +80,13 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         let bands = estimate
             .as_ref()
             .map_or(&[][..], |estimate| &estimate.bands);
-        for bytes in size_bands() {
+        for (bytes, bytes_label) in &*BAND_LABELS {
             let quantiles = bands
                 .iter()
-                .find(|band| band.bytes == bytes)
+                .find(|band| band.bytes == *bytes)
                 .map(|band| band.quantiles);
-            let bytes = bytes.to_string();
-            for (index, quantile) in QUANTILES.iter().enumerate() {
-                let quantile = quantile.to_string();
-                let labels = [&**bucket, phase, bytes.as_str(), quantile.as_str()];
+            for (index, quantile) in QUANTILE_LABELS.iter().enumerate() {
+                let labels = [&**bucket, phase, bytes_label, quantile];
                 match quantiles {
                     Some(quantiles) => LATENCY
                         .with_label_values(&labels)
@@ -133,11 +140,11 @@ fn count_predictions(bucket: &BucketName, phase: &str, predictions: Predictions)
             predictions.observations,
         ),
         (
-            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILES[0].to_string()]),
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILE_LABELS[0]]),
             predictions.above_median,
         ),
         (
-            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILES[2].to_string()]),
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILE_LABELS[2]]),
             predictions.above_tail,
         ),
     ] {

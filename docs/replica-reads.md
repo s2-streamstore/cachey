@@ -17,9 +17,9 @@ median, scaled by a moving average of the last 32 successful reads relative to i
 by an excess from canceled copies. The moving average follows a shift in latency
 sooner than the model does, and since it is taken against the current median, a
 shift the model absorbs is not counted twice. Outside the range of sizes its model has
-observed, a bucket is ranked by the model's estimate: its last segment extended where
-latency grows measurably with size, or else its median at the largest size it has
-seen, since latency grows with size. An estimate can be far off, so there a peer never
+observed, a bucket is ranked by the model's estimate: below it, its smallest band's
+median; above it, its last segment extended where latency grows measurably with size,
+or else its median at the largest size it has seen, since latency grows with size. An estimate can be far off, so there a peer never
 ranks ahead of the first bucket, and reads of those sizes leave the moving average
 alone.
 

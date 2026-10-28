@@ -413,7 +413,9 @@ async fn assert_stalls_are_rescued(
     reports
 }
 
-/// Allow 1.5 nominal reads for the hedge delay plus one for the replacement, each cold.
+/// Allow 1.5 nominal reads for the hedge delay plus one for the replacement. Where reads of
+/// a size split between warm and cold objects, every read's hedge waits past the cold
+/// ones, so each nominal read allows for a cold object.
 fn hedged_read_ms(scenario: &Scenario, bytes: usize) -> u64 {
     let replica = &scenario.replicas[0];
     let cold_ms = replica

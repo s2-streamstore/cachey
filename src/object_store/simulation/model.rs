@@ -225,12 +225,15 @@ impl Scenario {
         eyre::ensure!(
             self.object_ages
                 .as_ref()
-                .is_none_or(|ages| ages.min_ms > 0 && ages.max_ms > ages.min_ms)
-                && (self.object_ages.is_some()
-                    || self
-                        .replicas
-                        .iter()
-                        .all(|replica| replica.hot_cache.is_none())),
+                .is_none_or(|ages| ages.min_ms > 0 && ages.max_ms > ages.min_ms),
+            "invalid object ages"
+        );
+        eyre::ensure!(
+            self.object_ages.is_some()
+                || self
+                    .replicas
+                    .iter()
+                    .all(|replica| replica.hot_cache.is_none()),
             "a replica with a hot cache needs object ages"
         );
         eyre::ensure!(

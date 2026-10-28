@@ -372,7 +372,6 @@ impl Followups<'_> {
                 )
             })?,
         };
-        let model = routing.model(index).clone();
         let overloaded = routing.all_overloaded();
         let retrying = !early && self.states.buckets[index].tried;
         // Hedges and retries never queue for admission, so a retry cannot spend a credit
@@ -402,7 +401,7 @@ impl Followups<'_> {
         self.started(index);
         Some(CopyAttempt {
             index,
-            model,
+            model: routing.model(index).clone(),
             is_primary: false,
             probe: None,
             permits,
