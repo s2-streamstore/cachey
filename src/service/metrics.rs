@@ -25,6 +25,13 @@ const PHASE: &str = "request";
 /// Median and p99, as indices into [`QUANTILES`].
 const REPORTED_QUANTILES: [usize; 2] = [0, 2];
 
+/// 1, 2.5, and 5 per decade, from cache hits under a millisecond to the default 10 s
+/// download timeout.
+const LATENCY_BUCKETS: [f64; 15] = [
+    0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+    10.0,
+];
+
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     type BucketGauge = (GaugeVec, fn(&BucketMetrics) -> f64);
 
@@ -304,9 +311,7 @@ pub fn download_latency(kind: &ObjectKind, latency: std::time::Duration) {
             "cachey_download_latency_seconds",
             "Successful download latency of a cache entry, including retries, hedging, and bucket fallback",
             &["kind"],
-            vec![
-                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
-            ]
+            LATENCY_BUCKETS.to_vec()
         )
         .unwrap()
     });
@@ -344,9 +349,7 @@ pub fn first_chunk_latency(kind: &ObjectKind, hit: bool, latency: Duration) {
             "cachey_first_chunk_latency_seconds",
             "Time to first chunk",
             &["kind", "hit"],
-            vec![
-                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
-            ]
+            LATENCY_BUCKETS.to_vec()
         )
         .unwrap()
     });
