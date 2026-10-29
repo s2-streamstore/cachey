@@ -172,14 +172,7 @@ pub fn fetch_request_bytes(kind: &ObjectKind, bytes: u64) {
             "cachey_fetch_request_bytes",
             "Number of bytes requested",
             &["kind"],
-            vec![
-                f64::from(512 * 1024),       // 512 KiB
-                f64::from(1024 * 1024),      // 1 MiB
-                f64::from(2 * 1024 * 1024),  // 2 MiB
-                f64::from(4 * 1024 * 1024),  // 4 MiB
-                f64::from(8 * 1024 * 1024),  // 8 MiB
-                f64::from(16 * 1024 * 1024), // 16 MiB
-            ]
+            vec![f64::from(64 << 10), f64::from(1 << 20), f64::from(16 << 20)]
         )
         .unwrap()
     });
