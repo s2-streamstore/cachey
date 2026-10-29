@@ -18,6 +18,12 @@ static SIZE_LABELS: LazyLock<[String; 4]> =
 static QUANTILE_LABELS: LazyLock<[String; 3]> =
     LazyLock::new(|| QUANTILES.map(|quantile| quantile.to_string()));
 
+/// Only the request model is reported; `phase` stays so existing queries keep matching.
+const PHASE: &str = "request";
+
+/// Median and p99, as indices into [`QUANTILES`].
+const REPORTED_QUANTILES: [usize; 2] = [0, 2];
+
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     type BucketGauge = (GaugeVec, fn(&BucketMetrics) -> f64);
 
@@ -69,48 +75,43 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     for (gauge, value) in &*GAUGES {
         gauge.with_label_values(&[bucket]).set(value(metrics));
     }
-    for (phase, estimate) in [
-        ("first_byte", &metrics.first_byte),
-        ("body", &metrics.body),
-        ("request", &metrics.request),
-    ] {
-        let sizes = estimate
-            .as_ref()
-            .map_or(&[][..], |estimate| &estimate.sizes);
-        for (bytes, bytes_label) in REPORTED_SIZES.iter().zip(&*SIZE_LABELS) {
-            let quantiles = sizes
-                .iter()
-                .find(|size| size.bytes == *bytes)
-                .map(|size| size.quantiles);
-            for (index, quantile) in QUANTILE_LABELS.iter().enumerate() {
-                let labels = [&**bucket, phase, bytes_label, quantile];
-                match quantiles {
-                    Some(quantiles) => LATENCY
-                        .with_label_values(&labels)
-                        .set(quantiles[index].as_secs_f64()),
-                    None => {
-                        let _ = LATENCY.remove_label_values(&labels);
-                    }
+    let sizes = metrics
+        .request
+        .as_ref()
+        .map_or(&[][..], |estimate| &estimate.sizes);
+    for (bytes, bytes_label) in REPORTED_SIZES.iter().zip(&*SIZE_LABELS) {
+        let quantiles = sizes
+            .iter()
+            .find(|size| size.bytes == *bytes)
+            .map(|size| size.quantiles);
+        for index in REPORTED_QUANTILES {
+            let labels = [&**bucket, PHASE, bytes_label, &QUANTILE_LABELS[index]];
+            match quantiles {
+                Some(quantiles) => LATENCY
+                    .with_label_values(&labels)
+                    .set(quantiles[index].as_secs_f64()),
+                None => {
+                    let _ = LATENCY.remove_label_values(&labels);
                 }
             }
         }
-        match estimate {
-            Some(estimate) => {
-                MODEL_BYTES
-                    .with_label_values(&[&**bucket, phase])
-                    .set(estimate.largest_bytes as f64);
-                count_predictions(bucket, phase, estimate.predictions);
-            }
-            None => {
-                let _ = MODEL_BYTES.remove_label_values(&[bucket, phase]);
-            }
+    }
+    match &metrics.request {
+        Some(estimate) => {
+            MODEL_BYTES
+                .with_label_values(&[&**bucket, PHASE])
+                .set(estimate.largest_bytes as f64);
+            count_predictions(bucket, estimate.predictions);
+        }
+        None => {
+            let _ = MODEL_BYTES.remove_label_values(&[bucket, PHASE]);
         }
     }
 }
 
 /// Advances counters to the cumulative totals of a bucket's statistics. Concurrent
 /// scrapes take turns, or each would add the same difference.
-fn count_predictions(bucket: &BucketName, phase: &str, predictions: Predictions) {
+fn count_predictions(bucket: &BucketName, predictions: Predictions) {
     static ADVANCING: Mutex<()> = Mutex::new(());
 
     static PREDICTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -133,15 +134,15 @@ fn count_predictions(bucket: &BucketName, phase: &str, predictions: Predictions)
 
     for (counter, total) in [
         (
-            PREDICTIONS.with_label_values(&[&**bucket, phase]),
+            PREDICTIONS.with_label_values(&[&**bucket, PHASE]),
             predictions.observations,
         ),
         (
-            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILE_LABELS[0]]),
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, PHASE, &QUANTILE_LABELS[0]]),
             predictions.above_median,
         ),
         (
-            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILE_LABELS[2]]),
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, PHASE, &QUANTILE_LABELS[2]]),
             predictions.above_tail,
         ),
     ] {
@@ -194,7 +195,7 @@ pub fn fetch_request_entries(kind: &ObjectKind, entries: usize) {
             "cachey_fetch_request_entries",
             "Number of cache entries a fetch spans: pages, or one exact range",
             &["kind"],
-            vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+            vec![1.0, 2.0, 4.0]
         )
         .unwrap()
     });
@@ -416,4 +417,76 @@ pub fn gather() -> Bytes {
     let mut buffer = BytesMut::new().writer();
     encoder.encode(&metric_families, &mut buffer).unwrap();
     buffer.into_inner().freeze()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{gather, set_bucket_stats};
+    use crate::{
+        object_store::{BucketMetrics, LatencyEstimate, Predictions, REPORTED_SIZES, SizeLatency},
+        types::BucketName,
+    };
+
+    #[test]
+    fn bucket_latency_exports_request_median_and_p99() {
+        let bucket = BucketName::new("exported-latency").unwrap();
+        set_bucket_stats(
+            &bucket,
+            &BucketMetrics {
+                error_rate: 0.0,
+                deprioritized: false,
+                consecutive_failures: 0,
+                recovery_successes: 0,
+                request: Some(LatencyEstimate {
+                    sizes: vec![SizeLatency {
+                        bytes: REPORTED_SIZES[0],
+                        quantiles: [1, 2, 3].map(Duration::from_millis),
+                    }],
+                    largest_bytes: REPORTED_SIZES[0],
+                    predictions: Predictions {
+                        observations: 10,
+                        above_median: 5,
+                        above_tail: 1,
+                    },
+                }),
+            },
+        );
+        let snapshot = gather();
+        let snapshot = std::str::from_utf8(&snapshot).unwrap();
+        let exported = |metric: &str| -> Vec<&str> {
+            snapshot
+                .lines()
+                .filter(|line| {
+                    line.starts_with(&format!("{metric}{{"))
+                        && line.contains(r#"bucket="exported-latency""#)
+                })
+                .collect()
+        };
+
+        for (metric, series) in [
+            ("cachey_bucket_latency_seconds", 2),
+            ("cachey_bucket_latency_model_bytes", 1),
+            ("cachey_bucket_latency_predictions_total", 1),
+            ("cachey_bucket_latency_predictions_exceeded_total", 2),
+        ] {
+            let lines = exported(metric);
+            assert_eq!(lines.len(), series, "{metric}: {lines:?}");
+            assert!(
+                lines.iter().all(|line| line.contains(r#"phase="request""#)),
+                "{metric}: {lines:?}"
+            );
+        }
+        let latency = exported("cachey_bucket_latency_seconds");
+        for (quantile, seconds) in [("0.5", "0.001"), ("0.99", "0.003")] {
+            assert!(
+                latency.iter().any(|line| {
+                    line.contains(&format!(r#"quantile="{quantile}""#))
+                        && line.ends_with(&format!(" {seconds}"))
+                }),
+                "{latency:?}"
+            );
+        }
+    }
 }
