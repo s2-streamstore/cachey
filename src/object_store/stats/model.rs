@@ -162,6 +162,16 @@ impl SizeModel {
             duration(p99.min(p95 * HEDGE_TAIL_CAP).min(median * HEDGE_MEDIAN_CAP))
         })
     }
+
+    /// At each of [`REPORTED_SIZES`] up to the largest retained size, so none is extrapolated.
+    pub fn reported_hedge_delays(&self) -> [Option<Duration>; 4] {
+        REPORTED_SIZES.map(|bytes| {
+            let curve = self.0.as_ref()?;
+            (bytes <= curve.largest_bytes)
+                .then(|| self.hedge_delay(bytes))
+                .flatten()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

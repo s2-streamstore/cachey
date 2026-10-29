@@ -18,7 +18,8 @@ static SIZE_LABELS: LazyLock<[String; 4]> =
 static QUANTILE_LABELS: LazyLock<[String; 3]> =
     LazyLock::new(|| QUANTILES.map(|quantile| quantile.to_string()));
 
-/// Only the request model is reported; `phase` stays so existing queries keep matching.
+/// Only the request model's latency is reported; `phase` stays so existing queries keep
+/// matching.
 const PHASE: &str = "request";
 
 /// Median and p99, as indices into [`QUANTILES`].
@@ -105,6 +106,35 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
         }
         None => {
             let _ = MODEL_BYTES.remove_label_values(&[bucket, PHASE]);
+        }
+    }
+    set_hedge_delays(bucket, metrics);
+}
+
+fn set_hedge_delays(bucket: &BucketName, metrics: &BucketMetrics) {
+    static HEDGE_DELAY: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_hedge_delay_seconds",
+            "Early hedge delay by the phase it fires in, at a read size in bytes",
+            &["bucket", "phase", "bytes"]
+        )
+        .unwrap()
+    });
+
+    for (phase, delays) in [
+        ("first_byte", &metrics.first_byte_hedge_delays),
+        ("body", &metrics.body_hedge_delays),
+    ] {
+        for (bytes_label, delay) in SIZE_LABELS.iter().zip(delays) {
+            let labels = [&**bucket, phase, bytes_label];
+            match delay {
+                Some(delay) => HEDGE_DELAY
+                    .with_label_values(&labels)
+                    .set(delay.as_secs_f64()),
+                None => {
+                    let _ = HEDGE_DELAY.remove_label_values(&labels);
+                }
+            }
         }
     }
 }

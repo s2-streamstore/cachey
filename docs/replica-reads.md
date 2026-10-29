@@ -197,14 +197,16 @@ contacting a backend.
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_download_latency_seconds` | Successful download latency, including admission and fallback |
+| `cachey_bucket_hedge_delay_seconds` | Early hedge delay by the `phase` it fires in (`first_byte` or `body`), at a read size (`bytes`) |
 | `cachey_hedges_total` | Early hedges of successful downloads, by `phase`, `target`, and `outcome` |
 | `cachey_first_chunk_latency_seconds` | Handler time to first chunk, including cache lookup and coalescing |
 
-Latency metrics report the request model, labeled `phase="request"`; the first-byte
-and body models are not exported. Gauges are absent until measured. Latency is reported at sizes 16 times apart, which keeps series
-fewer than the model's bands, and at a size only while the model retains a read at
-least that large, so no reported latency is extrapolated. Latencies exclude
-transmission to the client.
+Latency metrics report the request model, labeled `phase="request"`. The first-byte and
+body models are reported only through the hedge delays they set, at requested and body
+bytes respectively. Gauges are absent until measured. Latency and hedge delays are
+reported at sizes 16 times apart, which keeps series fewer than the model's bands, and
+at a size only while the model retains a read at least that large, so none is
+extrapolated. Latencies exclude transmission to the client.
 
 Prediction counters compare each observation that trains a model with the fit in use
 when it arrives. For an accurate model, half exceed the median and 1% exceed p99.
