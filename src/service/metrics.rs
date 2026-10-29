@@ -172,7 +172,7 @@ pub fn fetch_request_bytes(kind: &ObjectKind, bytes: u64) {
             "cachey_fetch_request_bytes",
             "Number of bytes requested",
             &["kind"],
-            exponential_buckets(f64::from(16 << 10), 4.0, 6).unwrap()
+            exponential_buckets(f64::from(4 << 10), 4.0, 7).unwrap()
         )
         .unwrap()
     });
