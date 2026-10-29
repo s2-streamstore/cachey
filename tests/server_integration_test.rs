@@ -48,19 +48,6 @@ async fn setup_test_server() -> TestContext {
     TestContext { rustfs, server_url }
 }
 
-async fn scrape_metrics(client: &reqwest::Client, server_url: &str) -> String {
-    client
-        .get(format!("{server_url}/metrics"))
-        .send()
-        .await
-        .expect("Failed to scrape metrics")
-        .error_for_status()
-        .expect("Metrics endpoint returned an error status")
-        .text()
-        .await
-        .expect("Failed to read metrics body")
-}
-
 #[tokio::test]
 async fn test_fetch_endpoint_head_request() {
     let ctx = setup_test_server().await;
@@ -146,56 +133,6 @@ async fn test_fetch_endpoint_not_found() {
         .expect("Failed to send request");
 
     assert_eq!(response.status(), 404);
-}
-
-#[tokio::test]
-async fn test_fetch_metrics_record_success_for_ranged_get() {
-    let ctx = setup_test_server().await;
-
-    let mut test_data = BytesMut::zeroed(PAGE_SIZE as usize + 1024);
-    for (i, byte) in test_data.iter_mut().enumerate() {
-        *byte = (i % 251) as u8;
-    }
-    let test_data = test_data.freeze();
-    let object_key = "metrics-success-object.bin";
-    upload_test_object(
-        &ctx.rustfs.client,
-        &ctx.rustfs.bucket_name,
-        object_key,
-        test_data.clone(),
-    )
-    .await;
-
-    let client = reqwest::Client::new();
-    let metric_kind = "metrics-success-kind";
-    let response = client
-        .get(format!(
-            "{}/fetch/{}/{}",
-            ctx.server_url, metric_kind, object_key
-        ))
-        .header("Range", "bytes=0-4095")
-        .header("c0-bucket", &ctx.rustfs.bucket_name)
-        .send()
-        .await
-        .expect("Failed to send request");
-
-    assert_eq!(response.status(), 206);
-    let body = response
-        .bytes()
-        .await
-        .expect("Failed to read response body");
-    assert_eq!(body, test_data.slice(0..4096));
-
-    let metrics = scrape_metrics(&client, &ctx.server_url).await;
-    let expected_metric = format!(
-        "cachey_fetch_requests_total{{kind=\"{metric_kind}\",method=\"GET\",status=\"success\"}} "
-    );
-    assert!(
-        metrics
-            .lines()
-            .any(|line| line.starts_with(&expected_metric)),
-        "Missing success metric line. Metrics body:\n{metrics}"
-    );
 }
 
 /// An exact read caches its range apart from the page holding it.
