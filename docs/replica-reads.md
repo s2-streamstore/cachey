@@ -190,21 +190,23 @@ contacting a backend.
 
 | Measurement | Meaning |
 |-------------|---------|
-| `cachey_bucket_latency_seconds` | Median, p95, or p99 (`quantile`) at a read size (`bytes`) of 4 KiB, 64 KiB, 1 MiB, or 16 MiB |
+| `cachey_bucket_latency_seconds` | Median or p99 (`quantile`) at a read size (`bytes`) of 4 KiB, 64 KiB, 1 MiB, or 16 MiB |
 | `cachey_bucket_latency_model_bytes` | Largest size retained by the model |
 | `cachey_bucket_latency_predictions_total` | Observations at sizes the model predicted |
 | `cachey_bucket_latency_predictions_exceeded_total` | Those slower than the predicted median (`quantile="0.5"`) or p99 (`quantile="0.99"`) |
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
 | `cachey_bucket_deprioritized` | Reduced bucket preference |
 | `cachey_download_latency_seconds` | Successful download latency, including admission and fallback |
+| `cachey_bucket_hedge_delay_seconds` | Early hedge delay by the `phase` it fires in (`first_byte` or `body`), at a read size (`bytes`) |
 | `cachey_hedges_total` | Early hedges of successful downloads, by `phase`, `target`, and `outcome` |
 | `cachey_first_chunk_latency_seconds` | Handler time to first chunk, including cache lookup and coalescing |
 
-Latency gauges have a `phase` label: `first_byte`, `body`, or `request`. They are
-absent until measured. Latency is reported at sizes 16 times apart, which keeps series
-fewer than the model's bands, and at a size only while the model retains a read at
-least that large, so no reported latency is extrapolated. Latencies exclude
-transmission to the client.
+Latency metrics report the request model, labeled `phase="request"`. The first-byte and
+body models are reported only through the hedge delays they set, at requested and body
+bytes respectively. Gauges are absent until measured. Latency and hedge delays are
+reported at sizes 16 times apart, which keeps series fewer than the model's bands, and
+at a size only while the model retains a read at least that large, so none is
+extrapolated. Latencies exclude transmission to the client.
 
 Prediction counters compare each observation that trains a model with the fit in use
 when it arrives. For an accurate model, half exceed the median and 1% exceed p99.

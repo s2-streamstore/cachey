@@ -40,12 +40,12 @@ pub struct BucketMetrics {
     pub deprioritized: bool,
     pub consecutive_failures: u32,
     pub recovery_successes: u32,
-    /// Request start through validated headers, by requested bytes, including SDK retries.
-    pub first_byte: Option<LatencyEstimate>,
-    /// Validated headers through the end of the body, by response bytes.
-    pub body: Option<LatencyEstimate>,
     /// Request start through body validation, by requested bytes, including SDK retries.
     pub request: Option<LatencyEstimate>,
+    /// Early hedge delays at [`REPORTED_SIZES`] of requested bytes, before response headers.
+    pub first_byte_hedge_delays: [Option<Duration>; 4],
+    /// Early hedge delays at [`REPORTED_SIZES`] of body bytes, after response headers.
+    pub body_hedge_delays: [Option<Duration>; 4],
 }
 
 fn decay(rate: f64, elapsed: Duration) -> f64 {
@@ -870,9 +870,13 @@ impl BucketedStats {
                     deprioritized: stats.deprioritized,
                     consecutive_failures: stats.consecutive_failures,
                     recovery_successes: stats.recovery_successes,
-                    first_byte: stats.estimates.first_byte.estimate(),
-                    body: stats.estimates.body.estimate(),
                     request: stats.estimates.request.estimate(),
+                    first_byte_hedge_delays: stats
+                        .estimates
+                        .first_byte
+                        .model()
+                        .reported_hedge_delays(),
+                    body_hedge_delays: stats.estimates.body.model().reported_hedge_delays(),
                 };
                 (entry.key().clone(), metrics)
             })

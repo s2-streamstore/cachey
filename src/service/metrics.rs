@@ -3,8 +3,8 @@ use std::{sync::LazyLock, time::Duration};
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 use prometheus::{
-    Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, TextEncoder, register_gauge_vec,
-    register_histogram_vec, register_int_counter_vec, register_int_gauge,
+    Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, TextEncoder, exponential_buckets,
+    register_gauge_vec, register_histogram_vec, register_int_counter_vec, register_int_gauge,
 };
 
 use crate::{
@@ -17,6 +17,13 @@ static SIZE_LABELS: LazyLock<[String; 4]> =
 
 static QUANTILE_LABELS: LazyLock<[String; 3]> =
     LazyLock::new(|| QUANTILES.map(|quantile| quantile.to_string()));
+
+/// Only the request model's latency is reported; `phase` stays so existing queries keep
+/// matching.
+const PHASE: &str = "request";
+
+/// Median and p99, as indices into [`QUANTILES`].
+const REPORTED_QUANTILES: [usize; 2] = [0, 2];
 
 pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     type BucketGauge = (GaugeVec, fn(&BucketMetrics) -> f64);
@@ -69,40 +76,64 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
     for (gauge, value) in &*GAUGES {
         gauge.with_label_values(&[bucket]).set(value(metrics));
     }
-    for (phase, estimate) in [
-        ("first_byte", &metrics.first_byte),
-        ("body", &metrics.body),
-        ("request", &metrics.request),
-    ] {
-        let sizes = estimate
-            .as_ref()
-            .map_or(&[][..], |estimate| &estimate.sizes);
-        for (bytes, bytes_label) in REPORTED_SIZES.iter().zip(&*SIZE_LABELS) {
-            let quantiles = sizes
-                .iter()
-                .find(|size| size.bytes == *bytes)
-                .map(|size| size.quantiles);
-            for (index, quantile) in QUANTILE_LABELS.iter().enumerate() {
-                let labels = [&**bucket, phase, bytes_label, quantile];
-                match quantiles {
-                    Some(quantiles) => LATENCY
-                        .with_label_values(&labels)
-                        .set(quantiles[index].as_secs_f64()),
-                    None => {
-                        let _ = LATENCY.remove_label_values(&labels);
-                    }
+    let sizes = metrics
+        .request
+        .as_ref()
+        .map_or(&[][..], |estimate| &estimate.sizes);
+    for (bytes, bytes_label) in REPORTED_SIZES.iter().zip(&*SIZE_LABELS) {
+        let quantiles = sizes
+            .iter()
+            .find(|size| size.bytes == *bytes)
+            .map(|size| size.quantiles);
+        for index in REPORTED_QUANTILES {
+            let labels = [&**bucket, PHASE, bytes_label, &QUANTILE_LABELS[index]];
+            match quantiles {
+                Some(quantiles) => LATENCY
+                    .with_label_values(&labels)
+                    .set(quantiles[index].as_secs_f64()),
+                None => {
+                    let _ = LATENCY.remove_label_values(&labels);
                 }
             }
         }
-        match estimate {
-            Some(estimate) => {
-                MODEL_BYTES
-                    .with_label_values(&[&**bucket, phase])
-                    .set(estimate.largest_bytes as f64);
-                count_predictions(bucket, phase, estimate.predictions);
-            }
-            None => {
-                let _ = MODEL_BYTES.remove_label_values(&[bucket, phase]);
+    }
+    match &metrics.request {
+        Some(estimate) => {
+            MODEL_BYTES
+                .with_label_values(&[&**bucket, PHASE])
+                .set(estimate.largest_bytes as f64);
+            count_predictions(bucket, estimate.predictions);
+        }
+        None => {
+            let _ = MODEL_BYTES.remove_label_values(&[bucket, PHASE]);
+        }
+    }
+    set_hedge_delays(bucket, metrics);
+}
+
+fn set_hedge_delays(bucket: &BucketName, metrics: &BucketMetrics) {
+    static HEDGE_DELAY: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "cachey_bucket_hedge_delay_seconds",
+            "Early hedge delay by the phase it fires in, at a read size in bytes",
+            &["bucket", "phase", "bytes"]
+        )
+        .unwrap()
+    });
+
+    for (phase, delays) in [
+        ("first_byte", &metrics.first_byte_hedge_delays),
+        ("body", &metrics.body_hedge_delays),
+    ] {
+        for (bytes_label, delay) in SIZE_LABELS.iter().zip(delays) {
+            let labels = [&**bucket, phase, bytes_label];
+            match delay {
+                Some(delay) => HEDGE_DELAY
+                    .with_label_values(&labels)
+                    .set(delay.as_secs_f64()),
+                None => {
+                    let _ = HEDGE_DELAY.remove_label_values(&labels);
+                }
             }
         }
     }
@@ -110,7 +141,7 @@ pub fn set_bucket_stats(bucket: &BucketName, metrics: &BucketMetrics) {
 
 /// Advances counters to the cumulative totals of a bucket's statistics. Concurrent
 /// scrapes take turns, or each would add the same difference.
-fn count_predictions(bucket: &BucketName, phase: &str, predictions: Predictions) {
+fn count_predictions(bucket: &BucketName, predictions: Predictions) {
     static ADVANCING: Mutex<()> = Mutex::new(());
 
     static PREDICTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -133,15 +164,15 @@ fn count_predictions(bucket: &BucketName, phase: &str, predictions: Predictions)
 
     for (counter, total) in [
         (
-            PREDICTIONS.with_label_values(&[&**bucket, phase]),
+            PREDICTIONS.with_label_values(&[&**bucket, PHASE]),
             predictions.observations,
         ),
         (
-            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILE_LABELS[0]]),
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, PHASE, &QUANTILE_LABELS[0]]),
             predictions.above_median,
         ),
         (
-            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, phase, &QUANTILE_LABELS[2]]),
+            PREDICTIONS_EXCEEDED.with_label_values(&[&**bucket, PHASE, &QUANTILE_LABELS[2]]),
             predictions.above_tail,
         ),
     ] {
@@ -171,14 +202,7 @@ pub fn fetch_request_bytes(kind: &ObjectKind, bytes: u64) {
             "cachey_fetch_request_bytes",
             "Number of bytes requested",
             &["kind"],
-            vec![
-                f64::from(512 * 1024),       // 512 KiB
-                f64::from(1024 * 1024),      // 1 MiB
-                f64::from(2 * 1024 * 1024),  // 2 MiB
-                f64::from(4 * 1024 * 1024),  // 4 MiB
-                f64::from(8 * 1024 * 1024),  // 8 MiB
-                f64::from(16 * 1024 * 1024), // 16 MiB
-            ]
+            exponential_buckets(f64::from(4 << 10), 4.0, 7).unwrap()
         )
         .unwrap()
     });
@@ -194,7 +218,7 @@ pub fn fetch_request_entries(kind: &ObjectKind, entries: usize) {
             "cachey_fetch_request_entries",
             "Number of cache entries a fetch spans: pages, or one exact range",
             &["kind"],
-            vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+            vec![1.0, 2.0, 4.0]
         )
         .unwrap()
     });
