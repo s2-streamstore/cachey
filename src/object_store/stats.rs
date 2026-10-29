@@ -690,9 +690,9 @@ impl RoutingSnapshot {
                 continue;
             }
             let mut stats = snapshot.stats.lock();
-            let stale = snapshot.median.is_some()
-                && now.duration_since(stats.last_outcome) >= RECOVERY_INTERVAL;
             // The first bucket is always worth rechecking; others only if they may win.
+            let stale = (index == 0 || snapshot.median.is_some())
+                && now.duration_since(stats.last_outcome) >= RECOVERY_INTERVAL;
             if (stats.deprioritized || stale)
                 && !stats.probing
                 && stats.active == 0
@@ -1331,6 +1331,28 @@ mod tests {
         for (bucket, millis) in buckets.iter().zip([60, 20, 25]) {
             stats.seed_latency(bucket, millis);
         }
+        advance(RECOVERY_INTERVAL).await;
+        let (index, probe) = snapshot(&stats, &buckets).primary(Duration::from_secs(1));
+        assert_eq!(index, 0);
+        assert!(probe.is_some());
+    }
+
+    /// Likewise a first bucket that only canceled copies have made look slow, since only a
+    /// read can clear their routing latency.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_unmeasured_first_bucket_is_probed() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for bucket in buckets.iter().skip(1) {
+            stats.seed_latency(bucket, 100);
+        }
+        let timeline = RequestTimeline::default();
+        let canceled = begin(&stats, &buckets[0], None, &timeline);
+        advance(Duration::from_secs(2)).await;
+        drop(canceled);
+        let (index, probe) = snapshot(&stats, &buckets).primary(Duration::from_secs(1));
+        assert_eq!(index, 1);
+        assert!(probe.is_none());
         advance(RECOVERY_INTERVAL).await;
         let (index, probe) = snapshot(&stats, &buckets).primary(Duration::from_secs(1));
         assert_eq!(index, 0);
