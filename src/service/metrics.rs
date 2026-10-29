@@ -3,8 +3,8 @@ use std::{sync::LazyLock, time::Duration};
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 use prometheus::{
-    Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, TextEncoder, register_gauge_vec,
-    register_histogram_vec, register_int_counter_vec, register_int_gauge,
+    Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, TextEncoder, exponential_buckets,
+    register_gauge_vec, register_histogram_vec, register_int_counter_vec, register_int_gauge,
 };
 
 use crate::{
@@ -172,7 +172,7 @@ pub fn fetch_request_bytes(kind: &ObjectKind, bytes: u64) {
             "cachey_fetch_request_bytes",
             "Number of bytes requested",
             &["kind"],
-            vec![f64::from(64 << 10), f64::from(1 << 20), f64::from(16 << 20)]
+            exponential_buckets(f64::from(16 << 10), 4.0, 6).unwrap()
         )
         .unwrap()
     });
