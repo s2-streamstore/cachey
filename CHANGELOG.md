@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2](https://github.com/s2-streamstore/cachey/compare/0.13.1...0.13.2) - 2026-10-29
+
+### Added
+
+- *(service)* resolve millisecond latencies in download and first chunk histograms ([#207](https://github.com/s2-streamstore/cachey/pull/207))
+- *(service)* report hedge delays in place of raw phase latency ([#206](https://github.com/s2-streamstore/cachey/pull/206))
+
+### Fixed
+
+- *(object_store)* probe a stale first bucket before it has a median ([#204](https://github.com/s2-streamstore/cachey/pull/204))
+
 ## [0.13.1](https://github.com/s2-streamstore/cachey/compare/0.13.0...0.13.1) - 2026-10-28
 
 ### Added
