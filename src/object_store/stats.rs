@@ -336,7 +336,7 @@ impl BucketStats {
                 _ => None,
             };
             match ratio {
-                _ if read.probe && ratio.unwrap_or(1.0) < factor => ratio.unwrap_or(1.0),
+                Some(ratio) if read.probe && ratio < factor => ratio,
                 Some(ratio) => factor * (1.0 - LATENCY_ALPHA) + ratio * LATENCY_ALPHA,
                 None => factor,
             }
@@ -1139,6 +1139,29 @@ mod tests {
             true,
         );
         assert_eq!(best(&stats, &buckets, Duration::from_secs(1)), Some(0));
+    }
+
+    /// A recovery probe at a size the model has not observed has no ratio to lower the
+    /// routing factor with.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_at_an_unobserved_size_leaves_the_routing_factor_alone() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for _ in 0..12 {
+            stats.seed_latency(&buckets[0], 10);
+        }
+        stats.model(&buckets[0]);
+        for _ in 0..20 {
+            stats.seed_latency(&buckets[0], 30);
+        }
+        let entry = stats.entry(&buckets[0]);
+        let before = entry.lock().routing_factor();
+        assert!(before > 1.5, "{before}");
+        entry
+            .lock()
+            .record(Instant::now(), &Sample::from_millis(10, 16 * MIB, 0), true);
+        let after = entry.lock().routing_factor();
+        assert!((after - before).abs() < 1e-9, "{before} became {after}");
     }
 
     #[tokio::test(start_paused = true)]
