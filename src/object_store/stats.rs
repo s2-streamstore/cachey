@@ -658,7 +658,6 @@ impl RoutingSnapshot {
             .unwrap_or_default()
             .min(limits.bucket_timeout)
             .min(download_budget);
-        let overloaded = self.buckets.iter().any(|bucket| bucket.overloaded);
         let mut remaining = total.mul_f64(scale);
         // Convert reservations to launch delays in place, retaining each destination.
         for (after, index) in &mut schedule {
@@ -666,7 +665,9 @@ impl RoutingSnapshot {
             let latest_start = download_budget.saturating_sub(reserve);
             let planned = download_budget.saturating_sub(remaining).max(primary_tail);
             let expected = self.tail(*index).unwrap_or(reserve);
-            *after = if !overloaded && planned.saturating_add(expected) >= download_budget {
+            *after = if !self.overloaded(*index)
+                && planned.saturating_add(expected) >= download_budget
+            {
                 planned.min(latest_start)
             } else {
                 planned
@@ -1616,6 +1617,22 @@ mod tests {
             .collect::<Vec<_>>();
         advance(Duration::from_millis(500)).await;
         assert_eq!(best(&stats, &buckets, Duration::from_secs(10)), Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_overloaded_primary_does_not_delay_rescues_past_the_deadline() {
+        let stats = BucketedStats::default();
+        let buckets = buckets();
+        for bucket in buckets.iter() {
+            stats.seed_latency(bucket, 4_000);
+        }
+        let timeline = RequestTimeline::default();
+        begin(&stats, &buckets[0], None, &timeline).complete(Outcome::Overload);
+        let routing = snapshot(&stats, &buckets);
+        let budget = DownloadLimits::default().download_timeout;
+        for (after, index) in routing.rescue_schedule(0, false) {
+            assert!(after + routing.tail(index).unwrap() < budget);
+        }
     }
 
     #[tokio::test(start_paused = true)]
