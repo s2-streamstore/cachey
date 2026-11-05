@@ -276,7 +276,7 @@ pub async fn fetch(
         BucketNameSet::new(buckets.into_iter()).expect("non-empty set")
     };
 
-    debug!(%kind, %object, ?buckets, ?byterange, "processing");
+    debug!(%kind, ?object, ?buckets, ?byterange, "processing");
 
     metrics::fetch_request_count(&kind, &method, "start");
 
