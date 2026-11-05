@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.4](https://github.com/s2-streamstore/cachey/compare/0.13.3...0.13.4) - 2026-11-05
+
+### Fixed
+
+- *(service)* escape object keys in the fetch request log ([#214](https://github.com/s2-streamstore/cachey/pull/214))
+- *(object_store)* gate the rescue deadline clamp on the rescue's own bucket ([#213](https://github.com/s2-streamstore/cachey/pull/213))
+
+### Other
+
+- *(deps)* upgrade dependencies ([#215](https://github.com/s2-streamstore/cachey/pull/215))
+
 ## [0.13.3](https://github.com/s2-streamstore/cachey/compare/0.13.2...0.13.3) - 2026-11-03
 
 ### Fixed
