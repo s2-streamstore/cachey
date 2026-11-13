@@ -3,3 +3,8 @@
 #   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo +nightly update -p <crate> --precise <version>
 # A full `cargo update` reverts these until they age out, so re-run the targeted update after it.
 # Remove entries once they are older than the cooldown.
+
+[[exception]]
+crate = "axum-server"
+version = "0.9.2"
+advisory = "not a security release; taken early by maintainer decision after reviewing the 0.8.0 to 0.9.2 changes"
