@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.5](https://github.com/s2-streamstore/cachey/compare/0.13.4...0.13.5) - 2026-11-13
+
+### Added
+
+- *(server)* log accept errors and enable TCP keepalive ([#221](https://github.com/s2-streamstore/cachey/pull/221))
+
+### Fixed
+
+- *(server)* set TCP_NODELAY on accepted connections ([#218](https://github.com/s2-streamstore/cachey/pull/218))
+
+### Other
+
+- *(deps)* upgrade dependencies ([#220](https://github.com/s2-streamstore/cachey/pull/220))
+
 ## [0.13.4](https://github.com/s2-streamstore/cachey/compare/0.13.3...0.13.4) - 2026-11-05
 
 ### Fixed
