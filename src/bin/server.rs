@@ -16,10 +16,10 @@ use bytesize::ByteSize;
 use cachey::{
     cache::{CacheConfig, DiskCacheConfig, DiskCacheKind},
     object_store::DownloadLimits,
-    service::{CacheyService, ServiceConfig, on_accept_error},
+    service::{CacheyService, ServiceConfig},
 };
 use clap::{ArgAction, Args as ArgGroup, Parser};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 #[derive(ArgGroup, Debug)]
 struct DiskCacheGroup {
@@ -195,6 +195,15 @@ async fn main() -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+fn on_accept_error(remote_addr: Option<&SocketAddr>, error: &std::io::Error) {
+    if let Some(remote_addr) = remote_addr {
+        // Health checks and scanners make failed TLS handshakes routine.
+        debug!(%remote_addr, %error, "connection setup failed");
+    } else {
+        warn!(%error, "failed to accept connection");
+    }
 }
 
 fn tcp_socket_config() -> TcpSocketConfig {
