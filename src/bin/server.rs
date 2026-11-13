@@ -4,7 +4,10 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use axum_server::tls_rustls::RustlsConfig;
+use axum_server::{
+    accept::NoDelayAcceptor,
+    tls_rustls::{RustlsAcceptor, RustlsConfig},
+};
 use bytesize::ByteSize;
 use cachey::{
     cache::{CacheConfig, DiskCacheConfig, DiskCacheKind},
@@ -150,6 +153,8 @@ async fn main() -> eyre::Result<()> {
         .await?
         .into_router();
 
+    // Nagle can hold the small frame that ends an HTTP/2 response until the client's delayed ACK,
+    // which adds 40ms or more to the request.
     match (args.tls.tls_self, args.tls.tls_cert, args.tls.tls_key) {
         (false, Some(cert_path), Some(key_path)) => {
             info!(
@@ -158,7 +163,8 @@ async fn main() -> eyre::Result<()> {
                 "starting https server with provided certificate"
             );
             let rustls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
-            axum_server::bind_rustls(addr.parse()?, rustls_config)
+            axum_server::bind(addr.parse()?)
+                .acceptor(RustlsAcceptor::new(rustls_config).acceptor(NoDelayAcceptor::new()))
                 .handle(server_handle)
                 .serve(app.into_make_service())
                 .await?;
@@ -178,7 +184,8 @@ async fn main() -> eyre::Result<()> {
                 signing_key.serialize_pem().into_bytes(),
             )
             .await?;
-            axum_server::bind_rustls(addr.parse()?, rustls_config)
+            axum_server::bind(addr.parse()?)
+                .acceptor(RustlsAcceptor::new(rustls_config).acceptor(NoDelayAcceptor::new()))
                 .handle(server_handle)
                 .serve(app.into_make_service())
                 .await?;
@@ -186,6 +193,7 @@ async fn main() -> eyre::Result<()> {
         (false, None, None) => {
             info!(addr, "starting plain http server");
             axum_server::bind(addr.parse()?)
+                .acceptor(NoDelayAcceptor::new())
                 .handle(server_handle)
                 .serve(app.into_make_service())
                 .await?;
