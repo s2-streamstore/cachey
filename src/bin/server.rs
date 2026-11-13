@@ -2,17 +2,21 @@
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use axum_server::{
-    accept::NoDelayAcceptor,
+    accept::{TcpConfigAcceptor, TcpKeepaliveConfig, TcpSocketConfig},
     tls_rustls::{RustlsAcceptor, RustlsConfig},
 };
 use bytesize::ByteSize;
 use cachey::{
     cache::{CacheConfig, DiskCacheConfig, DiskCacheKind},
     object_store::DownloadLimits,
-    service::{CacheyService, ServiceConfig},
+    service::{CacheyService, ServiceConfig, on_accept_error},
 };
 use clap::{ArgAction, Args as ArgGroup, Parser};
 use tracing::info;
@@ -134,16 +138,37 @@ async fn main() -> eyre::Result<()> {
     let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let s3_client = aws_sdk_s3::Client::new(&aws_config);
 
-    let addr = {
-        let port = args.port.unwrap_or_else(|| {
-            if args.tls.tls_self || args.tls.tls_cert.is_some() {
-                443
-            } else {
-                80
-            }
-        });
-        format!("0.0.0.0:{port}")
+    let rustls_config = match (args.tls.tls_self, args.tls.tls_cert, args.tls.tls_key) {
+        (false, Some(cert_path), Some(key_path)) => {
+            info!(?cert_path, "using provided TLS certificate");
+            Some(RustlsConfig::from_pem_file(cert_path, key_path).await?)
+        }
+        (true, None, None) => {
+            info!("using self-signed TLS certificate, clients will need to use --insecure");
+            let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed([
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "::1".to_string(),
+            ])?;
+            Some(
+                RustlsConfig::from_pem(
+                    cert.pem().into_bytes(),
+                    signing_key.serialize_pem().into_bytes(),
+                )
+                .await?,
+            )
+        }
+        (false, None, None) => None,
+        _ => {
+            // This shouldn't happen due to clap validation...
+            return Err(eyre::eyre!("Invalid TLS configuration"));
+        }
     };
+
+    let port = args
+        .port
+        .unwrap_or(if rustls_config.is_some() { 443 } else { 80 });
+    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
 
     let server_handle = axum_server::Handle::new();
 
@@ -153,58 +178,38 @@ async fn main() -> eyre::Result<()> {
         .await?
         .into_router();
 
-    // Nagle can hold the small frame that ends an HTTP/2 response until the client's delayed ACK,
-    // which adds 40ms or more to the request.
-    match (args.tls.tls_self, args.tls.tls_cert, args.tls.tls_key) {
-        (false, Some(cert_path), Some(key_path)) => {
-            info!(
-                addr,
-                ?cert_path,
-                "starting https server with provided certificate"
-            );
-            let rustls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
-            axum_server::bind(addr.parse()?)
-                .acceptor(RustlsAcceptor::new(rustls_config).acceptor(NoDelayAcceptor::new()))
-                .handle(server_handle)
-                .serve(app.into_make_service())
-                .await?;
-        }
-        (true, None, None) => {
-            info!(
-                addr,
-                "starting https server with self-signed certificate, clients will need to use --insecure"
-            );
-            let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed([
-                "localhost".to_string(),
-                "127.0.0.1".to_string(),
-                "::1".to_string(),
-            ])?;
-            let rustls_config = RustlsConfig::from_pem(
-                cert.pem().into_bytes(),
-                signing_key.serialize_pem().into_bytes(),
-            )
+    let server = axum_server::bind(addr)
+        .handle(server_handle)
+        .accept_error_handler(on_accept_error);
+    let tcp_acceptor = TcpConfigAcceptor::new(tcp_socket_config());
+    let make_service = app.into_make_service();
+    if let Some(rustls_config) = rustls_config {
+        info!(%addr, "starting https server");
+        server
+            .acceptor(RustlsAcceptor::new(rustls_config).acceptor(tcp_acceptor))
+            .serve(make_service)
             .await?;
-            axum_server::bind(addr.parse()?)
-                .acceptor(RustlsAcceptor::new(rustls_config).acceptor(NoDelayAcceptor::new()))
-                .handle(server_handle)
-                .serve(app.into_make_service())
-                .await?;
-        }
-        (false, None, None) => {
-            info!(addr, "starting plain http server");
-            axum_server::bind(addr.parse()?)
-                .acceptor(NoDelayAcceptor::new())
-                .handle(server_handle)
-                .serve(app.into_make_service())
-                .await?;
-        }
-        _ => {
-            // This shouldn't happen due to clap validation...
-            return Err(eyre::eyre!("Invalid TLS configuration"));
-        }
+    } else {
+        info!(%addr, "starting plain http server");
+        server.acceptor(tcp_acceptor).serve(make_service).await?;
     }
 
     Ok(())
+}
+
+fn tcp_socket_config() -> TcpSocketConfig {
+    TcpSocketConfig::new()
+        // Nagle can hold the small frame that ends an HTTP/2 response until the client's delayed
+        // ACK, which adds 40ms or more to the request.
+        .nodelay(true)
+        // Nothing else closes an idle connection whose client vanished without closing it, such as
+        // when its host dies or a NAT drops the flow, so it would hold a task and file descriptor.
+        .keepalive(
+            TcpKeepaliveConfig::new()
+                .time(Duration::from_secs(60))
+                .interval(Duration::from_secs(10))
+                .retries(3),
+        )
 }
 
 async fn shutdown_signal(handle: axum_server::Handle<SocketAddr>) {

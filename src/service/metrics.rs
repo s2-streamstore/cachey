@@ -343,6 +343,21 @@ pub fn set_connection_count(count: usize) {
     CONNECTION_COUNT.set(count as i64);
 }
 
+pub fn accept_error(stage: &'static str, kind: std::io::ErrorKind) {
+    static COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "cachey_accept_errors_total",
+            "Connections that failed before serving a request, by where they failed and the I/O error kind",
+            &["stage", "kind"]
+        )
+        .unwrap()
+    });
+
+    COUNTER
+        .with_label_values(&[stage, &format!("{kind:?}")])
+        .inc();
+}
+
 pub fn first_chunk_latency(kind: &ObjectKind, hit: bool, latency: Duration) {
     static HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec!(

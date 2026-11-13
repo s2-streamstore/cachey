@@ -16,6 +16,7 @@ use foyer::Source;
 use futures::{Stream, StreamExt};
 use itertools::Either;
 use parking_lot::Mutex;
+use tracing::warn;
 
 mod metrics;
 mod throughput;
@@ -106,6 +107,22 @@ pub struct FetchRequest {
     /// Fetch and cache the byte range as one entry instead of as the pages it spans.
     pub exact: bool,
     pub config: RequestConfig,
+}
+
+/// Handles connections that fail before serving a request, for
+/// [`axum_server::Server::accept_error_handler`].
+///
+/// Listener failures, such as running out of file descriptors, are logged. Failures setting up an
+/// accepted connection, such as in the TLS handshake, are only counted, because health checks and
+/// scanners make them routine.
+pub fn on_accept_error(remote_addr: Option<&SocketAddr>, error: &std::io::Error) {
+    let stage = if remote_addr.is_some() {
+        "connection"
+    } else {
+        warn!(%error, "failed to accept connection");
+        "listener"
+    };
+    metrics::accept_error(stage, error.kind());
 }
 
 #[derive(Clone)]
