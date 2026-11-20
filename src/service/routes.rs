@@ -121,21 +121,30 @@ where
             .to_str()
             .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid Range header encoding"))?;
 
-        let parsed = http_range_header::parse_range_header(range_header)
-            .map_err(|_| (StatusCode::RANGE_NOT_SATISFIABLE, "Invalid range format"))?;
+        let parsed =
+            http_range_header::parse_range_header_with_max_ranges(range_header, NonZeroUsize::MIN)
+                .map_err(|err| match err {
+                    http_range_header::RangeUnsatisfiableError::Rejected(
+                        http_range_header::RangeRejected::TooMany,
+                    ) => (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        "Multiple ranges are not supported",
+                    ),
+                    _ => (StatusCode::RANGE_NOT_SATISFIABLE, "Invalid range format"),
+                })?;
 
-        if parsed.ranges.len() != 1 {
+        let ranges = parsed.into_ranges();
+        let [range] = ranges.as_slice() else {
             return Err((
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "Multiple ranges are not supported",
             ));
-        }
+        };
 
-        let byterange = match (parsed.ranges[0].start, parsed.ranges[0].end) {
-            (
-                http_range_header::StartPosition::Index(first_byte),
-                http_range_header::EndPosition::Index(last_byte),
-            ) if first_byte <= last_byte && last_byte < super::MAX_RANGE_END => {
+        let byterange = match *range {
+            http_range_header::SyntacticallyCorrectRange::Indexed(first_byte, last_byte)
+                if first_byte <= last_byte && last_byte < super::MAX_RANGE_END =>
+            {
                 first_byte..(last_byte + 1)
             }
             _ => return Err((StatusCode::RANGE_NOT_SATISFIABLE, "Unsupported range")),
@@ -561,6 +570,27 @@ mod tests {
                     Err(StatusCode::RANGE_NOT_SATISFIABLE)
                 }
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn range_header_rejects_multiple_and_unsupported_ranges() {
+        for (header, expected_message) in [
+            ("bytes=0-1, 2-3", "Multiple ranges are not supported"),
+            ("bytes=0-", "Unsupported range"),
+            ("bytes=-10", "Unsupported range"),
+            ("bytes=10-5", "Invalid range format"),
+            ("bytes=invalid", "Invalid range format"),
+        ] {
+            let request = Request::builder()
+                .header(header::RANGE, header)
+                .body(())
+                .unwrap();
+            let (mut parts, ()) = request.into_parts();
+            let err = ReadRange::from_request_parts(&mut parts, &())
+                .await
+                .unwrap_err();
+            assert_eq!(err, (StatusCode::RANGE_NOT_SATISFIABLE, expected_message));
         }
     }
 
