@@ -348,6 +348,7 @@ pub fn error_name(error: &DownloadError) -> &'static str {
         DownloadError::InvalidObjectState(_) => "invalid_object_state",
         DownloadError::NoSuchKey => "missing",
         DownloadError::RangeNotSatisfied { .. } => "range",
+        DownloadError::ObjectTooLarge { .. } => "object_too_large",
         DownloadError::BodyStreaming(_) => "body",
         DownloadError::InvalidResponse(_) => "invalid_response",
         DownloadError::Overloaded(_) => "overloaded",

@@ -33,6 +33,9 @@ pub const PAGE_SIZE: u64 = 16 * 1024 * 1024;
 
 pub const MAX_RANGE_END: u64 = PAGE_SIZE * (PageId::MAX as u64 + 1);
 
+/// Largest object size supported by the disk cache header (40-bit unsigned).
+pub const MAX_OBJECT_SIZE: u64 = MAX_RANGE_END - 1;
+
 fn page_id_for_byte_offset(byte_offset: u64) -> PageId {
     (byte_offset / PAGE_SIZE) as PageId
 }
@@ -191,19 +194,32 @@ impl CacheyService {
         assert!(byterange.end <= MAX_RANGE_END);
         assert!(!request.exact || byterange.end - byterange.start <= PAGE_SIZE);
 
+        let initial_error = if let Some(object_size) = request.object_size
+            && object_size > MAX_OBJECT_SIZE
+        {
+            Some(Err(ServiceError::Download(DownloadError::ObjectTooLarge {
+                object_size,
+                max_object_size: MAX_OBJECT_SIZE,
+            })))
+        } else {
+            None
+        };
+
         let end = byterange.end.min(request.object_size.unwrap_or(u64::MAX));
-        let entries = (byterange.start < end).then(|| {
+        let entries = (initial_error.is_none() && byterange.start < end).then(|| {
             if request.exact {
                 Either::Left(iter::once(byterange.clone()))
             } else {
                 Either::Right(pagerange(&(byterange.start..end)).map(page_byterange))
             }
         });
-        let past_end = entries.is_none().then(|| {
-            Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
-                requested: byterange.clone(),
-                object_size: request.object_size,
-            }))
+        let initial_error = initial_error.or_else(|| {
+            entries.is_none().then(|| {
+                Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
+                    requested: byterange.clone(),
+                    object_size: request.object_size,
+                }))
+            })
         });
 
         metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
@@ -218,7 +234,7 @@ impl CacheyService {
             request,
         });
 
-        futures::stream::iter(past_end).chain(
+        futures::stream::iter(initial_error).chain(
             futures::stream::iter(entries.into_iter().flatten())
                 .map(move |range| executor.clone().execute(range, self.cache.clone()))
                 .buffered(concurrency.get())
@@ -401,7 +417,8 @@ mod tests {
     use futures::TryStreamExt;
 
     use super::{
-        CacheyService, FetchRequest, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange,
+        CacheyService, FetchRequest, MAX_OBJECT_SIZE, PAGE_SIZE, ServiceConfig, ServiceError,
+        metrics, pagerange,
     };
     use crate::{
         cache::{CacheConfig, CacheKey, CacheValue},
@@ -837,5 +854,33 @@ mod tests {
         }
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_known_object_size_exceeding_max_object_size() {
+        let service = service("http://unused.invalid", ByteSize::mib(16)).await;
+        let result = service
+            .get(
+                FetchRequest {
+                    kind: ObjectKind::new("oversized-object").unwrap(),
+                    object: ObjectKey::new("object").unwrap(),
+                    buckets: BucketName::new("bucket").unwrap().into(),
+                    byterange: 0..4,
+                    object_size: Some(MAX_OBJECT_SIZE + 1),
+                    exact: false,
+                    config: RequestConfig::default(),
+                },
+                NonZeroUsize::MIN,
+            )
+            .try_collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ServiceError::Download(DownloadError::ObjectTooLarge {
+                object_size,
+                max_object_size,
+            })) if object_size == MAX_OBJECT_SIZE + 1 && max_object_size == MAX_OBJECT_SIZE
+        ));
     }
 }

@@ -20,7 +20,7 @@ use crate::{
         config::{DownloadLimits, RequestConfig},
         stats::{BucketedStats, LatencyModel, Outcome, ProbePermit, RequestTimeline},
     },
-    service::SlidingThroughput,
+    service::{MAX_OBJECT_SIZE, SlidingThroughput},
     types::{BucketName, BucketNameSet, ObjectKey},
 };
 
@@ -40,6 +40,11 @@ pub enum DownloadError {
     RangeNotSatisfied {
         requested: Range<u64>,
         object_size: Option<u64>,
+    },
+    #[error("Object size {object_size} exceeds maximum supported size {max_object_size}")]
+    ObjectTooLarge {
+        object_size: u64,
+        max_object_size: u64,
     },
     #[error("Invalid object-store response: {0}")]
     InvalidResponse(String),
@@ -78,6 +83,7 @@ impl DownloadError {
             Self::InvalidObjectState(_)
             | Self::NoSuchKey
             | Self::RangeNotSatisfied { .. }
+            | Self::ObjectTooLarge { .. }
             | Self::InvalidResponse(_)
             | Self::BodyStreaming(_)
             | Self::Overloaded(_)
@@ -89,7 +95,10 @@ impl DownloadError {
     /// Another copy from the same bucket would return the same error.
     fn repeats_within_bucket(&self) -> bool {
         match self {
-            Self::InvalidObjectState(_) | Self::NoSuchKey | Self::RangeNotSatisfied { .. } => true,
+            Self::InvalidObjectState(_)
+            | Self::NoSuchKey
+            | Self::RangeNotSatisfied { .. }
+            | Self::ObjectTooLarge { .. } => true,
             Self::InvalidResponse(_)
             | Self::BodyStreaming(_)
             | Self::Overloaded(_)
@@ -390,6 +399,14 @@ impl Downloader {
         object_size: Option<u64>,
         req_config: &RequestConfig,
     ) -> Result<DownloadOutput, DownloadError> {
+        if let Some(object_size) = object_size
+            && object_size > MAX_OBJECT_SIZE
+        {
+            return Err(DownloadError::ObjectTooLarge {
+                object_size,
+                max_object_size: MAX_OBJECT_SIZE,
+            });
+        }
         let end = byterange.end.min(object_size.unwrap_or(u64::MAX));
         if byterange.start >= end {
             return Err(DownloadError::RangeNotSatisfied {
@@ -484,9 +501,15 @@ impl Downloader {
         {
             return Err(invalid_range());
         }
+        let object_size = content_range.complete_length;
+        if object_size > MAX_OBJECT_SIZE {
+            return Err(DownloadError::ObjectTooLarge {
+                object_size,
+                max_object_size: MAX_OBJECT_SIZE,
+            });
+        }
         let expected_data_len = expected_end - req_range.start;
         timeline.receive_headers(expected_data_len);
-        let object_size = content_range.complete_length;
         let mtime = output
             .last_modified()
             .and_then(|dt| dt.secs().try_into().ok())
@@ -565,7 +588,7 @@ mod tests {
             admission::MIN_WAIT,
             stats::{LatencyModel, Outcome, Sample},
         },
-        service::SlidingThroughput,
+        service::{MAX_OBJECT_SIZE, SlidingThroughput},
         types::{BucketName, BucketNameSet, ObjectKey},
     };
 
@@ -833,6 +856,50 @@ mod tests {
             .expect("excess data must be rejected without waiting for the rest of the body");
             assert!(matches!(result, Err(DownloadError::InvalidResponse(_))));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejects_objects_exceeding_max_object_size() {
+        let downloader = downloader([]);
+        let output = GetObjectOutput::builder()
+            .content_range(format!("bytes 0-3/{}", MAX_OBJECT_SIZE + 1))
+            .body(ByteStream::new(SdkBody::from_body_1_x(StreamBody::new(
+                stream::pending::<Result<Frame<Bytes>, io::Error>>(),
+            ))))
+            .build();
+        let result = timeout(
+            Duration::from_millis(1),
+            downloader.read_response(&(0..4), output, &RequestTimeline::default()),
+        )
+        .await
+        .expect("oversized object must be rejected before reading the body");
+        assert!(matches!(
+            result,
+            Err(DownloadError::ObjectTooLarge {
+                object_size,
+                max_object_size,
+            }) if object_size == MAX_OBJECT_SIZE + 1 && max_object_size == MAX_OBJECT_SIZE
+        ));
+
+        let at_limit = GetObjectOutput::builder()
+            .content_range(format!("bytes 0-3/{MAX_OBJECT_SIZE}"))
+            .body(ByteStream::from_static(b"data"))
+            .build();
+        let piece = downloader
+            .read_response(&(0..4), at_limit, &RequestTimeline::default())
+            .await
+            .expect("MAX_OBJECT_SIZE is supported");
+        assert_eq!(piece.object_size, MAX_OBJECT_SIZE);
+
+        let result = fetch_range(
+            &downloader,
+            &["primary"],
+            0..4,
+            Some(MAX_OBJECT_SIZE + 1),
+            &RequestConfig::default(),
+        )
+        .await;
+        assert!(matches!(result, Err(DownloadError::ObjectTooLarge { .. })));
     }
 
     #[test]
