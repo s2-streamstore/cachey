@@ -165,8 +165,9 @@ pub(super) struct LatencyModel {
 impl LatencyModel {
     /// Timeouts affect health only after allowing time for each phase reached, using
     /// `unmeasured` for unknown phases. Unless both phases are measured, the request
-    /// model is a floor; when both are measured, the request model caps their sum
-    /// unless a single phase's tail exceeds it.
+    /// model is a floor. When both are measured and the body tail fits within the
+    /// request tail, the request model caps their sum (keeping at least the first-byte
+    /// tail); when the body tail exceeds it, the full phase sum is preserved.
     pub fn timeout_allowance(
         &self,
         requested_bytes: u64,
@@ -182,10 +183,13 @@ impl LatencyModel {
             .request
             .tail(requested_bytes.max(announced_body_bytes.unwrap_or(0)));
         match (first_byte, body) {
-            (Some(first_byte), Some(Some(body))) => {
-                request.map_or(reached, |tail| reached.min(tail.max(first_byte).max(body)))
-            }
-            _ => request.map_or(reached, |tail| tail.max(reached)),
+            (Some(first_byte), Some(Some(body))) => match request {
+                Some(tail) if body <= tail => reached.min(tail.max(first_byte)),
+                _ => reached,
+            },
+            _ => request
+                .or_else(|| self.request.tail(requested_bytes))
+                .map_or(reached, |tail| tail.max(reached)),
         }
     }
 }
@@ -580,6 +584,15 @@ struct BucketSnapshot {
     overloaded: bool,
 }
 
+/// A deadline rescue planned from the download's initial routing snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct ScheduledRescue {
+    pub after: Duration,
+    pub index: usize,
+    /// Feasibility budget to re-check against when this rescue fires.
+    pub budget: Duration,
+}
+
 /// Bucket state for routing one request size.
 pub(super) struct RoutingSnapshot {
     buckets: Vec<BucketSnapshot>,
@@ -615,13 +628,13 @@ impl RoutingSnapshot {
             .min_by(|left, right| self.compare(*left, *right, remaining))
     }
 
-    pub fn rescue_schedule(&self, primary: usize, probing: bool) -> VecDeque<(Duration, usize)> {
+    pub fn rescue_schedule(&self, primary: usize, probing: bool) -> VecDeque<ScheduledRescue> {
         let limits = self.limits;
         let download_budget = limits.download_timeout;
         let unknown_latency = limits.bucket_share(self.buckets.len());
         let reserve_budget = download_budget / 3 * 2;
-        let mut schedule = Vec::with_capacity(self.buckets.len());
-        schedule.extend((0..self.buckets.len()).filter_map(|index| {
+        let mut planned_reserves = Vec::with_capacity(self.buckets.len());
+        planned_reserves.extend((0..self.buckets.len()).filter_map(|index| {
             if index == primary || !self.feasible(index, download_budget) {
                 return None;
             }
@@ -637,17 +650,30 @@ impl RoutingSnapshot {
                 .min(download_budget);
             Some((reserve, index))
         }));
-        schedule
+        planned_reserves
             .sort_unstable_by(|(_, left), (_, right)| self.compare(*left, *right, download_budget));
-        let backup = schedule.first().filter(|_| probing).map(|(_, index)| {
-            let grace = self
-                .tail(*index)
-                .unwrap_or(unknown_latency)
-                .saturating_mul(2)
-                .max(Duration::from_millis(1));
-            (grace.min(download_budget), *index)
-        });
-        let total = schedule
+        let backup = planned_reserves
+            .first()
+            .filter(|_| probing)
+            .map(|(_, index)| {
+                let grace = self
+                    .tail(*index)
+                    .unwrap_or(unknown_latency)
+                    .saturating_mul(2)
+                    .max(Duration::from_millis(1));
+                let after = grace.min(download_budget);
+                let budget = if self.overloaded(*index) {
+                    download_budget
+                } else {
+                    download_budget.saturating_sub(after)
+                };
+                ScheduledRescue {
+                    after,
+                    index: *index,
+                    budget,
+                }
+            });
+        let total = planned_reserves
             .iter()
             .map(|(reserve, _)| *reserve)
             .fold(Duration::ZERO, Duration::saturating_add);
@@ -662,19 +688,27 @@ impl RoutingSnapshot {
             .min(limits.bucket_timeout)
             .min(download_budget);
         let mut remaining = total.mul_f64(scale);
-        // Convert reservations to launch delays in place, retaining each destination.
-        for (after, index) in &mut schedule {
-            let reserve = *after;
+        let mut schedule = Vec::with_capacity(planned_reserves.len() + usize::from(probing));
+        for (reserve, index) in planned_reserves {
             let latest_start = download_budget.saturating_sub(reserve);
             let planned = download_budget.saturating_sub(remaining).max(primary_tail);
-            let expected = self.tail(*index).unwrap_or(reserve);
-            *after = if !self.overloaded(*index)
-                && planned.saturating_add(expected) >= download_budget
-            {
+            let expected = self.tail(index).unwrap_or(reserve);
+            let overloaded = self.overloaded(index);
+            let after = if !overloaded && planned.saturating_add(expected) >= download_budget {
                 planned.min(latest_start)
             } else {
                 planned
             };
+            let budget = if overloaded {
+                download_budget
+            } else {
+                download_budget.saturating_sub(after)
+            };
+            schedule.push(ScheduledRescue {
+                after,
+                index,
+                budget,
+            });
             remaining = remaining.saturating_sub(reserve.mul_f64(scale));
         }
         schedule.extend(backup);
@@ -1529,7 +1563,44 @@ mod tests {
         assert_eq!(model.body.tail(page), Some(Duration::from_millis(600)));
         assert_eq!(
             model.timeout_allowance(page, Some(page), Duration::from_millis(100)),
-            Duration::from_millis(600)
+            Duration::from_millis(620)
+        );
+
+        // Slow unfinished headers can lift first_byte above request; the cap still holds
+        // at first_byte rather than adding body on top.
+        let stats = BucketedStats::default();
+        stats.seed(&bucket, Sample::from_millis(10, 4, 10));
+        let timeline = RequestTimeline::default();
+        timeline.start();
+        let unfinished = begin(&stats, &bucket, None, &timeline);
+        advance(Duration::from_millis(495)).await;
+        timeline.receive_headers(4);
+        drop(unfinished);
+        advance(LATENCY_SNAPSHOT_INTERVAL).await;
+        let model = stats.model(&bucket);
+        assert_eq!(model.first_byte.tail(4), Some(Duration::from_millis(495)));
+        assert_eq!(model.body.tail(4), Some(Duration::from_millis(10)));
+        assert_eq!(model.request.tail(4), Some(Duration::from_millis(20)));
+        assert_eq!(
+            model.timeout_allowance(4, Some(4), Duration::from_millis(100)),
+            Duration::from_millis(495)
+        );
+
+        // An understated requested size whose announced body is past a flat request
+        // model's reach still preserves the requested-size floor in the unmeasured branch.
+        let stats = BucketedStats::default();
+        for bytes in [4096, 65_536] {
+            for _ in 0..4 {
+                stats.seed(&bucket, Sample::from_millis(10, bytes, 200));
+            }
+        }
+        let model = stats.model(&bucket);
+        assert_eq!(model.request.tail(page), None);
+        assert_eq!(model.request.tail(4096), Some(Duration::from_millis(210)));
+        assert_eq!(model.body.tail(page), None);
+        assert_eq!(
+            model.timeout_allowance(4096, Some(page), Duration::from_millis(20)),
+            Duration::from_millis(210)
         );
     }
 
@@ -1673,8 +1744,8 @@ mod tests {
         begin(&stats, &buckets[0], None, &timeline).complete(Outcome::Overload);
         let routing = snapshot(&stats, &buckets);
         let budget = DownloadLimits::default().download_timeout;
-        for (after, index) in routing.rescue_schedule(0, false) {
-            assert!(after + routing.tail(index).unwrap() < budget);
+        for rescue in routing.rescue_schedule(0, false) {
+            assert!(rescue.after + routing.tail(rescue.index).unwrap() < budget);
         }
     }
 

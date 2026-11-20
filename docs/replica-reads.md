@@ -22,7 +22,7 @@ A bucket's routing latency at a read's size is:
 - **Measured buckets:** the request model's median at that size, scaled by a **recent moving average** and a **cancellation excess**.
   - The moving average tracks the last 32 successful reads (at sizes within the model's observed range) relative to the model's *current* median at each read's size. It reacts to latency shifts before the next model refit without double-counting shifts the model has already absorbed.
   - Outside the model's observed size range, the bucket uses its estimate (flat below the smallest band; extended along the last segment above the largest where latency grows measurably with size, or else the largest observed band's median). Because extrapolations can be far off, reads outside the observed range do not update the moving average, and a peer never ranks ahead of the first bucket there.
-- **Unmeasured buckets:** start at zero and rise directly from canceled copies until the first completed read succeeds.
+- **Unmeasured buckets:** start at zero for the first bucket and rise directly from canceled copies until the first completed read succeeds; unmeasured peers are floored at the first bucket's routing latency before locality adjustment, so an unmeasured peer never outranks the first bucket.
 
 Two live signals push traffic off a slowing bucket before timeouts accumulate:
 
@@ -79,7 +79,7 @@ Copies to the same bucket share a single **bucket deadline** starting at that bu
 - **Early hedges:** at most one early hedge is launched per download, timed from the primary's request start (first-byte model at requested size) and then from header arrival (body model at announced size). If the header hedge is blocked by admission or budget, the body phase can still fire.
   - Delay is `min(p99, 1.25 × p95, 5 × median)`. Following p95 avoids hedging a bimodal slow mode above 5% of reads (such as S3 Standard cold objects, where a second copy waits on the same backend fetch), while the 5× median cap still rescues stalls above 5% of reads (cold reads are ~4× warm). Health, rescue, and retry decisions use uncapped p99.
   - Early hedges use a single SDK attempt, skip overloaded buckets, never wait for admission, and prefer an untried feasible peer; otherwise they hedge against the primary's bucket if more than its [timeout allowance](#timeout-allowance) remains on the bucket deadline.
-- **Deadline rescues:** at download start, untried feasible replicas are given staggered launch delays (consuming up to two-thirds of `download_timeout`, plus a grace-timed backup when probing) so a stalled primary does not exhaust the download deadline. Non-overloaded rescues are pulled earlier when needed to finish before the deadline; overloaded rescues keep their staggered time. When a rescue timer fires, it re-checks fresh feasibility against `remaining` (or `download_timeout` if the target is overloaded) before launching.
+- **Deadline rescues:** at download start, untried feasible replicas are given staggered launch delays (consuming up to two-thirds of `download_timeout`, plus a grace-timed backup when probing) so a stalled primary does not exhaust the download deadline. Non-overloaded rescues are pulled earlier when needed to finish before the deadline; overloaded rescues keep their staggered time. Each scheduled rescue carries its schedule-time feasibility budget (`download_timeout - after` when scheduled healthy, or `download_timeout` when scheduled overloaded) and re-checks fresh feasibility against that budget when its timer fires.
 - **Fallbacks and body retries:** when a copy fails with a retryable error, the download falls back to the best untried bucket (even if historically infeasible). Once no other copy is active and no untried bucket remains, a `BodyStreaming` failure may be retried once against a failed bucket that still has more than its [timeout allowance](#timeout-allowance) left on its bucket deadline, without waiting for admission.
 
 ### Timeout allowance
@@ -87,8 +87,8 @@ Copies to the same bucket share a single **bucket deadline** starting at that bu
 A copy's timeout allowance governs timeout health verdicts, stall thresholds (`4×`), admission queueing patience, and whether a later copy to the same bucket has enough time left:
 
 - Each reached phase allows its uncapped p99, or half of `min(bucket_share, bucket_timeout)` when unmeasured (where `bucket_share = download_timeout / bucket_count`).
-- Before both phases are measured, the request model's p99 is a floor.
-- Once both `first_byte` and `body` tails are measured, their sum is capped by `max(request.tail, first_byte.tail, body.tail)` (querying `request` at `max(requested_bytes, announced_body_bytes)`). This keeps anticorrelated or independent phase tails aligned with `request.tail` and `bucket_timeout` while still allowing small announced bodies on page reads to tighten below `request.tail` and rare or extrapolated large bodies to keep `body.tail`.
+- Before both phases are measured, the request model's p99 at `max(requested_bytes, announced_body_bytes)`—falling back to `requested_bytes` if the larger size is beyond the model's reach—is a floor.
+- Once both `first_byte` and `body` tails are measured, if `body.tail <= request.tail` (at `max(requested_bytes, announced_body_bytes)`), their sum is capped at `max(request.tail, first_byte.tail)`. This keeps anticorrelated or independent phase tails aligned with `request.tail` and `bucket_timeout` and lets small announced bodies on page reads tighten below `request.tail`, while rare or extrapolated large bodies (`body.tail > request.tail`) preserve the full `first_byte.tail + body.tail` sum.
 
 ### Attempt budgets
 

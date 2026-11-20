@@ -2800,11 +2800,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn rescues_skip_destinations_that_become_infeasible_after_scheduling() {
-        for (degraded_ms, overloaded, launches) in [
-            (60_000, false, false),
-            (60_000, true, false),
-            (300, false, false),
-            (300, true, true),
+        for (degraded_ms, scheduled_overloaded, fire_overloaded, launches) in [
+            (60_000, false, false, false),
+            (60_000, true, true, false),
+            (300, false, false, false),
+            (300, false, true, false),
+            (300, true, true, true),
         ] {
             let (downloader, script) = scripted_downloader([
                 ("local", 0, 1_000, false),
@@ -2822,6 +2823,9 @@ mod tests {
             for (bucket, millis) in [("local", 10), ("peer", 60), ("third", 150)] {
                 seed_latency(&downloader, bucket, millis);
             }
+            if scheduled_overloaded {
+                record_outcome(&downloader, "third", Outcome::Overload);
+            }
             let config = RequestConfig::default();
             let (result, ()) = tokio::join!(
                 fetch_with_config(&downloader, &["local", "peer", "third"], &config),
@@ -2830,7 +2834,7 @@ mod tests {
                     for _ in 0..4 {
                         seed_latency(&downloader, "third", degraded_ms);
                     }
-                    if overloaded {
+                    if fire_overloaded {
                         record_outcome(&downloader, "third", Outcome::Overload);
                     }
                     let tail = model(&downloader, "third").request.tail(4).unwrap();
@@ -2846,16 +2850,44 @@ mod tests {
             } else {
                 assert!(
                     matches!(result, Err(DownloadError::Timeout { .. })),
-                    "degraded: {degraded_ms}ms, overloaded: {overloaded}: {result:?}"
+                    "degraded: {degraded_ms}ms, scheduled_overloaded: {scheduled_overloaded}, fire_overloaded: {fire_overloaded}: {result:?}"
                 );
                 assert_eq!(
                     script.requests.load(Ordering::SeqCst),
                     2,
-                    "degraded: {degraded_ms}ms, overloaded: {overloaded}"
+                    "degraded: {degraded_ms}ms, scheduled_overloaded: {scheduled_overloaded}, fire_overloaded: {fire_overloaded}"
                 );
             }
             assert_eq!(script.active.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_overloaded_rescue_keeps_its_schedule_time_budget_after_overload_expires() {
+        let (downloader, script) = scripted_downloader([
+            ("local", 0, 4_000, false),
+            ("peer", 0, 4_000, false),
+            ("third", 0, 500, false),
+        ]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                bucket_timeout: Duration::from_secs(3),
+                download_timeout: Duration::from_secs(3),
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        for bucket in ["local", "peer", "third"] {
+            seed_latency(&downloader, bucket, 1_500);
+        }
+        // Overloaded at schedule time, so third is staggered to 2 s (1 s remaining < 1.5 s tail).
+        // Overload expires after 1 s, before the rescue fires, yet the rescue still launches.
+        record_outcome(&downloader, "third", Outcome::Overload);
+        let output = fetch(&downloader, &["local", "peer", "third"]).await;
+        assert_eq!(output.used_bucket_idx, 2);
+        assert_eq!(output.latency, Duration::from_millis(2_500));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
