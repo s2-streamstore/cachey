@@ -24,7 +24,7 @@ use crate::{
     object_store::{
         admission::DownloadPermit,
         budget::HedgePermit,
-        stats::{LatencyModel, ProbePermit, RoutingSnapshot},
+        stats::{LatencyModel, ProbePermit, RoutingSnapshot, ScheduledRescue},
     },
     types::{BucketNameSet, ObjectKey},
 };
@@ -271,20 +271,20 @@ impl ReplicaRequest<'_> {
     }
 }
 
-/// Completes with the bucket whose rescue timer fires next, or never once none remain.
-async fn next_rescue(rescues: &mut VecDeque<(Duration, usize)>, start: Instant) -> usize {
-    let Some(&(after, index)) = rescues.front() else {
+/// Completes with the rescue whose timer fires next, or never once none remain.
+async fn next_rescue(rescues: &mut VecDeque<ScheduledRescue>, start: Instant) -> ScheduledRescue {
+    let Some(&rescue) = rescues.front() else {
         return std::future::pending().await;
     };
-    sleep_until(start + after).await;
+    sleep_until(start + rescue.after).await;
     rescues.pop_front();
-    index
+    rescue
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Trigger {
     Fallback,
-    Rescue(usize),
+    Rescue(ScheduledRescue),
     Hedge(HedgePhase),
 }
 
@@ -331,8 +331,8 @@ impl Followups<'_> {
     /// Prefer untried buckets. Retry a failed body only after other copies finish,
     /// at most once per download and within the retry budget.
     fn next(&mut self, trigger: Trigger, idle: bool) -> Option<CopyAttempt> {
-        if let Trigger::Rescue(index) = trigger
-            && self.states.buckets[index].tried
+        if let Trigger::Rescue(rescue) = trigger
+            && self.states.buckets[rescue.index].tried
         {
             return None;
         }
@@ -353,7 +353,9 @@ impl Followups<'_> {
         );
         let untried = |index: usize| !self.states.buckets[index].tried;
         let index = match trigger {
-            Trigger::Rescue(index) => index,
+            Trigger::Rescue(rescue) => routing
+                .feasible(rescue.index, rescue.budget)
+                .then_some(rescue.index)?,
             Trigger::Hedge(_) => routing
                 .best(
                     |index| {
@@ -385,10 +387,16 @@ impl Followups<'_> {
         };
         let overloaded = routing.all_overloaded();
         let retrying = !early && self.states.buckets[index].tried;
-        // Hedges and retries never queue for admission, so a retry cannot spend a credit
-        // and then run out of time before it starts.
-        let admission = if early || retrying {
-            Some(downloader.admission.try_acquire(self.request.bytes)?)
+        // Hedges, retries, and overload copies never queue for admission, so a copy
+        // cannot spend a credit and then run out of time before it starts.
+        let admission = if (early || retrying || overloaded) && self.backup_admission.is_none() {
+            let Some(permit) = downloader.admission.try_acquire(self.request.bytes) else {
+                if overloaded && !retrying && matches!(trigger, Trigger::Fallback) {
+                    self.states.record(index, DownloadError::AdmissionTimeout);
+                }
+                return None;
+            };
+            Some(permit)
         } else {
             None
         };
@@ -513,7 +521,7 @@ impl Downloader {
                     }
                     Trigger::Fallback
                 },
-                index = next_rescue(&mut rescues, start) => Trigger::Rescue(index),
+                rescue = next_rescue(&mut rescues, start) => Trigger::Rescue(rescue),
                 phase = hedge.due() => Trigger::Hedge(phase),
             };
             if active.len() < MAX_CONCURRENT_COPIES

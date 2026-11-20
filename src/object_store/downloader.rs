@@ -2797,4 +2797,256 @@ mod tests {
         assert_eq!(output.piece.data, Bytes::from_static(b"data"));
         assert_eq!(script.requests.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn rescues_skip_destinations_that_become_infeasible_after_scheduling() {
+        for (degraded_ms, scheduled_overloaded, fire_overloaded, launches) in [
+            (60_000, false, false, false),
+            (60_000, true, true, false),
+            (300, false, false, false),
+            (300, false, true, false),
+            (300, true, true, true),
+        ] {
+            let (downloader, script) = scripted_downloader([
+                ("local", 0, 1_000, false),
+                ("peer", 0, 1_000, false),
+                ("third", 0, 150, false),
+            ]);
+            let downloader = downloader
+                .with_test_limits(DownloadLimits {
+                    bucket_timeout: Duration::from_millis(500),
+                    download_timeout: Duration::from_millis(500),
+                    hedge_budget_percent: 0,
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            for (bucket, millis) in [("local", 10), ("peer", 60), ("third", 150)] {
+                seed_latency(&downloader, bucket, millis);
+            }
+            if scheduled_overloaded {
+                record_outcome(&downloader, "third", Outcome::Overload);
+            }
+            let config = RequestConfig::default();
+            let (result, ()) = tokio::join!(
+                fetch_with_config(&downloader, &["local", "peer", "third"], &config),
+                async {
+                    sleep(Duration::from_millis(150)).await;
+                    for _ in 0..4 {
+                        seed_latency(&downloader, "third", degraded_ms);
+                    }
+                    if fire_overloaded {
+                        record_outcome(&downloader, "third", Outcome::Overload);
+                    }
+                    let tail = model(&downloader, "third").request.tail(4).unwrap();
+                    assert!(
+                        tail >= Duration::from_millis(degraded_ms),
+                        "third must reflect its degraded tail before launch: {tail:?}"
+                    );
+                }
+            );
+            if launches {
+                assert_eq!(result.unwrap().used_bucket_idx, 2);
+                assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+            } else {
+                assert!(
+                    matches!(result, Err(DownloadError::Timeout { .. })),
+                    "degraded: {degraded_ms}ms, scheduled_overloaded: {scheduled_overloaded}, fire_overloaded: {fire_overloaded}: {result:?}"
+                );
+                assert_eq!(
+                    script.requests.load(Ordering::SeqCst),
+                    2,
+                    "degraded: {degraded_ms}ms, scheduled_overloaded: {scheduled_overloaded}, fire_overloaded: {fire_overloaded}"
+                );
+            }
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_overloaded_rescue_keeps_its_schedule_time_budget_after_overload_expires() {
+        let (downloader, script) = scripted_downloader([
+            ("local", 0, 4_000, false),
+            ("peer", 0, 4_000, false),
+            ("third", 0, 500, false),
+        ]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                bucket_timeout: Duration::from_secs(3),
+                download_timeout: Duration::from_secs(3),
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        for bucket in ["local", "peer", "third"] {
+            seed_latency(&downloader, bucket, 1_500);
+        }
+        // Overloaded at schedule time, so third is staggered to 2 s (1 s remaining < 1.5 s tail).
+        // Overload expires after 1 s, before the rescue fires, yet the rescue still launches.
+        record_outcome(&downloader, "third", Outcome::Overload);
+        let output = fetch(&downloader, &["local", "peer", "third"]).await;
+        assert_eq!(output.used_bucket_idx, 2);
+        assert_eq!(output.latency, Duration::from_millis(2_500));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_header_bucket_timeouts_deprioritize_buckets_with_anticorrelated_phases() {
+        for (first_byte_ms, bucket_timeout_ms, deprioritized) in
+            [(50, 500, true), (300, 500, true), (50, 300, false)]
+        {
+            let (downloader, script) =
+                scripted_downloader([("bucket", first_byte_ms, 1_000, false)]);
+            let downloader = downloader
+                .with_test_limits(DownloadLimits {
+                    bucket_timeout: Duration::from_millis(bucket_timeout_ms),
+                    download_timeout: Duration::from_secs(1),
+                    hedge_budget_percent: 0,
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            for _ in 0..4 {
+                seed(&downloader, "bucket", Sample::from_millis(300, 4, 50));
+                seed(&downloader, "bucket", Sample::from_millis(50, 4, 300));
+            }
+            let bucket_model = model(&downloader, "bucket");
+            assert_eq!(
+                bucket_model.request.tail(4),
+                Some(Duration::from_millis(350))
+            );
+            assert_eq!(
+                bucket_model.first_byte.tail(4).unwrap() + bucket_model.body.tail(4).unwrap(),
+                Duration::from_millis(600)
+            );
+            let result =
+                fetch_with_config(&downloader, &["bucket"], &RequestConfig::default()).await;
+            assert!(
+                matches!(result, Err(DownloadError::Timeout { .. })),
+                "{result:?}"
+            );
+            let observed = metrics(&downloader, "bucket").await;
+            assert_eq!(
+                observed.deprioritized, deprioritized,
+                "first_byte: {first_byte_ms}ms, bucket_timeout: {bucket_timeout_ms}ms"
+            );
+            assert_eq!(observed.consecutive_failures, u32::from(deprioritized));
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overload_fallback_does_not_burn_retry_credit_without_admission() {
+        for missing in [false, true] {
+            let (downloader, script) = scripted_downloader([("local", 2, 0, true)]);
+            if missing {
+                script.service_errors.lock().insert(0, 404);
+            }
+            let download_timeout = Duration::from_millis(100);
+            let downloader = downloader
+                .with_test_limits(DownloadLimits {
+                    download_timeout,
+                    max_inflight_requests: 1,
+                    max_inflight_bytes: 4,
+                    hedge_budget_percent: 0,
+                    ..DownloadLimits::default()
+                })
+                .unwrap();
+            for bucket in ["local", "peer"] {
+                seed_latency(&downloader, bucket, 5);
+                record_outcome(&downloader, bucket, Outcome::Overload);
+            }
+            let start = tokio::time::Instant::now();
+            let competing_read = async {
+                sleep(Duration::from_millis(1)).await;
+                let permit = downloader
+                    .admission
+                    .acquire(4, start + download_timeout, download_timeout)
+                    .await
+                    .unwrap();
+                sleep(download_timeout).await;
+                drop(permit);
+            };
+            let config = RequestConfig::default();
+            let (result, ()) = tokio::join!(
+                fetch_with_config(&downloader, &["local", "peer"], &config),
+                competing_read
+            );
+            if missing {
+                assert!(
+                    matches!(result, Err(DownloadError::AdmissionTimeout)),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(DownloadError::BodyStreaming(_))),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(script.requests.load(Ordering::SeqCst), 1);
+            assert!(
+                downloader.attempt_budget.try_retry(),
+                "missing: {missing}: retry credit must not be burned without admission"
+            );
+            assert_eq!(script.active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overload_rescue_does_not_burn_retry_credit_without_admission() {
+        let (downloader, script) = scripted_downloader([("local", 200, 0, false)]);
+        let download_timeout = Duration::from_millis(100);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                download_timeout,
+                bucket_timeout: download_timeout,
+                max_inflight_requests: 1,
+                max_inflight_bytes: 4,
+                hedge_budget_percent: 0,
+            })
+            .unwrap();
+        for bucket in ["local", "peer"] {
+            seed_latency(&downloader, bucket, 10);
+            record_outcome(&downloader, bucket, Outcome::Overload);
+        }
+        let result =
+            fetch_with_config(&downloader, &["local", "peer"], &RequestConfig::default()).await;
+        assert!(
+            matches!(result, Err(DownloadError::Timeout { ref bucket, .. }) if &**bucket == "local"),
+            "{result:?}"
+        );
+        assert_eq!(script.requests.load(Ordering::SeqCst), 1);
+        assert!(
+            downloader.attempt_budget.try_retry(),
+            "retry credit must not be burned by a rescue without admission"
+        );
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_probe_backup_uses_reserved_admission_during_widespread_overload() {
+        let (downloader, script) =
+            scripted_downloader([("local", 5, 1_000, false), ("peer", 0, 5, false)]);
+        let downloader = downloader
+            .with_test_limits(DownloadLimits {
+                max_inflight_requests: 2,
+                max_inflight_bytes: 8,
+                hedge_budget_percent: 0,
+                ..DownloadLimits::default()
+            })
+            .unwrap();
+        seed_latency(&downloader, "local", 3);
+        seed_latency(&downloader, "peer", 5);
+        record_outcome(&downloader, "local", Outcome::Failure);
+        advance(Duration::from_secs(37)).await;
+        let (output, ()) = tokio::join!(fetch(&downloader, &["local", "peer"]), async {
+            sleep(Duration::from_millis(1)).await;
+            for bucket in ["local", "peer"] {
+                record_outcome(&downloader, bucket, Outcome::Overload);
+            }
+        });
+        assert_eq!(output.primary_bucket_idx, 0);
+        assert_eq!(output.used_bucket_idx, 1);
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(script.active.load(Ordering::SeqCst), 0);
+    }
 }
