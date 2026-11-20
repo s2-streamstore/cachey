@@ -65,6 +65,7 @@ fn priority(error: &DownloadError) -> u8 {
         | DownloadError::Overloaded(_)
         | DownloadError::Unknown(_)
         | DownloadError::RangeNotSatisfied { .. }
+        | DownloadError::ObjectTooLarge { .. }
         | DownloadError::AdmissionExhausted { .. } => 3,
     }
 }

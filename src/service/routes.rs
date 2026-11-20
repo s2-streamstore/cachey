@@ -25,7 +25,9 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     object_store::{DownloadError, RequestConfig},
-    service::{CacheyService, Chunk, FetchRequest, PAGE_SIZE, ServiceError, metrics},
+    service::{
+        CacheyService, Chunk, FetchRequest, MAX_OBJECT_SIZE, PAGE_SIZE, ServiceError, metrics,
+    },
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
 };
 
@@ -53,6 +55,9 @@ fn on_chunk_error(
                 );
             }
             (StatusCode::RANGE_NOT_SATISFIABLE, "range_not_satisfiable")
+        }
+        ServiceError::Download(DownloadError::ObjectTooLarge { .. }) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "object_too_large")
         }
         ServiceError::Download(DownloadError::Timeout { .. }) => {
             (StatusCode::GATEWAY_TIMEOUT, "timeout")
@@ -264,12 +269,18 @@ where
     type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        optional_header(
+        let object_size = optional_header::<u64>(
             parts,
             &C0_OBJECT_SIZE_HEADER,
             "Invalid C0-Object-Size header",
-        )
-        .map(Self)
+        )?;
+        if object_size.is_some_and(|size| size > MAX_OBJECT_SIZE) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "C0-Object-Size exceeds maximum supported object size",
+            ));
+        }
+        Ok(Self(object_size))
     }
 }
 
@@ -516,10 +527,13 @@ mod tests {
         http::{HeaderValue, Method, Request, StatusCode, header},
     };
 
-    use super::{C0_CONFIG_HEADER, C0_EXACT_HEADER, ReadRange, on_chunk_error};
+    use super::{
+        C0_CONFIG_HEADER, C0_EXACT_HEADER, C0_OBJECT_SIZE_HEADER, ObjectSizeHeader, ReadRange,
+        on_chunk_error,
+    };
     use crate::{
         object_store::{DownloadError, RequestConfig},
-        service::{PAGE_SIZE, ServiceError, metrics},
+        service::{MAX_OBJECT_SIZE, PAGE_SIZE, ServiceError, metrics},
         types::{BucketName, ObjectKind},
     };
 
@@ -748,6 +762,25 @@ mod tests {
             let header = HeaderValue::from_str(&format!("ma={max_attempts}")).unwrap();
             let config = parse_c0_config(Some(header)).await.unwrap();
             assert_eq!(config.max_attempts, Some(max_attempts));
+        }
+    }
+
+    #[tokio::test]
+    async fn c0_object_size_rejects_sizes_exceeding_max_object_size() {
+        for (size, expected) in [
+            (MAX_OBJECT_SIZE, Ok(Some(MAX_OBJECT_SIZE))),
+            (MAX_OBJECT_SIZE + 1, Err(StatusCode::BAD_REQUEST)),
+        ] {
+            let request = Request::builder()
+                .header(&C0_OBJECT_SIZE_HEADER, size.to_string())
+                .body(())
+                .unwrap();
+            let (mut parts, ()) = request.into_parts();
+            let result = ObjectSizeHeader::from_request_parts(&mut parts, &())
+                .await
+                .map(|header| header.0)
+                .map_err(|(status, _)| status);
+            assert_eq!(result, expected, "{size}");
         }
     }
 }

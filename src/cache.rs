@@ -14,7 +14,7 @@ use foyer::{
 use mixtrics::registry::prometheus_0_14::PrometheusMetricsRegistry;
 
 use crate::{
-    service::PAGE_SIZE,
+    service::{MAX_OBJECT_SIZE, PAGE_SIZE},
     types::{BucketName, ObjectKey, ObjectKind},
 };
 
@@ -312,7 +312,10 @@ impl CacheValueHeader {
         if bucket_name_len > (1 << 6) {
             return Err("Bucket name length exceeds limit");
         }
-        if object_size >= (1 << 40) {
+        const {
+            assert!(MAX_OBJECT_SIZE < (1 << 40));
+        }
+        if object_size > MAX_OBJECT_SIZE {
             return Err("Object size exceeds limit");
         }
         if data_len > (1 << 24) {
