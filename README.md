@@ -57,7 +57,7 @@ Space-separated key-value pairs to override S3 request configuration per cache m
 - `rt=<ms>` Read timeout (time-to-first-byte)
 - `ot=<ms>` Operation timeout (across retries)
 - `oat=<ms>` Operation attempt timeout
-- `ma=<num>` Maximum attempts for each bucket's primary SDK operation
+- `ma=<num>` Maximum attempts for each bucket's primary SDK operation (1–16)
 - `ib=<ms>` Initial backoff duration
 - `mb=<ms>` Maximum backoff duration
 - `fps=<bool>` Force path-style addressing

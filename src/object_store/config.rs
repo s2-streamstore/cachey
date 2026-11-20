@@ -81,6 +81,8 @@ pub struct RequestConfig {
 }
 
 impl RequestConfig {
+    pub const MAX_ATTEMPTS: u32 = 16;
+
     #[must_use]
     pub fn is_noop(&self) -> bool {
         self == &Self::default()
@@ -134,7 +136,7 @@ impl RequestConfig {
         let mut config = base.cloned().unwrap_or_else(RetryConfig::standard);
 
         if let Some(max_attempts) = self.max_attempts {
-            config = config.with_max_attempts(max_attempts);
+            config = config.with_max_attempts(max_attempts.clamp(1, Self::MAX_ATTEMPTS));
         }
         if let Some(initial_backoff) = self.initial_backoff {
             config = config.with_initial_backoff(initial_backoff);
@@ -244,5 +246,25 @@ mod tests {
         };
 
         assert!(request.merged_retry_config(None).is_none());
+    }
+
+    #[test]
+    fn merged_retry_config_clamps_max_attempts() {
+        for (requested, expected) in [
+            (0, 1),
+            (1, 1),
+            (RequestConfig::MAX_ATTEMPTS, RequestConfig::MAX_ATTEMPTS),
+            (RequestConfig::MAX_ATTEMPTS + 1, RequestConfig::MAX_ATTEMPTS),
+            (u32::MAX, RequestConfig::MAX_ATTEMPTS),
+        ] {
+            let request = RequestConfig {
+                max_attempts: Some(requested),
+                ..RequestConfig::default()
+            };
+            let merged = request
+                .merged_retry_config(None)
+                .expect("retry overrides are set");
+            assert_eq!(merged.max_attempts(), expected, "{requested}");
+        }
     }
 }
