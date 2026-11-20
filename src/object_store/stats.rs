@@ -1525,10 +1525,27 @@ mod tests {
                 <= Duration::from_millis(1)
         );
         assert_eq!(model.request.tail(page), Some(Duration::from_millis(271)));
+
+        // An understated requested size whose announced body is past a flat request
+        // model's reach still preserves the requested-size floor.
+        let stats = BucketedStats::default();
+        for bytes in [4096, 65_536] {
+            for _ in 0..4 {
+                stats.seed(&bucket, Sample::from_millis(10, bytes, 200));
+            }
+        }
+        let model = stats.model(&bucket);
+        assert_eq!(model.request.tail(page), None);
+        assert_eq!(model.request.tail(4096), Some(Duration::from_millis(210)));
+        assert_eq!(model.body.tail(page), None);
+        assert_eq!(
+            model.timeout_allowance(4096, Some(page), Duration::from_millis(20)),
+            Duration::from_millis(210)
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timeout_allowance_caps_phase_sum_at_joint_tail_unless_a_phase_exceeds_it() {
+    async fn timeout_allowance_caps_phase_sum_unless_the_body_tail_exceeds_request_tail() {
         let stats = BucketedStats::default();
         let bucket = BucketName::new("local").unwrap();
         for _ in 0..4 {
@@ -1584,23 +1601,6 @@ mod tests {
         assert_eq!(
             model.timeout_allowance(4, Some(4), Duration::from_millis(100)),
             Duration::from_millis(495)
-        );
-
-        // An understated requested size whose announced body is past a flat request
-        // model's reach still preserves the requested-size floor in the unmeasured branch.
-        let stats = BucketedStats::default();
-        for bytes in [4096, 65_536] {
-            for _ in 0..4 {
-                stats.seed(&bucket, Sample::from_millis(10, bytes, 200));
-            }
-        }
-        let model = stats.model(&bucket);
-        assert_eq!(model.request.tail(page), None);
-        assert_eq!(model.request.tail(4096), Some(Duration::from_millis(210)));
-        assert_eq!(model.body.tail(page), None);
-        assert_eq!(
-            model.timeout_allowance(4096, Some(page), Duration::from_millis(20)),
-            Duration::from_millis(210)
         );
     }
 

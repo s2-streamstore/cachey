@@ -21,8 +21,8 @@ A bucket's routing latency at a read's size is:
 
 - **Measured buckets:** the request model's median at that size, scaled by a **recent moving average** and a **cancellation excess**.
   - The moving average tracks the last 32 successful reads (at sizes within the model's observed range) relative to the model's *current* median at each read's size. It reacts to latency shifts before the next model refit without double-counting shifts the model has already absorbed.
-  - Outside the model's observed size range, the bucket uses its estimate (flat below the smallest band; extended along the last segment above the largest where latency grows measurably with size, or else the largest observed band's median). Because extrapolations can be far off, reads outside the observed range do not update the moving average, and a peer never ranks ahead of the first bucket there.
-- **Unmeasured buckets:** start at zero for the first bucket and rise directly from canceled copies until the first completed read succeeds; unmeasured peers are floored at the first bucket's routing latency before locality adjustment, so an unmeasured peer never outranks the first bucket.
+  - Outside the model's observed size range, the bucket uses its estimate (flat below the smallest band; extended along the last segment above the largest where latency grows measurably with size, or else the largest observed band's median). Because extrapolations can be far off, reads outside the observed range do not update the moving average, and a peer never outranks the first bucket on latency alone there.
+- **Unmeasured buckets:** start at zero for the first bucket and rise directly from canceled copies until the first completed read succeeds; unmeasured peers are floored at the first bucket's routing latency before locality adjustment, so an unmeasured peer never outranks it on latency alone.
 
 Two live signals push traffic off a slowing bucket before timeouts accumulate:
 
