@@ -200,12 +200,19 @@ where
                 "ot" => config.operation_timeout = Some(parse_duration(value)?),
                 "oat" => config.operation_attempt_timeout = Some(parse_duration(value)?),
                 "ma" => {
-                    config.max_attempts = Some(value.parse().map_err(|_| {
+                    let max_attempts: u32 = value.parse().map_err(|_| {
                         (
                             StatusCode::BAD_REQUEST,
                             "Invalid value for ma in C0-Config header",
                         )
-                    })?);
+                    })?;
+                    if !(1..=RequestConfig::MAX_ATTEMPTS).contains(&max_attempts) {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            "ma in C0-Config header must be between 1 and 16",
+                        ));
+                    }
+                    config.max_attempts = Some(max_attempts);
                 }
                 "ib" => config.initial_backoff = Some(parse_duration(value)?),
                 "mb" => config.max_backoff = Some(parse_duration(value)?),
@@ -708,6 +715,18 @@ mod tests {
                 "Invalid value for ma in C0-Config header",
             ),
             (
+                HeaderValue::from_static("ma=0"),
+                "ma in C0-Config header must be between 1 and 16",
+            ),
+            (
+                HeaderValue::from_static("ma=17"),
+                "ma in C0-Config header must be between 1 and 16",
+            ),
+            (
+                HeaderValue::from_static("ma=4294967295"),
+                "ma in C0-Config header must be between 1 and 16",
+            ),
+            (
                 HeaderValue::from_static("fps=1"),
                 "Invalid value for fps in C0-Config header",
             ),
@@ -720,6 +739,15 @@ mod tests {
                 parse_c0_config(Some(value)).await.unwrap_err(),
                 (StatusCode::BAD_REQUEST, message)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn c0_config_accepts_max_attempts_bounds() {
+        for max_attempts in [1, RequestConfig::MAX_ATTEMPTS] {
+            let header = HeaderValue::from_str(&format!("ma={max_attempts}")).unwrap();
+            let config = parse_c0_config(Some(header)).await.unwrap();
+            assert_eq!(config.max_attempts, Some(max_attempts));
         }
     }
 }

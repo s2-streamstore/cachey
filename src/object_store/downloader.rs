@@ -2782,4 +2782,19 @@ mod tests {
             assert_eq!(script.active.load(Ordering::SeqCst), 0);
         }
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn unbounded_max_attempts_override_is_clamped_before_sdk_execution() {
+        let (downloader, script) = scripted_downloader([("bucket", 0, 0, false)]);
+        let config = RequestConfig {
+            max_attempts: Some(u32::MAX),
+            operation_attempt_timeout: Some(Duration::from_millis(u64::MAX)),
+            ..RequestConfig::default()
+        };
+        let output = fetch_with_config(&downloader, &["bucket"], &config)
+            .await
+            .unwrap();
+        assert_eq!(output.piece.data, Bytes::from_static(b"data"));
+        assert_eq!(script.requests.load(Ordering::SeqCst), 1);
+    }
 }
