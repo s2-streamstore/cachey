@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.6](https://github.com/s2-streamstore/cachey/compare/0.13.5...0.13.6) - 2026-11-20
+
+### Fixed
+
+- *(service)* reject objects exceeding MAX_OBJECT_SIZE ([#230](https://github.com/s2-streamstore/cachey/pull/230))
+- *(object_store)* re-validate rescues, cap timeout allowance, and require admission for overload copies ([#229](https://github.com/s2-streamstore/cachey/pull/229))
+- *(service)* bound max_attempts in C0-Config and retry overrides ([#228](https://github.com/s2-streamstore/cachey/pull/228))
+
+### Other
+
+- *(deps)* upgrade dependencies ([#226](https://github.com/s2-streamstore/cachey/pull/226))
+
 ## [0.13.5](https://github.com/s2-streamstore/cachey/compare/0.13.4...0.13.5) - 2026-11-13
 
 ### Added
