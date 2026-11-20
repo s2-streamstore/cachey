@@ -133,10 +133,11 @@ the download deadline, or else use the primary's bucket. A failed body can be re
 once when no other copy or untried bucket remains, without waiting for admission.
 
 A copy's timeout allowance is the p99 of each interval, or half the bucket's share
-of the download timeout for each unmeasured interval. A later copy to a bucket needs
-that much of the bucket's deadline left. A missing object, unsatisfied range, or
-invalid object state cancels all remaining copies to that bucket immediately,
-releasing their admission capacity.
+of the download timeout for each unmeasured interval; once both phases are measured,
+the request model caps their sum unless a single phase's p99 exceeds it. A later copy
+to a bucket needs that much of the bucket's deadline left. A missing object,
+unsatisfied range, or invalid object state cancels all remaining copies to that bucket
+immediately, releasing their admission capacity.
 
 Hedges and body retries have separate budgets funded by successful reads. The
 default allows one startup hedge and one per 20 successful downloads. A zero hedge
@@ -159,8 +160,9 @@ capacity and total process memory. Active copies are also capped at 1,024, so at
 the default memory limit, copies under 1 MiB, such as small exact reads, reach that cap
 first.
 
-Copies other than early hedges and body retries wait for admission while they can
-still finish by the deadline. A queue that formed within the last 100 ms is
+Copies other than early hedges, body retries, and copies launched during widespread
+overload wait for admission while they can still finish by the deadline. A queue that
+formed within the last 100 ms is
 absorbing a burst, which capacity will reach. Once it has stood longer, waiting only
 delays reads without filling more entries, so a copy joining it waits no longer than
 its timeout allowance or 100 ms, whichever is longer. A copy that fails admission

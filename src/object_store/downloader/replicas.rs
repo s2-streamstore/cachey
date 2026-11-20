@@ -353,7 +353,16 @@ impl Followups<'_> {
         );
         let untried = |index: usize| !self.states.buckets[index].tried;
         let index = match trigger {
-            Trigger::Rescue(index) => index,
+            Trigger::Rescue(index) => {
+                // Overloaded rescues are not pulled earlier by `rescue_schedule`, so
+                // recheck them against the full download budget rather than remaining time.
+                let budget = if routing.overloaded(index) {
+                    downloader.limits.download_timeout
+                } else {
+                    remaining
+                };
+                routing.feasible(index, budget).then_some(index)?
+            }
             Trigger::Hedge(_) => routing
                 .best(
                     |index| {
@@ -385,10 +394,16 @@ impl Followups<'_> {
         };
         let overloaded = routing.all_overloaded();
         let retrying = !early && self.states.buckets[index].tried;
-        // Hedges and retries never queue for admission, so a retry cannot spend a credit
-        // and then run out of time before it starts.
-        let admission = if early || retrying {
-            Some(downloader.admission.try_acquire(self.request.bytes)?)
+        // Hedges, retries, and overload copies never queue for admission, so a copy
+        // cannot spend a credit and then run out of time before it starts.
+        let admission = if (early || retrying || overloaded) && self.backup_admission.is_none() {
+            let Some(permit) = downloader.admission.try_acquire(self.request.bytes) else {
+                if overloaded && !retrying && matches!(trigger, Trigger::Fallback) {
+                    self.states.record(index, DownloadError::AdmissionTimeout);
+                }
+                return None;
+            };
+            Some(permit)
         } else {
             None
         };

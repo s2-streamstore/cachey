@@ -165,7 +165,8 @@ pub(super) struct LatencyModel {
 impl LatencyModel {
     /// Timeouts affect health only after allowing time for each phase reached, using
     /// `unmeasured` for unknown phases. Unless both phases are measured, the request
-    /// model is a floor.
+    /// model is a floor; when both are measured, the request model caps their sum
+    /// unless a single phase's tail exceeds it.
     pub fn timeout_allowance(
         &self,
         requested_bytes: u64,
@@ -177,12 +178,14 @@ impl LatencyModel {
         let reached = first_byte
             .unwrap_or(unmeasured)
             .saturating_add(body.map_or(Duration::ZERO, |tail| tail.unwrap_or(unmeasured)));
+        let request = self
+            .request
+            .tail(requested_bytes.max(announced_body_bytes.unwrap_or(0)));
         match (first_byte, body) {
-            (Some(_), Some(Some(_))) => reached,
-            _ => self
-                .request
-                .tail(requested_bytes)
-                .map_or(reached, |tail| tail.max(reached)),
+            (Some(first_byte), Some(Some(body))) => {
+                request.map_or(reached, |tail| reached.min(tail.max(first_byte).max(body)))
+            }
+            _ => request.map_or(reached, |tail| tail.max(reached)),
         }
     }
 }
@@ -1488,6 +1491,46 @@ mod tests {
                 <= Duration::from_millis(1)
         );
         assert_eq!(model.request.tail(page), Some(Duration::from_millis(271)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_allowance_caps_phase_sum_at_joint_tail_unless_a_phase_exceeds_it() {
+        let stats = BucketedStats::default();
+        let bucket = BucketName::new("local").unwrap();
+        for _ in 0..4 {
+            stats.seed(&bucket, Sample::from_millis(300, 4, 50));
+            stats.seed(&bucket, Sample::from_millis(50, 4, 300));
+        }
+        let model = stats.model(&bucket);
+        assert_eq!(model.first_byte.tail(4), Some(Duration::from_millis(300)));
+        assert_eq!(model.body.tail(4), Some(Duration::from_millis(300)));
+        assert_eq!(model.request.tail(4), Some(Duration::from_millis(350)));
+        assert_eq!(
+            model.timeout_allowance(4, Some(4), Duration::from_millis(100)),
+            Duration::from_millis(350)
+        );
+
+        let page = 16 * MIB;
+        let stats = BucketedStats::default();
+        for _ in 0..199 {
+            stats.seed(
+                &bucket,
+                Sample {
+                    requested_bytes: page,
+                    first_byte: Duration::from_millis(20),
+                    body_bytes: 4096,
+                    body: Duration::from_millis(1),
+                },
+            );
+        }
+        stats.seed(&bucket, Sample::from_millis(20, page, 600));
+        let model = stats.model(&bucket);
+        assert_eq!(model.request.tail(page), Some(Duration::from_millis(21)));
+        assert_eq!(model.body.tail(page), Some(Duration::from_millis(600)));
+        assert_eq!(
+            model.timeout_allowance(page, Some(page), Duration::from_millis(100)),
+            Duration::from_millis(600)
+        );
     }
 
     #[tokio::test(start_paused = true)]
