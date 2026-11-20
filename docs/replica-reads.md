@@ -1,231 +1,150 @@
 # Replica reads
 
-## Selection and recovery
+When a read can be served from multiple replicas, `cachey` routes across buckets using per-bucket health, size-aware latency models, shared deadlines, and bounded concurrency.
 
-Replica selection uses backend health, recent latency, and the time a new copy has:
-the remaining download deadline, within the bucket timeout.
-The first client-supplied bucket gets a locality preference; all buckets remain
-eligible for fallback.
+## Bucket selection and recovery
 
-Backend failures reduce preference; successful reads and recovery probes restore
-it. Missing objects, invalid ranges, cancellation, and admission failures do not
-affect health. A deprioritized bucket, or one without an outcome for 30 seconds, is
-probed if it might beat the current choice, and the first bucket regardless.
+### Ranking order
 
-Buckets are ranked by routing latency at the read's size: the request model's
-median, scaled by a moving average of the last 32 successful reads relative to it and
-by an excess from canceled copies. The moving average follows a shift in latency
-sooner than the model does, and since it is taken against the current median, a
-shift the model absorbs is not counted twice. Outside the range of sizes its model has
-observed, a bucket is ranked by the model's estimate: below it, its smallest band's
-median; above it, its last segment extended where latency grows measurably with size,
-or else its median at the largest size it has seen, since latency grows with size. An estimate can be far off, so there a peer never
-ranks ahead of the first bucket, and reads of those sizes leave the moving average
-alone.
+For each read, buckets are ranked by:
 
-Canceled copies raise the excess toward how far they outlasted their routing
-latency, as a fraction, so a slow large read slows small ones only in proportion.
-Copies of a size the model has not observed are not judged. The excess decays with a
-5-second half-life. Before a bucket has a median, canceled copies raise its routing
-latency directly, which stays until a read succeeds. A bucket's first measurement
-resets the moving average, the excess, and that latency. A recovery probe clears the
-excess and that latency, and lowers the moving average at once when it is faster, but
-raises it only as any read does, since a bucket that looks slow gets no reads to
-correct it.
+1. **Feasibility:** whether the bucket's predicted request p99 at the read size fits within the remaining download deadline and `bucket_timeout` (unmeasured buckets count as feasible).
+2. **Health:** healthy buckets rank ahead of deprioritized ones; among deprioritized buckets, lower `error_rate` wins.
+3. **Routing latency:** lower locality-adjusted routing latency wins. The first client-supplied bucket gets a locality preference (peers are scaled by 1.5×).
+4. **Client order:** earlier buckets break ties.
 
-Feasibility, rescue timing, and stall detection use the request model at each
-read's size. A copy is overdue after four times its timeout allowance, which is
-refined when headers announce the body length. Three overdue copies raise routing
-latency to the elapsed time of the third.
+All supplied buckets remain eligible for fallback even if deprioritized or historically infeasible.
+
+### Routing latency and stall detection
+
+A bucket's routing latency at a read's size is:
+
+- **Measured buckets:** the request model's median at that size, scaled by a **recent moving average** and a **cancellation excess**.
+  - The moving average tracks the last 32 successful reads (at sizes within the model's observed range) relative to the model's *current* median at each read's size. It reacts to latency shifts before the next model refit without double-counting shifts the model has already absorbed.
+  - Outside the model's observed size range, the bucket uses its estimate (flat below the smallest band; extended along the last segment above the largest where latency grows measurably with size, or else the largest observed band's median). Because extrapolations can be far off, reads outside the observed range do not update the moving average, and a peer never ranks ahead of the first bucket there.
+- **Unmeasured buckets:** start at zero and rise directly from canceled copies until the first completed read succeeds.
+
+Two live signals push traffic off a slowing bucket before timeouts accumulate:
+
+- **Canceled copies:** when a copy at an observed size is canceled, it raises the bucket's cancellation excess toward how far it outlasted its scaled median (as a fraction, so a slow large read slows small reads only in proportion). The excess decays with a 5-second half-life and eases on each normal success. Copies outside observed sizes are not judged. The bucket's first completed measurement resets the moving average, excess, and unmeasured latency.
+- **Overdue copies (stalls):** an active copy becomes overdue at 4× its [timeout allowance](#timeout-allowance), refined once headers announce the body length. When three or more copies to a bucket are overdue, its routing latency is raised to at least the elapsed time of the third.
+
+### Health and recovery probes
+
+- **What affects health:** backend errors, overload responses, and timeouts that outlast the copy's [timeout allowance](#timeout-allowance) immediately deprioritize the bucket and reset its recovery progress. Missing objects (`404`), unsatisfied ranges (`416`), invalid object state, cancellation, admission failures, and early timeouts do not affect health.
+- **Recovery:** 20 successful reads started after the latest failure clear the deprioritized state.
+- **Probing:** when the chosen primary is healthy and feasible, `cachey` may instead probe another bucket that is deprioritized or has had no outcome for 30 seconds, provided no probe or active copy is already running on it and its 24–36 second backoff has elapsed. The first bucket is always eligible for probing; other buckets are probed only if their locality-adjusted median could beat the current choice.
+- **Probe safety:** a probe pre-acquires two admission permits (one for itself and one reserved for a backup copy) and disables early hedges; if both permits are not immediately available, the probe is skipped and the healthy winner runs instead. A successful probe clears cancellation excess and lowers the moving average immediately when faster, but raises it only like any normal read so a single slow probe cannot starve the bucket of traffic needed to correct it. Probes preserve existing latency history.
 
 ## Latency model
 
-Each bucket has three models:
+Each bucket maintains three size-aware models:
 
-| Model | Interval | Keyed by |
-|-------|----------|----------|
-| First byte | Request start through validated headers, including SDK retries | Requested bytes |
-| Body | Headers through the end of the body | Announced response bytes |
-| Request | Request start through body validation, including SDK retries | Requested bytes |
+| Model | Measured interval | Keyed by |
+|---|---|---|
+| **First byte** | Request start through validated headers (including SDK retries) | Requested bytes |
+| **Body** | Validated headers through end of body | Announced response bytes |
+| **Request** | Request start through validated body (including SDK retries) | Requested bytes |
 
-Requested bytes are known before headers arrive. Capacitor reads the range before
-sending headers, so its time to first byte grows with size. Page reads request a
-whole page, and exact reads (`C0-Exact`) only their range. With `C0-Object-Size`,
-admission and the models count a read at the bytes the object holds within it, which
-is what it receives. Without it, the models of page reads describe whatever response
-sizes pages return.
+Requested bytes are known before headers arrive; backends such as Capacitor read the range before sending headers, so first-byte latency can grow with size. Page reads request a full page, while exact reads (`C0-Exact`) request only their range. When `C0-Object-Size` is provided, admission and the models count a read at the bytes the object holds within the range (what it will actually receive). Without it, page-read models reflect whatever response sizes pages return.
 
-Each model has a point per size band, bands being four times apart: the band's median
-size and median latency, with medians made nondecreasing across bands by pooling
-adjacent violators into their weighted mean. Medians are interpolated linearly between
-points and held flat below the first. Beyond the last they follow the last segment,
-where latency grows measurably with size, at most in proportion to size and no faster
-than the last band's own halves, each twice the other's sizes, show. A lone band
-follows its halves; without them, its body time is a transfer cost from 1 ms at zero
-bytes. Predictions have a 1 ms floor.
+### Fitting and interpolation
 
-A band's p95 and p99 are its median times those quantiles of each sample's latency
-relative to the median at the sample's size, and at least the band's own, so neither
-the band's largest sizes nor a step in latency below it set its tail. They come only
-from the band's own samples, so a stall or slow mode in one band never stretches
-another's. Between points they are interpolated like medians, so sizes between two
-bands take tails from both, and beyond the last they keep their ratio to it.
+- **Bands and medians:** observations are grouped into size bands 4× apart. Each band becomes a point at its weighted median size and weighted median latency, made nondecreasing across bands via pool-adjacent-violators (weighted mean). Predictions have a 1 ms floor.
+- **Between and below bands:** medians interpolate linearly between adjacent band points and stay flat below the first band.
+- **Above the last band:** medians extrapolate only where latency grows measurably with size, following the last segment's slope capped by both proportionality to size and the slope between the last band's lower and upper size halves. A lone band uses its halves, or—for the body model without split halves—a proportional transfer cost from 1 ms at zero bytes.
+- **Tails (p95 and p99):** each band computes p95 and p99 from its own samples only, as quantiles of each sample's ratio to `max(interpolated_median(sample_size), band_median)`, multiplied by the band median. This prevents large sizes within a band, steps below it, or stalls in another band from inflating a band's tail. Tails interpolate linearly between bands and keep a constant ratio to the median beyond the last band.
 
-Latency need not grow in proportion to size. S3 Standard serves objects from a cache
-while their age times their size stays under about 50 MiB·s, with a first byte in
-about 30 ms, and adds about 80 ms when they are cold, regardless of size. A read soon
-after a write can find an object warm, while a later one, such as a reader catching
-up, finds it cold. Small objects stay warm longer, so the share of cold reads grows
-with size: reads of one size split between a warm and a cold mode, and the median
-steps up where cold reads become the majority. A line through every size predicts
-seconds for 16 MiB from that step; quantiles by band follow it.
+Band quantiles are used instead of a single line because real object stores are not purely linear in size. For example, S3 Standard serves warm objects from cache (~30 ms first byte) while `age × size` stays under ~50 MiB·s and adds ~80 ms once cold regardless of size. Because small objects stay warm longer, the median steps up where cold reads become the majority; fitting one line across that step predicts seconds for 16 MiB reads, whereas band quantiles follow the step.
 
-Sizes read only a few times are estimated from few samples, and mostly err toward
-hedging late. A lone slow read becomes its band's median and tail, and raises the
-median of sizes between it and the next band, until more reads arrive or it ages out.
-Sizes beyond the largest retained one follow the last segment, which overstates them
-after a warm-to-cold step when the last band holds one size. The exception is a band
-that has seen only a few healthy reads: its tails sit close to its median, so its
-hedges can fire on healthy reads, within the hedge budget. At a cold start, when every
-band is sparse, they can spend the budget before the first stall. Likewise, where cold
-reads are 1% to 5% of a band, its p95 stays warm and its p99 cold, so those cold reads
-are hedged, within the budget.
+### Decay, sampling, training, and refits
 
-Observations have a 15-second half-life of model time. Model time advances at most
-150 ms per observation, so a half-life spans at least 100 observations when traffic
-is light, and idle buckets keep their history. Each model retains up to 1,024
-samples, split evenly across size bands, so rare sizes survive.
-Priority sampling keeps weights unbiased. Samples are dropped once they weigh under
-0.4% of a new observation.
+- **Decay:** observations decay with a 15-second half-life in *model time*. Model time advances by at most 150 ms per observation, so a half-life spans at least 100 observations under light traffic and idle buckets retain their history.
+- **Retention:** each model keeps up to 1,024 samples split evenly across active size bands using unbiased priority sampling, pruning samples whose weight falls below 0.4% of a new observation.
+- **Training:** validated responses train all three models. Unfinished copies that received headers train only the first-byte model; otherwise unfinished copies train nothing so hedged-away stalls do not inflate the p99 used to detect them.
+- **Refits:** models refit at most once per second, or sooner while observation counts double. Each routing decision refits at most one bucket on the 1-second cadence (the one longest without a refit). Fitting 1,024 samples takes tens of microseconds under the bucket's lock.
 
-Validated responses train all three models. Copies that receive headers train the
-first-byte model even if they later fail, time out, or are canceled. Otherwise,
-unfinished copies train nothing, so tails describe completed requests: stalls
-superseded by a hedge stay outside the p99 that detects them. Recovery probes keep
-latency history.
+### Sparse-size behavior
 
-Models refit at most once per second, or sooner while the observation count
-doubles. A routing decision refits at most one bucket on that interval, the one
-longest without a refit. A fit of 1,024 samples takes tens of microseconds, under the
-bucket's statistics lock. Metrics report the latest fit.
+Rarely read sizes have few samples and usually err toward hedging late: a lone slow read sets its band's median and tail until more reads arrive or it ages out, and sizes past the largest retained sample can be overstated if the last band sits just above a warm-to-cold step with a single size. Conversely, a band with only a few healthy reads has tails close to its median and can fire hedges on healthy reads (bounded by the hedge budget), including at cold start or in bands where 1%–5% of reads are cold (warm p95, cold p99).
 
-## Deadlines and hedging
+## Deadlines, hedging, rescues, and retries
 
-A download fetches one cache entry: a page, or an exact range. Its deadline includes
-admission, SDK retries, and body validation. Copies to one bucket share a deadline
-starting at its first admission, whose expiry counts against health once. Up to three
-copies can run per download; the first validated result wins and cancels the others.
+A download fetches one cache entry (a full page or an exact range). Its `download_timeout` covers admission, SDK retries, and body validation. Up to **3 copies** may run concurrently per download; the first validated response wins and cancels the rest.
 
-Early hedges use the first-byte model at the requested size, then the body model at
-the announced size. Each delay is p99 capped at 1.25 times the p95 and five times the
-median. Where stalls exceed 1% of reads they set the p99, and with ±20% jitter the p95
-cap is about 1.5 times the median. The cap follows the p95 because reads of one size
-can split between fast and slow objects, like S3 Standard's warm and cold ones. Every
-copy of a cold read waits for the same fetch from storage, so hedging it only spends
-the budget that stalls need. Cold reads take about four times as long as warm ones, so
-a slow mode beyond five times the median is a stall, which a hedge can rescue even
-when it exceeds 5% of reads. Health, rescue, and retry decisions use uncapped
-estimates.
+Copies to the same bucket share a single **bucket deadline** starting at that bucket's first admission (`min(bucket_timeout, remaining_download_time)`), and its expiry counts against bucket health at most once. Conclusive per-bucket errors (`404` missing object, `416` unsatisfied range, or invalid object state) immediately cancel all remaining copies to that bucket, releasing their admission capacity.
 
-Early hedges use one SDK attempt, skip overloaded buckets, and never wait for
-admission. They prefer an untried bucket expected to finish within its timeout and
-the download deadline, or else use the primary's bucket. A failed body can be retried
-once when no other copy or untried bucket remains, without waiting for admission.
+### Copy types
 
-A copy's timeout allowance is the p99 of each interval, or half the bucket's share
-of the download timeout for each unmeasured interval; once both phases are measured,
-the request model caps their sum unless a single phase's p99 exceeds it. A later copy
-to a bucket needs that much of the bucket's deadline left. A missing object,
-unsatisfied range, or invalid object state cancels all remaining copies to that bucket
-immediately, releasing their admission capacity.
+- **Early hedges:** at most one early hedge is launched per download, timed from the primary's request start (first-byte model at requested size) and then from header arrival (body model at announced size). If the header hedge is blocked by admission or budget, the body phase can still fire.
+  - Delay is `min(p99, 1.25 × p95, 5 × median)`. Following p95 avoids hedging a bimodal slow mode above 5% of reads (such as S3 Standard cold objects, where a second copy waits on the same backend fetch), while the 5× median cap still rescues stalls above 5% of reads (cold reads are ~4× warm). Health, rescue, and retry decisions use uncapped p99.
+  - Early hedges use a single SDK attempt, skip overloaded buckets, never wait for admission, and prefer an untried feasible peer; otherwise they hedge against the primary's bucket if more than its [timeout allowance](#timeout-allowance) remains on the bucket deadline.
+- **Deadline rescues:** at download start, untried feasible replicas are given staggered launch delays (consuming up to two-thirds of `download_timeout`, plus a grace-timed backup when probing) so a stalled primary does not exhaust the download deadline. Non-overloaded rescues are pulled earlier when needed to finish before the deadline; overloaded rescues keep their staggered time. When a rescue timer fires, it re-checks fresh feasibility against `remaining` (or `download_timeout` if the target is overloaded) before launching.
+- **Fallbacks and body retries:** when a copy fails with a retryable error, the download falls back to the best untried bucket (even if historically infeasible). Once no other copy is active and no untried bucket remains, a `BodyStreaming` failure may be retried once against a failed bucket that still has more than its [timeout allowance](#timeout-allowance) left on its bucket deadline, without waiting for admission.
 
-Hedges and body retries have separate budgets funded by successful reads. The
-default allows one startup hedge and one per 20 successful downloads. A zero hedge
-budget still permits fallback and deadline rescue.
+### Timeout allowance
 
-## Limits
+A copy's timeout allowance governs timeout health verdicts, stall thresholds (`4×`), admission queueing patience, and whether a later copy to the same bucket has enough time left:
+
+- Each reached phase allows its uncapped p99, or half of `min(bucket_share, bucket_timeout)` when unmeasured (where `bucket_share = download_timeout / bucket_count`).
+- Before both phases are measured, the request model's p99 is a floor.
+- Once both `first_byte` and `body` tails are measured, their sum is capped by `max(request.tail, first_byte.tail, body.tail)` (querying `request` at `max(requested_bytes, announced_body_bytes)`). This keeps anticorrelated or independent phase tails aligned with `request.tail` and `bucket_timeout` while still allowing small announced bodies on page reads to tighten below `request.tail` and rare or extrapolated large bodies to keep `body.tail`.
+
+### Attempt budgets
+
+Hedges and retries use separate success-funded budgets shared across `Downloader` clones:
+
+- **Hedge budget:** starts with 1 hedge, earns `--hedge-budget-percent` credits per successful download (default 5%, or 1 hedge per 20 successes, up to 16 stored), and caps active hedges at 16 globally and 2 per bucket. Setting `--hedge-budget-percent 0` disables early hedges while keeping fallback and deadline rescue active.
+- **Retry budget:** starts with 1 attempt and earns 1 per 10 successful downloads (up to 16 stored). It gates same-bucket body retries and any extra copy launched while all buckets are overloaded.
+
+## Limits and admission
 
 | Server option | Default |
-|---------------|---------|
+|---|---|
 | `--bucket-timeout-ms` | 5,000 ms per bucket, per download |
 | `--download-timeout-ms` | 10,000 ms per download |
 | `--max-download-memory` | 1 GiB of reserved body bytes |
 | `--hedge-budget-percent` | 5% |
 
-Server reads reserve the bytes they expect: 16 MiB per page or an exact range's
-length, less any part past the end of an object of known size. Admission trusts that
-size, so a read whose size is understated can hold up to the rest of its range beyond
-its reservation. By default, 64 full pages fit. This limit is separate from cache
-capacity and total process memory. Active copies are also capped at 1,024, so at
-the default memory limit, copies under 1 MiB, such as small exact reads, reach that cap
-first.
+Rust callers configure limits through `DownloadLimits`; `Downloader` clones share limits and admission state.
 
-Copies other than early hedges, body retries, and copies launched during widespread
-overload wait for admission while they can still finish by the deadline. A queue that
-formed within the last 100 ms is
-absorbing a burst, which capacity will reach. Once it has stood longer, waiting only
-delays reads without filling more entries, so a copy joining it waits no longer than
-its timeout allowance or 100 ms, whichever is longer. A copy that fails admission
-does not fall back to another bucket, whose copy would wait in the same queue. A
-copy fails at once if it would not be admitted in time: each copy ahead of it, then
-the copy itself, is expected to take the average time between departures, admitted
-or abandoned, since the queue was last empty.
+### Capacity reservations
 
-Rust callers set both limits through `DownloadLimits`. Downloader clones share limits.
+Each active copy reserves its expected bytes—16 MiB for a page read, or an exact range's length, clamped to `C0-Object-Size` when provided—separate from cache capacity and total process memory. By default, 64 full 16 MiB pages fit. Active copies are also capped at 1,024, so reads under 1 MiB reach the request cap before the memory cap. Admission trusts `C0-Object-Size`, so an understated size lets a read hold up to the rest of its range beyond its reservation.
+
+### Queueing policy
+
+- **Non-queueing copies:** early hedges, body retries, and copies launched during widespread overload (when all buckets are overloaded) never queue for admission—they require an immediate permit (or a recovery probe's reserved backup permit) so they cannot spend a budget credit and time out before starting.
+- **Queueing copies:** all other copies wait while they can still start by `download_deadline - timeout_allowance`.
+  - A queue younger than **100 ms** is treated as absorbing a burst and waits up to that deadline.
+  - Once a queue has stood for **100 ms** or longer, waiting only adds latency without improving throughput, so newly arriving copies wait at most `max(timeout_allowance, 100 ms)`.
+  - A copy fails immediately with `AdmissionTimeout` if its predicted wait—the moving average departure interval since the queue last emptied, multiplied by `(waiting + 1)` minus time since the last departure—reaches its latest start time.
+- **No admission fallback:** because every bucket shares the same admission queue, a copy that fails admission does not fall back to another bucket. If an untried fallback during widespread overload is rejected for lacking immediate admission, `AdmissionTimeout` is recorded on that bucket so a prior `404` from another replica is not returned as a false miss.
 
 ## Errors
 
-A backend response signals overload when its status is 429 or 503, or its error code
-is `SlowDown`, `ServiceUnavailable`, or a throttling code. A 404 or 416 without a more
-specific error code, as S3-compatible stores and proxies may send with an empty or
-non-XML body, is a missing object or an unsatisfied range.
+- **Classification:** HTTP `429`/`503` or `SlowDown`, `ServiceUnavailable`, and throttling codes signal overload (marking the bucket overloaded for 1 second). Bare `404` or `416` responses without a more specific error code (for example, empty or non-XML bodies from S3-compatible stores or proxies) are treated as missing objects or unsatisfied ranges.
+- **HTTP status mapping:** admission failures and overload return HTTP `503`; timeouts return HTTP `504`.
+- **Precedence:** backend errors take precedence over timeouts, admission failures, and missing objects. Once response streaming to the client has started, errors terminate the body.
+- **Ranges:** empty or reversed ranges are rejected before contacting any backend. Unsatisfied ranges (`416`) permit fallback across replicas; if all replicas fail and `RangeNotSatisfied` is the final error, it reports the largest object size seen across responses.
 
-Admission failure or overload returns HTTP 503; timeouts return 504. Backend errors
-take precedence over timeouts, admission failures, and missing objects. Errors
-after streaming starts terminate the body.
+## Metrics and headers
 
-An unsatisfied range permits fallback. If it is the final error, it reports the
-largest size from those responses. Empty or reversed ranges are rejected before
-contacting a backend.
-
-## Metrics
-
-| Measurement | Meaning |
-|-------------|---------|
-| `cachey_bucket_latency_seconds` | Median or p99 (`quantile`) at a read size (`bytes`) of 4 KiB, 64 KiB, 1 MiB, or 16 MiB |
-| `cachey_bucket_latency_model_bytes` | Largest size retained by the model |
-| `cachey_bucket_latency_predictions_total` | Observations at sizes the model predicted |
-| `cachey_bucket_latency_predictions_exceeded_total` | Those slower than the predicted median (`quantile="0.5"`) or p99 (`quantile="0.99"`) |
+| Metric | Description |
+|---|---|
+| `cachey_bucket_latency_seconds` | Request-model median or p99 (`quantile`) at `bytes` of 4 KiB, 64 KiB, 1 MiB, or 16 MiB |
+| `cachey_bucket_latency_model_bytes` | Largest read size retained by the request model |
+| `cachey_bucket_latency_predictions_total` | Training observations at sizes the current fit predicted |
+| `cachey_bucket_latency_predictions_exceeded_total` | Observations exceeding the predicted median (`quantile="0.5"`) or p99 (`quantile="0.99"`) |
 | `cachey_bucket_error_ratio` / `cachey_bucket_consecutive_failures` | Backend health outcomes |
-| `cachey_bucket_deprioritized` | Reduced bucket preference |
-| `cachey_download_latency_seconds` | Successful download latency, including admission and fallback |
-| `cachey_bucket_hedge_delay_seconds` | Early hedge delay by the `phase` it fires in (`first_byte` or `body`), at a read size (`bytes`) |
-| `cachey_hedges_total` | Early hedges of successful downloads, by `phase`, `target`, and `outcome` |
+| `cachey_bucket_deprioritized` | Whether the bucket is currently deprioritized |
+| `cachey_bucket_hedge_delay_seconds` | Early hedge delay by `phase` (`first_byte` or `body`) and `bytes` |
+| `cachey_hedges_total` | Early hedges of successful downloads by primary `bucket`, `phase`, `target` (`primary` or `peer`), and `outcome` (`won` or `lost`) |
+| `cachey_download_latency_seconds` | Successful download latency, including admission, retries, and fallback |
 | `cachey_first_chunk_latency_seconds` | Handler time to first chunk, including cache lookup and coalescing |
 
-Latency metrics report the request model, labeled `phase="request"`. The first-byte and
-body models are reported only through the hedge delays they set, at requested and body
-bytes respectively. Gauges are absent until measured. Latency and hedge delays are
-reported at sizes 16 times apart, which keeps series fewer than the model's bands, and
-at a size only while the model retains a read at least that large, so none is
-extrapolated. Latencies exclude transmission to the client.
+- **Reporting scope:** latency metrics report the request model (`phase="request"`); first-byte and body models are exposed through `cachey_bucket_hedge_delay_seconds`. Gauges are omitted until measured, and reported only at sizes up to the model's largest retained sample so no extrapolated values are exported. Latencies exclude transmission to the client.
+- **Prediction accuracy:** each training observation is compared against the fit active when it arrives (well-calibrated models sit near 50% above median and 1% above p99). Sizes beyond the model's reach and unfinished copies past headers are excluded.
+- **`DownloadOutput` and `C0-Status`:** `DownloadOutput` records the primary and winning bucket indices, whether any copies overlapped (`hedged`, including rescues and probes), and any early `hedge` outcome. `C0-Status` reports the serving bucket and cache status in a response header for the first entry and HTTP/2 trailers for subsequent pages (HTTP/1.1 reports only the first entry).
 
-Prediction counters compare each observation that trains a model with the fit in use
-when it arrives. For an accurate model, half exceed the median and 1% exceed p99.
-Sizes beyond the model's reach are not counted, nor are stalls a hedge superseded,
-since unfinished copies train nothing past their headers.
-
-`DownloadOutput` identifies the initial and winning buckets. `hedged` means copies
-overlapped, including rescue and recovery probes; `fallback` counts wins from
-another bucket. `hedge` reports a download's early hedge, of which there is at most
-one, and `cachey_hedges_total` counts them by the primary's `bucket`: the `phase` it
-fired in (`first_byte` or `body`), whether it went to the primary's bucket or a peer
-(`target`), and whether its response was served (`outcome` of `won` or `lost`).
-Downloads that fail are not counted.
-
-`C0-Status` exposes the serving bucket and cache status. The first entry uses a
-response header. Later pages use HTTP/2 trailers; HTTP/1.1 reports only the first
-entry.
-
-See the [simulation harness](simulation/README.md) and
-[reference results](simulation/REFERENCE.md).
+See the [simulation harness](simulation/README.md) and [reference results](simulation/REFERENCE.md).
