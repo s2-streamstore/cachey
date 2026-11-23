@@ -26,7 +26,8 @@ use tracing::{debug, instrument, warn};
 use crate::{
     object_store::{DownloadError, RequestConfig},
     service::{
-        CacheyService, Chunk, FetchRequest, MAX_OBJECT_SIZE, PAGE_SIZE, ServiceError, metrics,
+        CacheyService, Chunk, FetchPlan, FetchRequest, MAX_OBJECT_SIZE, PAGE_SIZE, ServiceError,
+        metrics,
     },
     types::{BucketName, BucketNameSet, ObjectKey, ObjectKind},
 };
@@ -307,31 +308,52 @@ pub async fn fetch(
 
     metrics::fetch_request_count(&kind, &method, "start");
 
+    let egress_throughput = service.egress_throughput.clone();
+    let request = FetchRequest {
+        kind: kind.clone(),
+        object,
+        buckets,
+        byterange: byterange.clone(),
+        object_size,
+        exact,
+        config: req_config,
+    };
+
+    let multi = match FetchPlan::new(request) {
+        FetchPlan::Error(err) => return error_response(&kind, &method, 0, &err),
+        FetchPlan::Single(single) => {
+            let chunk = match single.execute(service).await {
+                Ok(chunk) => chunk,
+                Err(err) => return error_response(&kind, &method, 0, &err),
+            };
+            metrics::first_chunk_latency(&kind, chunk.cached_at.is_some(), start.elapsed());
+            let headers = chunk_response_headers(&chunk, &byterange);
+            metrics::fetch_request_count(&kind, &method, "success");
+            if method == axum::http::Method::HEAD {
+                return (StatusCode::PARTIAL_CONTENT, headers).into_response();
+            }
+            egress_throughput.lock().record(chunk.data.len());
+            // A single-chunk body lets hyper set END_STREAM on the final DATA frame instead of
+            // sending a trailing empty HEADERS frame over HTTP/2.
+            return (
+                StatusCode::PARTIAL_CONTENT,
+                headers,
+                axum::body::Body::from(chunk.data),
+            )
+                .into_response();
+        }
+        FetchPlan::Multi(multi) => multi,
+    };
+
     let concurrency = if method == axum::http::Method::HEAD {
         NonZeroUsize::MIN
     } else {
         const { NonZeroUsize::new(2).unwrap() }
     };
 
-    let egress_throughput = service.egress_throughput.clone();
-    let mut chunks = Box::pin(
-        service
-            .get(
-                FetchRequest {
-                    kind: kind.clone(),
-                    object,
-                    buckets,
-                    byterange: byterange.clone(),
-                    object_size,
-                    exact,
-                    config: req_config,
-                },
-                concurrency,
-            )
-            .peekable(),
-    );
+    let mut chunks = Box::pin(multi.stream(service, concurrency));
 
-    let Some(first_chunk) = chunks.as_mut().peek().await else {
+    let Some(first_chunk) = chunks.next().await else {
         metrics::fetch_request_count(&kind, &method, "failed:stream_empty");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -340,52 +362,40 @@ pub async fn fetch(
             .into_response();
     };
 
-    let mut headers = HeaderMap::new();
-    match first_chunk {
-        Ok(chunk) => {
-            metrics::first_chunk_latency(&kind, chunk.cached_at.is_some(), start.elapsed());
-            let object_size = chunk.object_size;
-            let first_byte = chunk.range.start;
-            let last_byte = byterange.end.min(object_size) - 1;
-            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
-            headers.insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from(last_byte - first_byte + 1),
-            );
-            headers.insert(
-                header::CONTENT_RANGE,
-                HeaderValue::try_from(format!("bytes {first_byte}-{last_byte}/{object_size}"))
-                    .unwrap(),
-            );
-            headers.insert(
-                header::LAST_MODIFIED,
-                HeaderValue::try_from(httpdate::fmt_http_date(
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(chunk.mtime)),
-                ))
-                .unwrap(),
-            );
-            headers.insert("c0-status", c0_status(chunk));
-        }
-        Err(e) => {
-            let (status, headers) = on_chunk_error(&kind, &method, 0, e);
-            return (status, headers, e.to_string()).into_response();
-        }
-    }
+    let first_chunk = match first_chunk {
+        Ok(chunk) => chunk,
+        Err(e) => return error_response(&kind, &method, 0, &e),
+    };
+    metrics::first_chunk_latency(&kind, first_chunk.cached_at.is_some(), start.elapsed());
+    let headers = chunk_response_headers(&first_chunk, &byterange);
 
     if method == axum::http::Method::HEAD {
         metrics::fetch_request_count(&kind, &method, "success");
         return (StatusCode::PARTIAL_CONTENT, headers).into_response();
     }
 
+    if first_chunk.range.end == byterange.end.min(first_chunk.object_size) {
+        // Stop waiting for pages beyond EOF; shared cache fills can continue.
+        drop(chunks);
+        metrics::fetch_request_count(&kind, &method, "success");
+        egress_throughput.lock().record(first_chunk.data.len());
+        return (
+            StatusCode::PARTIAL_CONTENT,
+            headers,
+            axum::body::Body::from(first_chunk.data),
+        )
+            .into_response();
+    }
+
     let body = StreamBody::new(async_stream::stream! {
         let mut trailers = HeaderMap::new();
-        let mut chunk_idx = 0;
+        egress_throughput.lock().record(first_chunk.data.len());
+        yield Ok(Frame::data(first_chunk.data));
+        let mut chunk_idx = 1;
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(chunk) => {
-                    if chunk_idx > 0 {
-                        trailers.append("c0-status", c0_status(&chunk));
-                    }
+                    trailers.append("c0-status", c0_status(&chunk));
                     let is_last_chunk = chunk.range.end == byterange.end.min(chunk.object_size);
                     if is_last_chunk {
                         metrics::fetch_request_count(&kind, &method, "success");
@@ -398,13 +408,12 @@ pub async fn fetch(
                         yield Ok(Frame::trailers(trailers));
                         break;
                     }
-                },
+                }
                 Err(err) => {
-                    assert!(chunk_idx > 0, "first chunk cannot be an error since we peeked");
                     let _ = on_chunk_error(&kind, &method, chunk_idx, &err);
                     yield Err(err);
                     break;
-                },
+                }
             }
             chunk_idx += 1;
         }
@@ -416,6 +425,41 @@ pub async fn fetch(
         axum::body::Body::new(body),
     )
         .into_response()
+}
+
+fn error_response(
+    kind: &ObjectKind,
+    method: &axum::http::Method,
+    chunk_idx: usize,
+    error: &ServiceError,
+) -> Response {
+    let (status, headers) = on_chunk_error(kind, method, chunk_idx, error);
+    (status, headers, error.to_string()).into_response()
+}
+
+fn chunk_response_headers(chunk: &Chunk, byterange: &Range<u64>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let object_size = chunk.object_size;
+    let first_byte = chunk.range.start;
+    let last_byte = byterange.end.min(object_size) - 1;
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from(last_byte - first_byte + 1),
+    );
+    headers.insert(
+        header::CONTENT_RANGE,
+        HeaderValue::try_from(format!("bytes {first_byte}-{last_byte}/{object_size}")).unwrap(),
+    );
+    headers.insert(
+        header::LAST_MODIFIED,
+        HeaderValue::try_from(httpdate::fmt_http_date(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(chunk.mtime)),
+        ))
+        .unwrap(),
+    );
+    headers.insert("c0-status", c0_status(chunk));
+    headers
 }
 
 fn c0_status(chunk: &Chunk) -> HeaderValue {

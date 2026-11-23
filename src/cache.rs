@@ -1,4 +1,5 @@
 use std::{
+    io::Read,
     ops::Range,
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
@@ -417,10 +418,20 @@ impl foyer::Code for CacheValue {
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?
         };
 
+        let data_len = header.data_len();
         let data = {
-            let mut buf = BytesMut::zeroed(header.data_len());
-            reader.read_exact(&mut buf)?;
-            buf.freeze()
+            let mut buf = Vec::with_capacity(data_len);
+            // `read_to_end` on `Take` writes into spare capacity via `BorrowedBuf`, avoiding
+            // zero-filling up to 16 MiB before immediately overwriting it.
+            let read = reader.take(data_len as u64).read_to_end(&mut buf)?;
+            if read != data_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                )
+                .into());
+            }
+            Bytes::from(buf)
         };
 
         Ok(Self {
@@ -724,5 +735,15 @@ mod tests {
         let header = CacheValueHeader::new(4, 0, 0, 0, 0).unwrap();
         let data = [header.to_bytes().as_slice(), &[0xff; 4]].concat();
         assert!(CacheValue::decode(&mut data.as_slice()).is_err());
+
+        let header = CacheValueHeader::new(4, 16, 0, 16, 0).unwrap();
+        let data = [header.to_bytes().as_slice(), b"buck", &[1; 8]].concat();
+        let err = CacheValue::decode(&mut data.as_slice()).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::UnexpectedEof),
+            "expected UnexpectedEof, got {err:?}"
+        );
     }
 }

@@ -178,9 +178,12 @@ async fn main() -> eyre::Result<()> {
         .await?
         .into_router();
 
-    let server = axum_server::bind(addr)
+    let mut server = axum_server::bind(addr)
         .handle(server_handle)
         .accept_error_handler(on_accept_error);
+    // Clients share one HTTP/2 connection per pod, so allow multiplexing beyond hyper's default
+    // of 200 concurrent streams.
+    server.http_builder().http2().max_concurrent_streams(1024);
     let tcp_acceptor = TcpConfigAcceptor::new(tcp_socket_config());
     let make_service = app.into_make_service();
     if let Some(rustls_config) = rustls_config {

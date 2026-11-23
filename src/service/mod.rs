@@ -1,5 +1,4 @@
 use std::{
-    iter,
     net::SocketAddr,
     num::{NonZeroU32, NonZeroUsize},
     ops::{Range, RangeInclusive},
@@ -13,8 +12,7 @@ use std::{
 use bytes::Bytes;
 use eyre::Result;
 use foyer::Source;
-use futures::{Stream, StreamExt};
-use itertools::Either;
+use futures::{Stream, StreamExt, future::Either};
 use parking_lot::Mutex;
 
 mod metrics;
@@ -120,6 +118,121 @@ pub struct CacheyService {
     server_handle: axum_server::Handle<SocketAddr>,
 }
 
+pub(crate) struct SingleEntryFetch {
+    request: FetchRequest,
+    entry_range: Range<u64>,
+}
+
+impl SingleEntryFetch {
+    pub(crate) async fn execute(self, service: CacheyService) -> Result<Chunk, ServiceError> {
+        let Self {
+            request,
+            entry_range,
+        } = self;
+        let cache_key = CacheKey {
+            kind: request.kind.clone(),
+            object: request.object.clone(),
+            range: entry_range.clone(),
+        };
+        let byterange = request.byterange.clone();
+        let mut expected_size = request.object_size;
+        let downloader = service.downloader;
+        let (entry_start, value) =
+            fetch_cached_entry(&service.cache, cache_key, move || async move {
+                download_entry(&downloader, &request, &entry_range).await
+            })
+            .await?;
+        chunk_from_entry(entry_start, &byterange, &mut expected_size, value)
+    }
+}
+
+pub(crate) struct MultiPageFetch {
+    request: FetchRequest,
+    pages: RangeInclusive<PageId>,
+}
+
+impl MultiPageFetch {
+    pub(crate) fn stream(
+        self,
+        service: CacheyService,
+        concurrency: NonZeroUsize,
+    ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
+        let Self { request, pages } = self;
+        let byterange = request.byterange.clone();
+        let mut expected_size = request.object_size;
+        let executor = Arc::new(EntryGetExecutor {
+            downloader: service.downloader,
+            request,
+        });
+
+        futures::stream::iter(pages.map(page_byterange))
+            .map(move |range| executor.clone().execute(range, service.cache.clone()))
+            .buffered(concurrency.get())
+            .map(move |result| {
+                let (entry_start, value) = result?;
+                chunk_from_entry(entry_start, &byterange, &mut expected_size, value)
+            })
+    }
+}
+
+pub(crate) enum FetchPlan {
+    Error(ServiceError),
+    Single(SingleEntryFetch),
+    Multi(MultiPageFetch),
+}
+
+impl FetchPlan {
+    pub(crate) fn new(request: FetchRequest) -> Self {
+        let byterange = &request.byterange;
+        assert!(byterange.start < byterange.end);
+        assert!(byterange.end <= MAX_RANGE_END);
+        assert!(!request.exact || byterange.end - byterange.start <= PAGE_SIZE);
+
+        metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
+
+        if let Some(object_size) = request.object_size
+            && object_size > MAX_OBJECT_SIZE
+        {
+            metrics::fetch_request_entries(&request.kind, 0);
+            return Self::Error(ServiceError::Download(DownloadError::ObjectTooLarge {
+                object_size,
+                max_object_size: MAX_OBJECT_SIZE,
+            }));
+        }
+
+        let end = byterange.end.min(request.object_size.unwrap_or(u64::MAX));
+        if byterange.start >= end {
+            metrics::fetch_request_entries(&request.kind, 0);
+            return Self::Error(ServiceError::Download(DownloadError::RangeNotSatisfied {
+                requested: byterange.clone(),
+                object_size: request.object_size,
+            }));
+        }
+
+        if request.exact {
+            metrics::fetch_request_entries(&request.kind, 1);
+            let entry_range = request.byterange.clone();
+            return Self::Single(SingleEntryFetch {
+                request,
+                entry_range,
+            });
+        }
+
+        let pages = pagerange(&(byterange.start..end));
+        let count = pages.len();
+        metrics::fetch_request_entries(&request.kind, count);
+        if count == 1 {
+            let entry_range = page_byterange(*pages.start());
+            Self::Single(SingleEntryFetch {
+                request,
+                entry_range,
+            })
+        } else {
+            Self::Multi(MultiPageFetch { request, pages })
+        }
+    }
+}
+
 impl CacheyService {
     pub async fn new(
         config: ServiceConfig,
@@ -189,76 +302,15 @@ impl CacheyService {
         request: FetchRequest,
         concurrency: NonZeroUsize,
     ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
-        let byterange = request.byterange.clone();
-        assert!(byterange.start < byterange.end);
-        assert!(byterange.end <= MAX_RANGE_END);
-        assert!(!request.exact || byterange.end - byterange.start <= PAGE_SIZE);
-
-        let initial_error = if let Some(object_size) = request.object_size
-            && object_size > MAX_OBJECT_SIZE
-        {
-            Some(Err(ServiceError::Download(DownloadError::ObjectTooLarge {
-                object_size,
-                max_object_size: MAX_OBJECT_SIZE,
-            })))
-        } else {
-            None
-        };
-
-        let end = byterange.end.min(request.object_size.unwrap_or(u64::MAX));
-        let entries = (initial_error.is_none() && byterange.start < end).then(|| {
-            if request.exact {
-                Either::Left(iter::once(byterange.clone()))
-            } else {
-                Either::Right(pagerange(&(byterange.start..end)).map(page_byterange))
+        match FetchPlan::new(request) {
+            FetchPlan::Error(err) => Either::Left(Either::Left(futures::stream::once(
+                std::future::ready(Err(err)),
+            ))),
+            FetchPlan::Single(single) => {
+                Either::Left(Either::Right(futures::stream::once(single.execute(self))))
             }
-        });
-        let initial_error = initial_error.or_else(|| {
-            entries.is_none().then(|| {
-                Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
-                    requested: byterange.clone(),
-                    object_size: request.object_size,
-                }))
-            })
-        });
-
-        metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
-        metrics::fetch_request_entries(
-            &request.kind,
-            entries.as_ref().map_or(0, ExactSizeIterator::len),
-        );
-
-        let mut expected_size = request.object_size;
-        let executor = Arc::new(EntryGetExecutor {
-            downloader: self.downloader,
-            request,
-        });
-
-        futures::stream::iter(initial_error).chain(
-            futures::stream::iter(entries.into_iter().flatten())
-                .map(move |range| executor.clone().execute(range, self.cache.clone()))
-                .buffered(concurrency.get())
-                .map(move |result| {
-                    let (entry_start, value) = result?;
-                    // A range past the object's end is unsatisfiable whatever size was expected.
-                    let (data, range) = slice_entry_data(entry_start, &byterange, &value)?;
-                    let expected_size = *expected_size.get_or_insert(value.object_size);
-                    if value.object_size != expected_size {
-                        return Err(ServiceError::ObjectSizeInconsistency {
-                            new: value.object_size,
-                            prev: expected_size,
-                        });
-                    }
-                    Ok(Chunk {
-                        bucket: value.bucket,
-                        mtime: value.mtime,
-                        data,
-                        range,
-                        object_size: value.object_size,
-                        cached_at: NonZeroU32::new(value.cached_at),
-                    })
-                }),
-        )
+            FetchPlan::Multi(multi) => Either::Right(multi.stream(self, concurrency)),
+        }
     }
 
     pub fn into_router(self) -> axum::Router {
@@ -281,6 +333,125 @@ impl CacheyService {
     }
 }
 
+fn chunk_from_entry(
+    entry_start: u64,
+    byterange: &Range<u64>,
+    expected_size: &mut Option<u64>,
+    value: CacheValue,
+) -> Result<Chunk, ServiceError> {
+    // A range past the object's end is unsatisfiable whatever size was expected.
+    let (data, range) = slice_entry_data(entry_start, byterange, &value)?;
+    let expected_size = *expected_size.get_or_insert(value.object_size);
+    if value.object_size != expected_size {
+        return Err(ServiceError::ObjectSizeInconsistency {
+            new: value.object_size,
+            prev: expected_size,
+        });
+    }
+    Ok(Chunk {
+        bucket: value.bucket,
+        mtime: value.mtime,
+        data,
+        range,
+        object_size: value.object_size,
+        cached_at: NonZeroU32::new(value.cached_at),
+    })
+}
+
+async fn download_entry(
+    downloader: &Downloader,
+    request: &FetchRequest,
+    range: &Range<u64>,
+) -> Result<CacheValue, ServiceError> {
+    metrics::entry_request_count(&request.kind, metrics::EntryRequestType::Download);
+
+    let out = downloader
+        .download(
+            &request.buckets,
+            request.object.clone(),
+            range,
+            request.object_size,
+            &request.config,
+        )
+        .await?;
+    metrics::download_latency(&request.kind, out.latency);
+    if out.hedged {
+        metrics::entry_request_count(&request.kind, metrics::EntryRequestType::Hedged);
+    }
+    if let Some(hedge) = out.hedge {
+        metrics::hedge_count(
+            &request.kind,
+            &request.buckets[out.primary_bucket_idx],
+            hedge,
+        );
+    }
+    if out.primary_bucket_idx == 0 {
+        metrics::entry_request_count(&request.kind, metrics::EntryRequestType::ClientPref);
+    }
+    if out.used_bucket_idx != out.primary_bucket_idx {
+        metrics::entry_request_count(&request.kind, metrics::EntryRequestType::Fallback);
+    }
+    Ok(CacheValue {
+        bucket: request.buckets[out.used_bucket_idx].clone(),
+        mtime: out.piece.mtime,
+        data: out.piece.data,
+        object_size: out.piece.object_size,
+        cached_at: now(),
+    })
+}
+
+async fn fetch_cached_entry<F, Fut>(
+    cache: &foyer::HybridCache<CacheKey, CacheValue>,
+    cache_key: CacheKey,
+    download: F,
+) -> Result<(u64, CacheValue), ServiceError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<CacheValue, ServiceError>> + Send + 'static,
+{
+    metrics::entry_request_count(&cache_key.kind, metrics::EntryRequestType::Access);
+
+    let fetched_by_current_request = Arc::new(AtomicBool::new(false));
+    let entry = cache
+        .get_or_fetch(&cache_key, {
+            let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
+            move || {
+                let fut = download();
+                async move {
+                    fetched_by_current_request.store(true, Ordering::Relaxed);
+                    fut.await
+                }
+            }
+        })
+        .await
+        .map_err(|err| {
+            err.downcast_ref::<ServiceError>()
+                .cloned()
+                .unwrap_or(ServiceError::Cache(err))
+        })?;
+    let key = entry.key();
+    metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Success);
+
+    let mut value = entry.value().clone();
+    match entry.source() {
+        Source::Memory => {
+            metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
+            metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitMemory);
+        }
+        Source::Disk => {
+            metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
+            metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitDisk);
+        }
+        Source::Outer => {
+            value.cached_at = 0;
+            if !fetched_by_current_request.load(Ordering::Relaxed) {
+                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Coalesced);
+            }
+        }
+    }
+    Ok((cache_key.range.start, value))
+}
+
 fn now() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -300,96 +471,15 @@ impl EntryGetExecutor {
         range: Range<u64>,
         cache: foyer::HybridCache<CacheKey, CacheValue>,
     ) -> Result<(u64, CacheValue), ServiceError> {
-        metrics::entry_request_count(&self.request.kind, metrics::EntryRequestType::Access);
-
         let cache_key = CacheKey {
             kind: self.request.kind.clone(),
             object: self.request.object.clone(),
             range: range.clone(),
         };
-        let fetched_by_current_request = Arc::new(AtomicBool::new(false));
-        let entry = cache
-            .get_or_fetch(&cache_key, {
-                let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
-                move || async move {
-                    fetched_by_current_request.store(true, Ordering::Relaxed);
-                    metrics::entry_request_count(
-                        &self.request.kind,
-                        metrics::EntryRequestType::Download,
-                    );
-
-                    let out = self
-                        .downloader
-                        .download(
-                            &self.request.buckets,
-                            self.request.object.clone(),
-                            &range,
-                            self.request.object_size,
-                            &self.request.config,
-                        )
-                        .await?;
-                    metrics::download_latency(&self.request.kind, out.latency);
-                    if out.hedged {
-                        metrics::entry_request_count(
-                            &self.request.kind,
-                            metrics::EntryRequestType::Hedged,
-                        );
-                    }
-                    if let Some(hedge) = out.hedge {
-                        metrics::hedge_count(
-                            &self.request.kind,
-                            &self.request.buckets[out.primary_bucket_idx],
-                            hedge,
-                        );
-                    }
-                    if out.primary_bucket_idx == 0 {
-                        metrics::entry_request_count(
-                            &self.request.kind,
-                            metrics::EntryRequestType::ClientPref,
-                        );
-                    }
-                    if out.used_bucket_idx != out.primary_bucket_idx {
-                        metrics::entry_request_count(
-                            &self.request.kind,
-                            metrics::EntryRequestType::Fallback,
-                        );
-                    }
-                    Ok::<_, ServiceError>(CacheValue {
-                        bucket: self.request.buckets[out.used_bucket_idx].clone(),
-                        mtime: out.piece.mtime,
-                        data: out.piece.data,
-                        object_size: out.piece.object_size,
-                        cached_at: now(),
-                    })
-                }
-            })
-            .await
-            .map_err(|err| {
-                err.downcast_ref::<ServiceError>()
-                    .cloned()
-                    .unwrap_or(ServiceError::Cache(err))
-            })?;
-        let key = entry.key();
-        metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Success);
-
-        let mut value = entry.value().clone();
-        match entry.source() {
-            Source::Memory => {
-                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
-                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitMemory);
-            }
-            Source::Disk => {
-                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
-                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitDisk);
-            }
-            Source::Outer => {
-                value.cached_at = 0;
-                if !fetched_by_current_request.load(Ordering::Relaxed) {
-                    metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Coalesced);
-                }
-            }
-        }
-        Ok((cache_key.range.start, value))
+        fetch_cached_entry(&cache, cache_key, move || async move {
+            download_entry(&self.downloader, &self.request, &range).await
+        })
+        .await
     }
 }
 
@@ -882,5 +972,140 @@ mod tests {
                 max_object_size,
             })) if object_size == MAX_OBJECT_SIZE + 1 && max_object_size == MAX_OBJECT_SIZE
         ));
+    }
+
+    async fn spawn_http2_service(
+        bucket: &BucketName,
+        object: &ObjectKey,
+        data: Bytes,
+        memory: ByteSize,
+    ) -> (
+        std::net::SocketAddr,
+        axum_server::Handle<std::net::SocketAddr>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (s3_endpoint, _, s3_handle) =
+            spawn_mock_s3_server(bucket, object, data, Duration::ZERO).await;
+        let app = service(&s3_endpoint, memory).await.into_router();
+        let server_handle = axum_server::Handle::<std::net::SocketAddr>::new();
+        let serve_handle = server_handle.clone();
+        tokio::spawn(async move {
+            axum_server::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .handle(serve_handle)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let addr = server_handle.listening().await.unwrap();
+        (addr, server_handle, s3_handle)
+    }
+
+    #[tokio::test]
+    async fn http2_single_chunk_omits_trailers_and_multi_page_includes_them() {
+        use http_body::Body as _;
+        use http_body_util::BodyExt;
+
+        let kind = ObjectKind::new("h2-framing").unwrap();
+        let object = ObjectKey::new("object").unwrap();
+        let bucket = BucketName::new("bucket").unwrap();
+        let data = Bytes::from(
+            (0..PAGE_SIZE as usize + 128)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (addr, server_handle, s3_handle) =
+            spawn_http2_service(&bucket, &object, data.clone(), ByteSize::mib(64)).await;
+
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .http2_only(true)
+                .build_http::<http_body_util::Empty<Bytes>>();
+        let uri: http::Uri = format!("http://{addr}/fetch/{kind}/{object}")
+            .parse()
+            .unwrap();
+
+        let single_req = http::Request::builder()
+            .uri(uri.clone())
+            .version(http::Version::HTTP_2)
+            .header(http::header::RANGE, "bytes=0-1023")
+            .header("c0-bucket", &*bucket)
+            .body(http_body_util::Empty::new())
+            .unwrap();
+        let single_resp = client.request(single_req).await.unwrap();
+        assert_eq!(single_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(single_resp.headers().contains_key("c0-status"));
+        let mut single_body = single_resp.into_body();
+        let first_frame = single_body
+            .frame()
+            .await
+            .expect("data frame")
+            .expect("ok frame");
+        assert_eq!(first_frame.into_data().unwrap(), data.slice(0..1024));
+        assert!(
+            single_body.is_end_stream(),
+            "single-chunk HTTP/2 response should set END_STREAM on its DATA frame with no trailing frame"
+        );
+        assert!(single_body.frame().await.is_none());
+
+        let multi_req = http::Request::builder()
+            .uri(uri)
+            .version(http::Version::HTTP_2)
+            .header(http::header::RANGE, format!("bytes=0-{}", data.len() - 1))
+            .header("c0-bucket", &*bucket)
+            .body(http_body_util::Empty::new())
+            .unwrap();
+        let multi_resp = client.request(multi_req).await.unwrap();
+        assert_eq!(multi_resp.status(), StatusCode::PARTIAL_CONTENT);
+        let collected = multi_resp.into_body().collect().await.unwrap();
+        let trailers = collected
+            .trailers()
+            .cloned()
+            .expect("multi-page HTTP/2 response should include trailers");
+        assert_eq!(collected.to_bytes(), data);
+        assert_eq!(trailers.get_all("c0-status").iter().count(), 1);
+
+        server_handle.shutdown();
+        s3_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http2_early_eof_multi_page_range_omits_trailers() {
+        use http_body::Body as _;
+        use http_body_util::BodyExt;
+
+        let kind = ObjectKind::new("h2-early-eof").unwrap();
+        let object = ObjectKey::new("small-object").unwrap();
+        let bucket = BucketName::new("bucket").unwrap();
+        let data = Bytes::from(vec![0x5a; 1024]);
+        let (addr, server_handle, s3_handle) =
+            spawn_http2_service(&bucket, &object, data.clone(), ByteSize::mib(16)).await;
+
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .http2_only(true)
+                .build_http::<http_body_util::Empty<Bytes>>();
+        let req = http::Request::builder()
+            .uri(format!("http://{addr}/fetch/{kind}/{object}"))
+            .version(http::Version::HTTP_2)
+            .header(
+                http::header::RANGE,
+                format!("bytes=0-{}", PAGE_SIZE * 2 - 1),
+            )
+            .header("c0-bucket", &*bucket)
+            .body(http_body_util::Empty::new())
+            .unwrap();
+        let resp = client.request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let mut body = resp.into_body();
+        let frame = body.frame().await.expect("data frame").expect("ok frame");
+        assert_eq!(frame.into_data().unwrap(), data);
+        assert!(
+            body.is_end_stream(),
+            "early-EOF HTTP/2 response should set END_STREAM on its DATA frame with no trailing frame"
+        );
+        assert!(body.frame().await.is_none());
+
+        server_handle.shutdown();
+        s3_handle.abort();
     }
 }
