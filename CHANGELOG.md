@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.7](https://github.com/s2-streamstore/cachey/compare/0.13.6...0.13.7) - 2026-11-23
+
+### Other
+
+- *(deps)* upgrade dependencies and fix RUSTSEC-2026-0592 ([#233](https://github.com/s2-streamstore/cachey/pull/233))
+- *(server)* tune HTTP/2 settings, single-chunk response framing, and disk decode ([#231](https://github.com/s2-streamstore/cachey/pull/231))
+
 ## [0.13.6](https://github.com/s2-streamstore/cachey/compare/0.13.5...0.13.6) - 2026-11-20
 
 ### Fixed
