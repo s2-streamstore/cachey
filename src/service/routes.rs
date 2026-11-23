@@ -319,18 +319,12 @@ pub async fn fetch(
         config: req_config,
     };
 
-    let pages = match CacheyService::plan_fetch(&request) {
-        FetchPlan::Error(err) => {
-            let (status, headers) = on_chunk_error(&kind, &method, 0, &err);
-            return (status, headers, err.to_string()).into_response();
-        }
-        FetchPlan::Single(entry_range) => {
-            let chunk = match service.fetch_single_chunk(request, entry_range).await {
+    let multi = match FetchPlan::new(request) {
+        FetchPlan::Error(err) => return error_response(&kind, &method, 0, &err),
+        FetchPlan::Single(single) => {
+            let chunk = match single.execute(service).await {
                 Ok(chunk) => chunk,
-                Err(err) => {
-                    let (status, headers) = on_chunk_error(&kind, &method, 0, &err);
-                    return (status, headers, err.to_string()).into_response();
-                }
+                Err(err) => return error_response(&kind, &method, 0, &err),
             };
             metrics::first_chunk_latency(&kind, chunk.cached_at.is_some(), start.elapsed());
             let headers = chunk_response_headers(&chunk, &byterange);
@@ -348,7 +342,7 @@ pub async fn fetch(
             )
                 .into_response();
         }
-        FetchPlan::Multi(pages) => pages,
+        FetchPlan::Multi(multi) => multi,
     };
 
     let concurrency = if method == axum::http::Method::HEAD {
@@ -357,7 +351,7 @@ pub async fn fetch(
         const { NonZeroUsize::new(2).unwrap() }
     };
 
-    let mut chunks = Box::pin(service.stream_pages(request, pages, concurrency));
+    let mut chunks = Box::pin(multi.stream(service, concurrency));
 
     let Some(first_chunk) = chunks.next().await else {
         metrics::fetch_request_count(&kind, &method, "failed:stream_empty");
@@ -370,10 +364,7 @@ pub async fn fetch(
 
     let first_chunk = match first_chunk {
         Ok(chunk) => chunk,
-        Err(e) => {
-            let (status, headers) = on_chunk_error(&kind, &method, 0, &e);
-            return (status, headers, e.to_string()).into_response();
-        }
+        Err(e) => return error_response(&kind, &method, 0, &e),
     };
     metrics::first_chunk_latency(&kind, first_chunk.cached_at.is_some(), start.elapsed());
     let headers = chunk_response_headers(&first_chunk, &byterange);
@@ -434,6 +425,16 @@ pub async fn fetch(
         axum::body::Body::new(body),
     )
         .into_response()
+}
+
+fn error_response(
+    kind: &ObjectKind,
+    method: &axum::http::Method,
+    chunk_idx: usize,
+    error: &ServiceError,
+) -> Response {
+    let (status, headers) = on_chunk_error(kind, method, chunk_idx, error);
+    (status, headers, error.to_string()).into_response()
 }
 
 fn chunk_response_headers(chunk: &Chunk, byterange: &Range<u64>) -> HeaderMap {

@@ -1,5 +1,4 @@
 use std::{
-    iter,
     net::SocketAddr,
     num::{NonZeroU32, NonZeroUsize},
     ops::{Range, RangeInclusive},
@@ -13,8 +12,7 @@ use std::{
 use bytes::Bytes;
 use eyre::Result;
 use foyer::Source;
-use futures::{Stream, StreamExt};
-use itertools::Either;
+use futures::{Stream, StreamExt, future::Either};
 use parking_lot::Mutex;
 
 mod metrics;
@@ -120,10 +118,119 @@ pub struct CacheyService {
     server_handle: axum_server::Handle<SocketAddr>,
 }
 
+pub(crate) struct SingleEntryFetch {
+    request: FetchRequest,
+    entry_range: Range<u64>,
+}
+
+impl SingleEntryFetch {
+    pub(crate) async fn execute(self, service: CacheyService) -> Result<Chunk, ServiceError> {
+        let Self {
+            request,
+            entry_range,
+        } = self;
+        let cache_key = CacheKey {
+            kind: request.kind.clone(),
+            object: request.object.clone(),
+            range: entry_range.clone(),
+        };
+        let byterange = request.byterange.clone();
+        let mut expected_size = request.object_size;
+        let downloader = service.downloader;
+        let (entry_start, value) =
+            fetch_cached_entry(&service.cache, cache_key, move || async move {
+                download_entry(&downloader, &request, &entry_range).await
+            })
+            .await?;
+        chunk_from_entry(entry_start, &byterange, &mut expected_size, value)
+    }
+}
+
+pub(crate) struct MultiPageFetch {
+    request: FetchRequest,
+    pages: RangeInclusive<PageId>,
+}
+
+impl MultiPageFetch {
+    pub(crate) fn stream(
+        self,
+        service: CacheyService,
+        concurrency: NonZeroUsize,
+    ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
+        let Self { request, pages } = self;
+        let byterange = request.byterange.clone();
+        let mut expected_size = request.object_size;
+        let executor = Arc::new(EntryGetExecutor {
+            downloader: service.downloader,
+            request,
+        });
+
+        futures::stream::iter(pages.map(page_byterange))
+            .map(move |range| executor.clone().execute(range, service.cache.clone()))
+            .buffered(concurrency.get())
+            .map(move |result| {
+                let (entry_start, value) = result?;
+                chunk_from_entry(entry_start, &byterange, &mut expected_size, value)
+            })
+    }
+}
+
 pub(crate) enum FetchPlan {
     Error(ServiceError),
-    Single(Range<u64>),
-    Multi(RangeInclusive<PageId>),
+    Single(SingleEntryFetch),
+    Multi(MultiPageFetch),
+}
+
+impl FetchPlan {
+    pub(crate) fn new(request: FetchRequest) -> Self {
+        let byterange = &request.byterange;
+        assert!(byterange.start < byterange.end);
+        assert!(byterange.end <= MAX_RANGE_END);
+        assert!(!request.exact || byterange.end - byterange.start <= PAGE_SIZE);
+
+        metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
+
+        if let Some(object_size) = request.object_size
+            && object_size > MAX_OBJECT_SIZE
+        {
+            metrics::fetch_request_entries(&request.kind, 0);
+            return Self::Error(ServiceError::Download(DownloadError::ObjectTooLarge {
+                object_size,
+                max_object_size: MAX_OBJECT_SIZE,
+            }));
+        }
+
+        let end = byterange.end.min(request.object_size.unwrap_or(u64::MAX));
+        if byterange.start >= end {
+            metrics::fetch_request_entries(&request.kind, 0);
+            return Self::Error(ServiceError::Download(DownloadError::RangeNotSatisfied {
+                requested: byterange.clone(),
+                object_size: request.object_size,
+            }));
+        }
+
+        if request.exact {
+            metrics::fetch_request_entries(&request.kind, 1);
+            let entry_range = request.byterange.clone();
+            return Self::Single(SingleEntryFetch {
+                request,
+                entry_range,
+            });
+        }
+
+        let pages = pagerange(&(byterange.start..end));
+        let count = pages.len();
+        metrics::fetch_request_entries(&request.kind, count);
+        if count == 1 {
+            let entry_range = page_byterange(*pages.start());
+            Self::Single(SingleEntryFetch {
+                request,
+                entry_range,
+            })
+        } else {
+            Self::Multi(MultiPageFetch { request, pages })
+        }
+    }
 }
 
 impl CacheyService {
@@ -183,90 +290,6 @@ impl CacheyService {
         self.egress_throughput.lock().bps(lookback)
     }
 
-    pub(crate) fn plan_fetch(request: &FetchRequest) -> FetchPlan {
-        let byterange = &request.byterange;
-        assert!(byterange.start < byterange.end);
-        assert!(byterange.end <= MAX_RANGE_END);
-        assert!(!request.exact || byterange.end - byterange.start <= PAGE_SIZE);
-
-        metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
-
-        if let Some(object_size) = request.object_size
-            && object_size > MAX_OBJECT_SIZE
-        {
-            metrics::fetch_request_entries(&request.kind, 0);
-            return FetchPlan::Error(ServiceError::Download(DownloadError::ObjectTooLarge {
-                object_size,
-                max_object_size: MAX_OBJECT_SIZE,
-            }));
-        }
-
-        let end = byterange.end.min(request.object_size.unwrap_or(u64::MAX));
-        if byterange.start >= end {
-            metrics::fetch_request_entries(&request.kind, 0);
-            return FetchPlan::Error(ServiceError::Download(DownloadError::RangeNotSatisfied {
-                requested: byterange.clone(),
-                object_size: request.object_size,
-            }));
-        }
-
-        if request.exact {
-            metrics::fetch_request_entries(&request.kind, 1);
-            return FetchPlan::Single(byterange.clone());
-        }
-
-        let pages = pagerange(&(byterange.start..end));
-        let count = pages.len();
-        metrics::fetch_request_entries(&request.kind, count);
-        if count == 1 {
-            FetchPlan::Single(page_byterange(*pages.start()))
-        } else {
-            FetchPlan::Multi(pages)
-        }
-    }
-
-    pub(crate) async fn fetch_single_chunk(
-        self,
-        request: FetchRequest,
-        entry_range: Range<u64>,
-    ) -> Result<Chunk, ServiceError> {
-        let cache_key = CacheKey {
-            kind: request.kind.clone(),
-            object: request.object.clone(),
-            range: entry_range.clone(),
-        };
-        let byterange = request.byterange.clone();
-        let mut expected_size = request.object_size;
-        let downloader = self.downloader;
-        let (entry_start, value) = fetch_cached_entry(&self.cache, cache_key, move || async move {
-            download_entry(&downloader, &request, &entry_range).await
-        })
-        .await?;
-        chunk_from_entry(entry_start, &byterange, &mut expected_size, value)
-    }
-
-    pub(crate) fn stream_pages(
-        self,
-        request: FetchRequest,
-        pages: RangeInclusive<PageId>,
-        concurrency: NonZeroUsize,
-    ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
-        let byterange = request.byterange.clone();
-        let mut expected_size = request.object_size;
-        let executor = Arc::new(EntryGetExecutor {
-            downloader: self.downloader,
-            request,
-        });
-
-        futures::stream::iter(pages.map(page_byterange))
-            .map(move |range| executor.clone().execute(range, self.cache.clone()))
-            .buffered(concurrency.get())
-            .map(move |result| {
-                let (entry_start, value) = result?;
-                chunk_from_entry(entry_start, &byterange, &mut expected_size, value)
-            })
-    }
-
     /// Fetches up to `concurrency` cache entries at a time. A range starting at or past a known
     /// object size fails without a download.
     ///
@@ -279,28 +302,15 @@ impl CacheyService {
         request: FetchRequest,
         concurrency: NonZeroUsize,
     ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
-        let byterange = request.byterange.clone();
-        let (initial_error, entries) = match Self::plan_fetch(&request) {
-            FetchPlan::Error(err) => (Some(Err(err)), None),
-            FetchPlan::Single(range) => (None, Some(Either::Left(iter::once(range)))),
-            FetchPlan::Multi(pages) => (None, Some(Either::Right(pages.map(page_byterange)))),
-        };
-
-        let mut expected_size = request.object_size;
-        let executor = Arc::new(EntryGetExecutor {
-            downloader: self.downloader,
-            request,
-        });
-
-        futures::stream::iter(initial_error).chain(
-            futures::stream::iter(entries.into_iter().flatten())
-                .map(move |range| executor.clone().execute(range, self.cache.clone()))
-                .buffered(concurrency.get())
-                .map(move |result| {
-                    let (entry_start, value) = result?;
-                    chunk_from_entry(entry_start, &byterange, &mut expected_size, value)
-                }),
-        )
+        match FetchPlan::new(request) {
+            FetchPlan::Error(err) => Either::Left(Either::Left(futures::stream::once(
+                std::future::ready(Err(err)),
+            ))),
+            FetchPlan::Single(single) => {
+                Either::Left(Either::Right(futures::stream::once(single.execute(self))))
+            }
+            FetchPlan::Multi(multi) => Either::Right(multi.stream(self, concurrency)),
+        }
     }
 
     pub fn into_router(self) -> axum::Router {
@@ -964,6 +974,32 @@ mod tests {
         ));
     }
 
+    async fn spawn_http2_service(
+        bucket: &BucketName,
+        object: &ObjectKey,
+        data: Bytes,
+        memory: ByteSize,
+    ) -> (
+        std::net::SocketAddr,
+        axum_server::Handle<std::net::SocketAddr>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (s3_endpoint, _, s3_handle) =
+            spawn_mock_s3_server(bucket, object, data, Duration::ZERO).await;
+        let app = service(&s3_endpoint, memory).await.into_router();
+        let server_handle = axum_server::Handle::<std::net::SocketAddr>::new();
+        let serve_handle = server_handle.clone();
+        tokio::spawn(async move {
+            axum_server::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .handle(serve_handle)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let addr = server_handle.listening().await.unwrap();
+        (addr, server_handle, s3_handle)
+    }
+
     #[tokio::test]
     async fn http2_single_chunk_omits_trailers_and_multi_page_includes_them() {
         use http_body::Body as _;
@@ -977,21 +1013,8 @@ mod tests {
                 .map(|i| (i % 251) as u8)
                 .collect::<Vec<_>>(),
         );
-        let (s3_endpoint, _, s3_handle) =
-            spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
-        let service = service(&s3_endpoint, ByteSize::mib(64)).await;
-
-        let server_handle = axum_server::Handle::<std::net::SocketAddr>::new();
-        let serve_handle = server_handle.clone();
-        let app = service.into_router();
-        tokio::spawn(async move {
-            axum_server::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-                .handle(serve_handle)
-                .serve(app.into_make_service())
-                .await
-                .unwrap();
-        });
-        let addr = server_handle.listening().await.unwrap();
+        let (addr, server_handle, s3_handle) =
+            spawn_http2_service(&bucket, &object, data.clone(), ByteSize::mib(64)).await;
 
         let client =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -1040,6 +1063,47 @@ mod tests {
             .expect("multi-page HTTP/2 response should include trailers");
         assert_eq!(collected.to_bytes(), data);
         assert_eq!(trailers.get_all("c0-status").iter().count(), 1);
+
+        server_handle.shutdown();
+        s3_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http2_early_eof_multi_page_range_omits_trailers() {
+        use http_body::Body as _;
+        use http_body_util::BodyExt;
+
+        let kind = ObjectKind::new("h2-early-eof").unwrap();
+        let object = ObjectKey::new("small-object").unwrap();
+        let bucket = BucketName::new("bucket").unwrap();
+        let data = Bytes::from(vec![0x5a; 1024]);
+        let (addr, server_handle, s3_handle) =
+            spawn_http2_service(&bucket, &object, data.clone(), ByteSize::mib(16)).await;
+
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .http2_only(true)
+                .build_http::<http_body_util::Empty<Bytes>>();
+        let req = http::Request::builder()
+            .uri(format!("http://{addr}/fetch/{kind}/{object}"))
+            .version(http::Version::HTTP_2)
+            .header(
+                http::header::RANGE,
+                format!("bytes=0-{}", PAGE_SIZE * 2 - 1),
+            )
+            .header("c0-bucket", &*bucket)
+            .body(http_body_util::Empty::new())
+            .unwrap();
+        let resp = client.request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let mut body = resp.into_body();
+        let frame = body.frame().await.expect("data frame").expect("ok frame");
+        assert_eq!(frame.into_data().unwrap(), data);
+        assert!(
+            body.is_end_stream(),
+            "early-EOF HTTP/2 response should set END_STREAM on its DATA frame with no trailing frame"
+        );
+        assert!(body.frame().await.is_none());
 
         server_handle.shutdown();
         s3_handle.abort();

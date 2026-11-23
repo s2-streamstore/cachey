@@ -68,10 +68,8 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
         .with_weighter(|key: &CacheKey, value: &CacheValue| {
             key.estimated_size() + value.estimated_size()
         })
-        .storage();
-
-    if let Some(disk_config) = config.disk_cache {
-        builder = builder.with_spawner(
+        .storage()
+        .with_spawner(
             tokio::runtime::Builder::new_multi_thread()
                 .thread_name_fn(|| {
                     static TID: AtomicUsize = AtomicUsize::new(0);
@@ -82,6 +80,8 @@ pub async fn build_cache(config: CacheConfig) -> foyer::Result<HybridCache<Cache
                 .build()?
                 .into(),
         );
+
+    if let Some(disk_config) = config.disk_cache {
         // TODO: throttling knobs?
         let device = match disk_config.kind {
             DiskCacheKind::BlockFile => {
@@ -738,6 +738,12 @@ mod tests {
 
         let header = CacheValueHeader::new(4, 16, 0, 16, 0).unwrap();
         let data = [header.to_bytes().as_slice(), b"buck", &[1; 8]].concat();
-        assert!(CacheValue::decode(&mut data.as_slice()).is_err());
+        let err = CacheValue::decode(&mut data.as_slice()).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::UnexpectedEof),
+            "expected UnexpectedEof, got {err:?}"
+        );
     }
 }
