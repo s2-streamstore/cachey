@@ -120,6 +120,12 @@ pub struct CacheyService {
     server_handle: axum_server::Handle<SocketAddr>,
 }
 
+pub(crate) enum FetchPlan {
+    Error(ServiceError),
+    Single(Range<u64>),
+    Multi(RangeInclusive<PageId>),
+}
+
 impl CacheyService {
     pub async fn new(
         config: ServiceConfig,
@@ -177,6 +183,90 @@ impl CacheyService {
         self.egress_throughput.lock().bps(lookback)
     }
 
+    pub(crate) fn plan_fetch(request: &FetchRequest) -> FetchPlan {
+        let byterange = &request.byterange;
+        assert!(byterange.start < byterange.end);
+        assert!(byterange.end <= MAX_RANGE_END);
+        assert!(!request.exact || byterange.end - byterange.start <= PAGE_SIZE);
+
+        metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
+
+        if let Some(object_size) = request.object_size
+            && object_size > MAX_OBJECT_SIZE
+        {
+            metrics::fetch_request_entries(&request.kind, 0);
+            return FetchPlan::Error(ServiceError::Download(DownloadError::ObjectTooLarge {
+                object_size,
+                max_object_size: MAX_OBJECT_SIZE,
+            }));
+        }
+
+        let end = byterange.end.min(request.object_size.unwrap_or(u64::MAX));
+        if byterange.start >= end {
+            metrics::fetch_request_entries(&request.kind, 0);
+            return FetchPlan::Error(ServiceError::Download(DownloadError::RangeNotSatisfied {
+                requested: byterange.clone(),
+                object_size: request.object_size,
+            }));
+        }
+
+        if request.exact {
+            metrics::fetch_request_entries(&request.kind, 1);
+            return FetchPlan::Single(byterange.clone());
+        }
+
+        let pages = pagerange(&(byterange.start..end));
+        let count = pages.len();
+        metrics::fetch_request_entries(&request.kind, count);
+        if count == 1 {
+            FetchPlan::Single(page_byterange(*pages.start()))
+        } else {
+            FetchPlan::Multi(pages)
+        }
+    }
+
+    pub(crate) async fn fetch_single_chunk(
+        self,
+        request: FetchRequest,
+        entry_range: Range<u64>,
+    ) -> Result<Chunk, ServiceError> {
+        let cache_key = CacheKey {
+            kind: request.kind.clone(),
+            object: request.object.clone(),
+            range: entry_range.clone(),
+        };
+        let byterange = request.byterange.clone();
+        let mut expected_size = request.object_size;
+        let downloader = self.downloader;
+        let (entry_start, value) = fetch_cached_entry(&self.cache, cache_key, move || async move {
+            download_entry(&downloader, &request, &entry_range).await
+        })
+        .await?;
+        chunk_from_entry(entry_start, &byterange, &mut expected_size, value)
+    }
+
+    pub(crate) fn stream_pages(
+        self,
+        request: FetchRequest,
+        pages: RangeInclusive<PageId>,
+        concurrency: NonZeroUsize,
+    ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
+        let byterange = request.byterange.clone();
+        let mut expected_size = request.object_size;
+        let executor = Arc::new(EntryGetExecutor {
+            downloader: self.downloader,
+            request,
+        });
+
+        futures::stream::iter(pages.map(page_byterange))
+            .map(move |range| executor.clone().execute(range, self.cache.clone()))
+            .buffered(concurrency.get())
+            .map(move |result| {
+                let (entry_start, value) = result?;
+                chunk_from_entry(entry_start, &byterange, &mut expected_size, value)
+            })
+    }
+
     /// Fetches up to `concurrency` cache entries at a time. A range starting at or past a known
     /// object size fails without a download.
     ///
@@ -190,43 +280,11 @@ impl CacheyService {
         concurrency: NonZeroUsize,
     ) -> impl Stream<Item = Result<Chunk, ServiceError>> {
         let byterange = request.byterange.clone();
-        assert!(byterange.start < byterange.end);
-        assert!(byterange.end <= MAX_RANGE_END);
-        assert!(!request.exact || byterange.end - byterange.start <= PAGE_SIZE);
-
-        let initial_error = if let Some(object_size) = request.object_size
-            && object_size > MAX_OBJECT_SIZE
-        {
-            Some(Err(ServiceError::Download(DownloadError::ObjectTooLarge {
-                object_size,
-                max_object_size: MAX_OBJECT_SIZE,
-            })))
-        } else {
-            None
+        let (initial_error, entries) = match Self::plan_fetch(&request) {
+            FetchPlan::Error(err) => (Some(Err(err)), None),
+            FetchPlan::Single(range) => (None, Some(Either::Left(iter::once(range)))),
+            FetchPlan::Multi(pages) => (None, Some(Either::Right(pages.map(page_byterange)))),
         };
-
-        let end = byterange.end.min(request.object_size.unwrap_or(u64::MAX));
-        let entries = (initial_error.is_none() && byterange.start < end).then(|| {
-            if request.exact {
-                Either::Left(iter::once(byterange.clone()))
-            } else {
-                Either::Right(pagerange(&(byterange.start..end)).map(page_byterange))
-            }
-        });
-        let initial_error = initial_error.or_else(|| {
-            entries.is_none().then(|| {
-                Err(ServiceError::Download(DownloadError::RangeNotSatisfied {
-                    requested: byterange.clone(),
-                    object_size: request.object_size,
-                }))
-            })
-        });
-
-        metrics::fetch_request_bytes(&request.kind, byterange.end - byterange.start);
-        metrics::fetch_request_entries(
-            &request.kind,
-            entries.as_ref().map_or(0, ExactSizeIterator::len),
-        );
 
         let mut expected_size = request.object_size;
         let executor = Arc::new(EntryGetExecutor {
@@ -240,23 +298,7 @@ impl CacheyService {
                 .buffered(concurrency.get())
                 .map(move |result| {
                     let (entry_start, value) = result?;
-                    // A range past the object's end is unsatisfiable whatever size was expected.
-                    let (data, range) = slice_entry_data(entry_start, &byterange, &value)?;
-                    let expected_size = *expected_size.get_or_insert(value.object_size);
-                    if value.object_size != expected_size {
-                        return Err(ServiceError::ObjectSizeInconsistency {
-                            new: value.object_size,
-                            prev: expected_size,
-                        });
-                    }
-                    Ok(Chunk {
-                        bucket: value.bucket,
-                        mtime: value.mtime,
-                        data,
-                        range,
-                        object_size: value.object_size,
-                        cached_at: NonZeroU32::new(value.cached_at),
-                    })
+                    chunk_from_entry(entry_start, &byterange, &mut expected_size, value)
                 }),
         )
     }
@@ -281,6 +323,125 @@ impl CacheyService {
     }
 }
 
+fn chunk_from_entry(
+    entry_start: u64,
+    byterange: &Range<u64>,
+    expected_size: &mut Option<u64>,
+    value: CacheValue,
+) -> Result<Chunk, ServiceError> {
+    // A range past the object's end is unsatisfiable whatever size was expected.
+    let (data, range) = slice_entry_data(entry_start, byterange, &value)?;
+    let expected_size = *expected_size.get_or_insert(value.object_size);
+    if value.object_size != expected_size {
+        return Err(ServiceError::ObjectSizeInconsistency {
+            new: value.object_size,
+            prev: expected_size,
+        });
+    }
+    Ok(Chunk {
+        bucket: value.bucket,
+        mtime: value.mtime,
+        data,
+        range,
+        object_size: value.object_size,
+        cached_at: NonZeroU32::new(value.cached_at),
+    })
+}
+
+async fn download_entry(
+    downloader: &Downloader,
+    request: &FetchRequest,
+    range: &Range<u64>,
+) -> Result<CacheValue, ServiceError> {
+    metrics::entry_request_count(&request.kind, metrics::EntryRequestType::Download);
+
+    let out = downloader
+        .download(
+            &request.buckets,
+            request.object.clone(),
+            range,
+            request.object_size,
+            &request.config,
+        )
+        .await?;
+    metrics::download_latency(&request.kind, out.latency);
+    if out.hedged {
+        metrics::entry_request_count(&request.kind, metrics::EntryRequestType::Hedged);
+    }
+    if let Some(hedge) = out.hedge {
+        metrics::hedge_count(
+            &request.kind,
+            &request.buckets[out.primary_bucket_idx],
+            hedge,
+        );
+    }
+    if out.primary_bucket_idx == 0 {
+        metrics::entry_request_count(&request.kind, metrics::EntryRequestType::ClientPref);
+    }
+    if out.used_bucket_idx != out.primary_bucket_idx {
+        metrics::entry_request_count(&request.kind, metrics::EntryRequestType::Fallback);
+    }
+    Ok(CacheValue {
+        bucket: request.buckets[out.used_bucket_idx].clone(),
+        mtime: out.piece.mtime,
+        data: out.piece.data,
+        object_size: out.piece.object_size,
+        cached_at: now(),
+    })
+}
+
+async fn fetch_cached_entry<F, Fut>(
+    cache: &foyer::HybridCache<CacheKey, CacheValue>,
+    cache_key: CacheKey,
+    download: F,
+) -> Result<(u64, CacheValue), ServiceError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<CacheValue, ServiceError>> + Send + 'static,
+{
+    metrics::entry_request_count(&cache_key.kind, metrics::EntryRequestType::Access);
+
+    let fetched_by_current_request = Arc::new(AtomicBool::new(false));
+    let entry = cache
+        .get_or_fetch(&cache_key, {
+            let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
+            move || {
+                let fut = download();
+                async move {
+                    fetched_by_current_request.store(true, Ordering::Relaxed);
+                    fut.await
+                }
+            }
+        })
+        .await
+        .map_err(|err| {
+            err.downcast_ref::<ServiceError>()
+                .cloned()
+                .unwrap_or(ServiceError::Cache(err))
+        })?;
+    let key = entry.key();
+    metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Success);
+
+    let mut value = entry.value().clone();
+    match entry.source() {
+        Source::Memory => {
+            metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
+            metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitMemory);
+        }
+        Source::Disk => {
+            metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
+            metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitDisk);
+        }
+        Source::Outer => {
+            value.cached_at = 0;
+            if !fetched_by_current_request.load(Ordering::Relaxed) {
+                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Coalesced);
+            }
+        }
+    }
+    Ok((cache_key.range.start, value))
+}
+
 fn now() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -300,96 +461,15 @@ impl EntryGetExecutor {
         range: Range<u64>,
         cache: foyer::HybridCache<CacheKey, CacheValue>,
     ) -> Result<(u64, CacheValue), ServiceError> {
-        metrics::entry_request_count(&self.request.kind, metrics::EntryRequestType::Access);
-
         let cache_key = CacheKey {
             kind: self.request.kind.clone(),
             object: self.request.object.clone(),
             range: range.clone(),
         };
-        let fetched_by_current_request = Arc::new(AtomicBool::new(false));
-        let entry = cache
-            .get_or_fetch(&cache_key, {
-                let fetched_by_current_request = Arc::clone(&fetched_by_current_request);
-                move || async move {
-                    fetched_by_current_request.store(true, Ordering::Relaxed);
-                    metrics::entry_request_count(
-                        &self.request.kind,
-                        metrics::EntryRequestType::Download,
-                    );
-
-                    let out = self
-                        .downloader
-                        .download(
-                            &self.request.buckets,
-                            self.request.object.clone(),
-                            &range,
-                            self.request.object_size,
-                            &self.request.config,
-                        )
-                        .await?;
-                    metrics::download_latency(&self.request.kind, out.latency);
-                    if out.hedged {
-                        metrics::entry_request_count(
-                            &self.request.kind,
-                            metrics::EntryRequestType::Hedged,
-                        );
-                    }
-                    if let Some(hedge) = out.hedge {
-                        metrics::hedge_count(
-                            &self.request.kind,
-                            &self.request.buckets[out.primary_bucket_idx],
-                            hedge,
-                        );
-                    }
-                    if out.primary_bucket_idx == 0 {
-                        metrics::entry_request_count(
-                            &self.request.kind,
-                            metrics::EntryRequestType::ClientPref,
-                        );
-                    }
-                    if out.used_bucket_idx != out.primary_bucket_idx {
-                        metrics::entry_request_count(
-                            &self.request.kind,
-                            metrics::EntryRequestType::Fallback,
-                        );
-                    }
-                    Ok::<_, ServiceError>(CacheValue {
-                        bucket: self.request.buckets[out.used_bucket_idx].clone(),
-                        mtime: out.piece.mtime,
-                        data: out.piece.data,
-                        object_size: out.piece.object_size,
-                        cached_at: now(),
-                    })
-                }
-            })
-            .await
-            .map_err(|err| {
-                err.downcast_ref::<ServiceError>()
-                    .cloned()
-                    .unwrap_or(ServiceError::Cache(err))
-            })?;
-        let key = entry.key();
-        metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Success);
-
-        let mut value = entry.value().clone();
-        match entry.source() {
-            Source::Memory => {
-                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
-                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitMemory);
-            }
-            Source::Disk => {
-                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHit);
-                metrics::entry_request_count(&key.kind, metrics::EntryRequestType::CacheHitDisk);
-            }
-            Source::Outer => {
-                value.cached_at = 0;
-                if !fetched_by_current_request.load(Ordering::Relaxed) {
-                    metrics::entry_request_count(&key.kind, metrics::EntryRequestType::Coalesced);
-                }
-            }
-        }
-        Ok((cache_key.range.start, value))
+        fetch_cached_entry(&cache, cache_key, move || async move {
+            download_entry(&self.downloader, &self.request, &range).await
+        })
+        .await
     }
 }
 
