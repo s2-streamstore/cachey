@@ -314,24 +314,20 @@ pub async fn fetch(
     };
 
     let egress_throughput = service.egress_throughput.clone();
-    let mut chunks = Box::pin(
-        service
-            .get(
-                FetchRequest {
-                    kind: kind.clone(),
-                    object,
-                    buckets,
-                    byterange: byterange.clone(),
-                    object_size,
-                    exact,
-                    config: req_config,
-                },
-                concurrency,
-            )
-            .peekable(),
-    );
+    let mut chunks = Box::pin(service.get(
+        FetchRequest {
+            kind: kind.clone(),
+            object,
+            buckets,
+            byterange: byterange.clone(),
+            object_size,
+            exact,
+            config: req_config,
+        },
+        concurrency,
+    ));
 
-    let Some(first_chunk) = chunks.as_mut().peek().await else {
+    let Some(first_chunk) = chunks.next().await else {
         metrics::fetch_request_count(&kind, &method, "failed:stream_empty");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -341,7 +337,7 @@ pub async fn fetch(
     };
 
     let mut headers = HeaderMap::new();
-    match first_chunk {
+    let first_chunk = match first_chunk {
         Ok(chunk) => {
             metrics::first_chunk_latency(&kind, chunk.cached_at.is_some(), start.elapsed());
             let object_size = chunk.object_size;
@@ -364,28 +360,44 @@ pub async fn fetch(
                 ))
                 .unwrap(),
             );
-            headers.insert("c0-status", c0_status(chunk));
+            headers.insert("c0-status", c0_status(&chunk));
+            chunk
         }
         Err(e) => {
-            let (status, headers) = on_chunk_error(&kind, &method, 0, e);
+            let (status, headers) = on_chunk_error(&kind, &method, 0, &e);
             return (status, headers, e.to_string()).into_response();
         }
-    }
+    };
 
     if method == axum::http::Method::HEAD {
         metrics::fetch_request_count(&kind, &method, "success");
         return (StatusCode::PARTIAL_CONTENT, headers).into_response();
     }
 
+    if first_chunk.range.end == byterange.end.min(first_chunk.object_size) {
+        // Stop waiting for pages beyond EOF; shared cache fills can continue.
+        drop(chunks);
+        metrics::fetch_request_count(&kind, &method, "success");
+        egress_throughput.lock().record(first_chunk.data.len());
+        // A single-chunk body lets hyper set END_STREAM on the final DATA frame instead of
+        // sending a trailing empty HEADERS frame over HTTP/2.
+        return (
+            StatusCode::PARTIAL_CONTENT,
+            headers,
+            axum::body::Body::from(first_chunk.data),
+        )
+            .into_response();
+    }
+
     let body = StreamBody::new(async_stream::stream! {
         let mut trailers = HeaderMap::new();
-        let mut chunk_idx = 0;
+        egress_throughput.lock().record(first_chunk.data.len());
+        yield Ok(Frame::data(first_chunk.data));
+        let mut chunk_idx = 1;
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(chunk) => {
-                    if chunk_idx > 0 {
-                        trailers.append("c0-status", c0_status(&chunk));
-                    }
+                    trailers.append("c0-status", c0_status(&chunk));
                     let is_last_chunk = chunk.range.end == byterange.end.min(chunk.object_size);
                     if is_last_chunk {
                         metrics::fetch_request_count(&kind, &method, "success");
@@ -398,13 +410,12 @@ pub async fn fetch(
                         yield Ok(Frame::trailers(trailers));
                         break;
                     }
-                },
+                }
                 Err(err) => {
-                    assert!(chunk_idx > 0, "first chunk cannot be an error since we peeked");
                     let _ = on_chunk_error(&kind, &method, chunk_idx, &err);
                     yield Err(err);
                     break;
-                },
+                }
             }
             chunk_idx += 1;
         }

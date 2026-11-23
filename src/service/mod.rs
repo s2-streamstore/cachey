@@ -883,4 +883,85 @@ mod tests {
             })) if object_size == MAX_OBJECT_SIZE + 1 && max_object_size == MAX_OBJECT_SIZE
         ));
     }
+
+    #[tokio::test]
+    async fn http2_single_chunk_omits_trailers_and_multi_page_includes_them() {
+        use http_body::Body as _;
+        use http_body_util::BodyExt;
+
+        let kind = ObjectKind::new("h2-framing").unwrap();
+        let object = ObjectKey::new("object").unwrap();
+        let bucket = BucketName::new("bucket").unwrap();
+        let data = Bytes::from(
+            (0..PAGE_SIZE as usize + 128)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (s3_endpoint, _, s3_handle) =
+            spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
+        let service = service(&s3_endpoint, ByteSize::mib(64)).await;
+
+        let server_handle = axum_server::Handle::<std::net::SocketAddr>::new();
+        let serve_handle = server_handle.clone();
+        let app = service.into_router();
+        tokio::spawn(async move {
+            axum_server::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .handle(serve_handle)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let addr = server_handle.listening().await.unwrap();
+
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .http2_only(true)
+                .build_http::<http_body_util::Empty<Bytes>>();
+        let uri: http::Uri = format!("http://{addr}/fetch/{kind}/{object}")
+            .parse()
+            .unwrap();
+
+        let single_req = http::Request::builder()
+            .uri(uri.clone())
+            .version(http::Version::HTTP_2)
+            .header(http::header::RANGE, "bytes=0-1023")
+            .header("c0-bucket", &*bucket)
+            .body(http_body_util::Empty::new())
+            .unwrap();
+        let single_resp = client.request(single_req).await.unwrap();
+        assert_eq!(single_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(single_resp.headers().contains_key("c0-status"));
+        let mut single_body = single_resp.into_body();
+        let first_frame = single_body
+            .frame()
+            .await
+            .expect("data frame")
+            .expect("ok frame");
+        assert_eq!(first_frame.into_data().unwrap(), data.slice(0..1024));
+        assert!(
+            single_body.is_end_stream(),
+            "single-chunk HTTP/2 response should set END_STREAM on its DATA frame with no trailing frame"
+        );
+        assert!(single_body.frame().await.is_none());
+
+        let multi_req = http::Request::builder()
+            .uri(uri)
+            .version(http::Version::HTTP_2)
+            .header(http::header::RANGE, format!("bytes=0-{}", data.len() - 1))
+            .header("c0-bucket", &*bucket)
+            .body(http_body_util::Empty::new())
+            .unwrap();
+        let multi_resp = client.request(multi_req).await.unwrap();
+        assert_eq!(multi_resp.status(), StatusCode::PARTIAL_CONTENT);
+        let collected = multi_resp.into_body().collect().await.unwrap();
+        let trailers = collected
+            .trailers()
+            .cloned()
+            .expect("multi-page HTTP/2 response should include trailers");
+        assert_eq!(collected.to_bytes(), data);
+        assert_eq!(trailers.get_all("c0-status").iter().count(), 1);
+
+        server_handle.shutdown();
+        s3_handle.abort();
+    }
 }
