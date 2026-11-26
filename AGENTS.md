@@ -17,7 +17,7 @@ cachey is a read-through cache for S3-compatible object storage
 - Use `--locked` for Cargo commands that build, check, test, run, document, fetch, or read metadata
 - Use `cargo +nightly add`, `cargo +nightly update`, `cargo +nightly remove`, or `cargo +nightly generate-lockfile` for dependency changes
 - Do not use the stable forms of these dependency commands
-- Do not edit dependency declarations or `Cargo.lock` directly
+- Avoid editing dependency declarations or `Cargo.lock` directly; if you need to, ask for explicit permission first and flag the risk
 - Do not run `cargo install` as part of a coding task
 - Prefer well-maintained crates from crates.io
 - Be mindful of allocations in hot paths
