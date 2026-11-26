@@ -24,15 +24,9 @@ concurrency:
 jobs:
   cooldown:
     name: dependency cooldown
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 2
-
-      - name: Check publish age of new crates.io versions
-        run: python3 .github/dependency-cooldown/check.py HEAD^1
+    permissions:
+      contents: read
+    uses: s2-streamstore/s2/.github/workflows/rust-dependency-cooldown.yml@main
 
   conventional-commit:
     name: conventional commit
