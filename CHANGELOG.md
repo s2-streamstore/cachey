@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.8](https://github.com/s2-streamstore/cachey/compare/0.13.7...0.13.8) - 2026-11-26
+
+### Other
+
+- drop nightly Cargo cooldown requirement and soften Cargo.lock guidance ([#237](https://github.com/s2-streamstore/cachey/pull/237))
+- pin rust-dependency-cooldown workflow to commit SHA ([#236](https://github.com/s2-streamstore/cachey/pull/236))
+- use shared rust-dependency-cooldown workflow ([#234](https://github.com/s2-streamstore/cachey/pull/234))
+
 ## [0.13.7](https://github.com/s2-streamstore/cachey/compare/0.13.6...0.13.7) - 2026-11-23
 
 ### Other
