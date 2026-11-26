@@ -159,14 +159,14 @@ Options:
 - [AGENTS.md](./AGENTS.md) and symlinks for your favorite coding buddies
 - [Replica simulation harness](docs/simulation/README.md)
 
-Use the nightly Cargo dependency commands so that the three-day publication cooldown applies:
+Use Cargo dependency commands so that the three-day publication cooldown applies:
 
 ```bash
-cargo +nightly add <crate>
-cargo +nightly update
-cargo +nightly update -p <crate>
-cargo +nightly remove <crate>
-cargo +nightly generate-lockfile
+cargo add <crate>
+cargo update
+cargo update -p <crate>
+cargo remove <crate>
+cargo generate-lockfile
 ```
 
 Use `--locked` with normal build, check, test, run, document, fetch, and metadata commands. The pull request dependency gate verifies each proposed lockfile change before Rust build jobs start.
